@@ -16,7 +16,7 @@
  *  Rev 9.4 (2/5/2026) - Simplified Diagnostic Dashboard
  *  - REMOVED: Web relay control (mode buttons, individual relay buttons)
  *  - REMOVED: Quality Check Test Mode (password section, ADS1015 ADC)
- *  - REMOVED: Web passthrough toggle (passthrough still works via BlueCherry/serial)
+ *  - KEPT: Web passthrough toggle with confirmation dialog
  *  - REMOVED: Web I2C reset endpoint
  *  - NEW: Read-only Service Diagnostic Dashboard for field contractors
  *  - Dashboard shows: Serial data, Cellular modem status, IO board health
@@ -1433,7 +1433,29 @@ const char* control_html = R"rawliteral(
                     <span id="wdLabel" style="font-weight:600;font-size:0.85em;">--</span>
                 </label>
             </div>
-            <div style="font-size:0.75em;color:#999;padding:2px 0;">Pulses GPIO39 if no serial data for 30 min</div>
+            <div style="font-size:0.75em;color:#999;padding:2px 0 8px;">Pulses GPIO39 if no serial data for 30 min</div>
+            <div style="border-top:1px solid #eee;padding-top:10px;margin-top:4px;">
+                <div class="cfg-row">
+                    <span class="lbl">Modem Passthrough:</span>
+                    <button class="btn" id="ptBtn" onclick="togglePassthrough()" style="background:#e65100;">Enter Passthrough</button>
+                    <span id="ptStatus" style="font-weight:600;font-size:0.85em;color:#999;">Inactive</span>
+                </div>
+                <div style="font-size:0.75em;color:#999;padding:2px 0;">Bridges serial to modem for PPP. ESP32 restarts and auto-returns after 60 min.</div>
+            </div>
+        </div>
+    </div>
+    <div id="ptModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:200;justify-content:center;align-items:center;">
+        <div style="background:#fff;border-radius:8px;max-width:90%;width:360px;overflow:hidden;">
+            <div style="background:#e65100;color:#fff;padding:12px 16px;font-weight:700;">Enter Passthrough Mode?</div>
+            <div style="padding:16px;color:#333;font-size:0.9em;line-height:1.5;">
+                <p style="margin:0 0 8px;"><b>This will:</b></p>
+                <ul style="margin:0 0 10px;padding-left:18px;"><li>Restart ESP32 into passthrough mode</li><li>Bridge RS-232 serial directly to modem</li><li>Disable WiFi and web server</li></ul>
+                <p style="margin:0;color:#c62828;"><b>Auto-returns to normal after 60 min.</b></p>
+            </div>
+            <div style="padding:10px 16px;background:#f5f5f5;display:flex;justify-content:flex-end;gap:8px;">
+                <button class="btn" onclick="closePtModal()" style="background:#9e9e9e;">Cancel</button>
+                <button class="btn" onclick="confirmPassthrough()" style="background:#c62828;">Enable</button>
+            </div>
         </div>
     </div>
     <div class="ts" id="lastUpdate">Waiting for data...</div>
@@ -1484,6 +1506,14 @@ const char* control_html = R"rawliteral(
         function setWatchdog(on){fetch('/setwatchdog?enabled='+(on?'1':'0')).then(()=>{
             document.getElementById('wdLabel').textContent=on?'ENABLED':'DISABLED';
             document.getElementById('wdLabel').style.color=on?'#2e7d32':'#999';});}
+        function togglePassthrough(){document.getElementById('ptModal').style.display='flex';}
+        function closePtModal(){document.getElementById('ptModal').style.display='none';}
+        function confirmPassthrough(){closePtModal();
+            const b=document.getElementById('ptBtn'),s=document.getElementById('ptStatus');
+            s.textContent='Activating...';s.style.color='#e65100';b.disabled=true;
+            fetch('/setpassthrough?enabled=1').then(r=>r.text()).then(()=>{
+                s.textContent='Restarting...';s.style.color='#c62828';
+            }).catch(()=>{s.textContent='Sent (ESP32 restarting)';s.style.color='#e65100';});}
         document.addEventListener('DOMContentLoaded',function(){if(document.activeElement)document.activeElement.blur();});
         poll();setInterval(poll,2000);
     </script>
@@ -1821,6 +1851,32 @@ void startConfigAP() {
             request->send(200, "text/plain", watchdogEnabled ? "Watchdog ENABLED" : "Watchdog DISABLED");
         } else {
             request->send(400, "text/plain", "Missing enabled parameter");
+        }
+    });
+    
+    // Set passthrough mode endpoint
+    // Usage: GET /setpassthrough?enabled=1 (enter passthrough mode)
+    // Uses preference-based boot: sets flag, restarts, runs minimal passthrough
+    // Auto-returns to normal after 60 min timeout or early exit via MCP GPA5
+    server.on("/setpassthrough", HTTP_GET, [](AsyncWebServerRequest *request){
+        if (request->hasParam("enabled")) {
+            int enabledVal = request->getParam("enabled")->value().toInt();
+            
+            if (enabledVal == 1) {
+                request->send(200, "text/plain", 
+                    "PASSTHROUGH MODE REQUESTED\n"
+                    "ESP32 will restart in minimal passthrough mode.\n"
+                    "Auto-returns to normal after 60 min.");
+                delay(500);
+                enterPassthroughMode();  // Sets preferences and restarts
+            } else {
+                request->send(200, "text/plain", "Restarting to normal mode...");
+                delay(500);
+                ESP.restart();
+            }
+        } else {
+            String status = passthroughMode ? "ACTIVE" : "INACTIVE";
+            request->send(200, "text/plain", "Passthrough: " + status);
         }
     });
     
