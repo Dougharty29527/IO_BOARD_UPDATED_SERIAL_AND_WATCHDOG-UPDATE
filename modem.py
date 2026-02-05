@@ -29,6 +29,15 @@ JSON Format (Outgoing to ESP32 - Passthrough Command):
     
     - command: "passthrough" to request passthrough mode
     - timeout: Duration in minutes
+
+External Control (from SSH):
+    The module responds to Unix signals for external control:
+    
+    Disconnect PPP via signal:
+        kill -USR1 $(cat /tmp/modem_manager.pid)
+    
+    Or use the standalone script:
+        sudo python3 ppp_disconnect.py
 '''
 
 import json
@@ -37,6 +46,8 @@ import time
 import subprocess
 import threading
 import re
+import signal
+import os
 
 from kivy.logger import Logger
 from kivy.clock import Clock
@@ -97,6 +108,38 @@ class SerialManager:
         self.ppp_start_time = None       # time.time() when PPP started
         self.ppp_timer_thread = None     # Background thread for timeout
         self.ppp_active = False          # True while PPP is running
+        
+        # Register signal handlers for external control
+        # SIGUSR1: Disconnect PPP (use: kill -USR1 <pid>)
+        # SIGUSR2: Reserved for future use
+        signal.signal(signal.SIGUSR1, self._handle_sigusr1)
+        
+        # Write PID file for easy signal sending
+        self._write_pid_file()
+
+    def _write_pid_file(self):
+        '''Write PID to file for external scripts to send signals'''
+        pid_file = '/tmp/modem_manager.pid'
+        try:
+            with open(pid_file, 'w') as f:
+                f.write(str(os.getpid()))
+            self._log('debug', f'PID {os.getpid()} written to {pid_file}')
+        except Exception as e:
+            self._log('warning', f'Could not write PID file: {e}')
+    
+    def _handle_sigusr1(self, signum, frame):
+        '''
+        Handle SIGUSR1 signal - disconnect PPP.
+        
+        Send this signal to disconnect PPP from another terminal:
+            kill -USR1 $(cat /tmp/modem_manager.pid)
+        '''
+        self._log('info', 'Received SIGUSR1 - disconnecting PPP')
+        if self.ppp_active:
+            # Run disconnect in a separate thread to avoid signal handler issues
+            threading.Thread(target=self.disconnect_ppp, daemon=True).start()
+        else:
+            self._log('info', 'PPP not active, nothing to disconnect')
 
     def _log(self, level, message):
         '''Log message with specified level'''
