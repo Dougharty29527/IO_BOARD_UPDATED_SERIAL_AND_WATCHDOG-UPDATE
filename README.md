@@ -1,6 +1,6 @@
 # Walter IO Board Firmware
 
-**Version:** Rev 9.3  
+**Version:** Rev 9.3a  
 **Date:** February 5, 2026  
 **Authors:** Todd Adams & Doug Harty
 
@@ -337,6 +337,37 @@ Click "Enter Passthrough Mode" button
 3. **I2C Command** - Set MCP GPA5 (bit 5) HIGH via I2C
 4. **Power cycle** - Always boots to normal mode
 
+### Disconnecting PPP from SSH
+
+When logged in via SSH during an active PPP session, you can disconnect PPP using:
+
+**Method 1: Signal (Recommended)**
+```bash
+# modem.py writes its PID to /tmp/modem_manager.pid
+kill -USR1 $(cat /tmp/modem_manager.pid)
+```
+
+**Method 2: Standalone Script**
+```bash
+sudo python3 ppp_disconnect.py
+```
+
+**Method 3: Manual Commands**
+```bash
+# Kill pppd
+sudo pkill pppd
+
+# Send stop signal to ESP32
+echo "+++STOPPPP" | sudo tee /dev/ttyAMA0
+```
+
+The disconnect process:
+1. Terminates pppd (SIGTERM, then SIGKILL if needed)
+2. Waits for serial port to be released
+3. Sends `+++STOPPPP` escape sequence to ESP32
+4. ESP32 restarts to normal mode
+5. modem.py automatically reconnects
+
 ### Linux PPP Setup
 
 ```bash
@@ -461,6 +492,24 @@ if manager.is_lte_connected():
 5. On timeout or `disconnect_ppp()`, stops pppd and sends `+++STOPPPP`
 6. ESP32 detects escape sequence and restarts to normal mode
 
+### External Control via Signals
+
+modem.py supports Unix signals for external control from SSH sessions:
+
+| Signal | Action |
+|--------|--------|
+| SIGUSR1 | Disconnect PPP and return to normal mode |
+
+```bash
+# PID file location
+/tmp/modem_manager.pid
+
+# Disconnect PPP from another terminal
+kill -USR1 $(cat /tmp/modem_manager.pid)
+```
+
+This is useful when you're logged in via SSH during a PPP session and need to disconnect programmatically.
+
 ---
 
 ## Fault Codes
@@ -512,6 +561,7 @@ Password-protected mode for factory testing when I2C master not connected.
 |------|-------------|
 | `IO_BOARD_FIRMWARE9_1-29-26.ino` | Main ESP32 firmware |
 | `modem.py` | Linux Python module for serial communication |
+| `ppp_disconnect.py` | Standalone script to disconnect PPP from SSH |
 | `BlueCherryZTP.cpp/h` | BlueCherry cloud integration |
 | `BlueCherryZTP_CBOR.cpp/h` | CBOR encoding for BlueCherry |
 | `ESP_AsyncDNSServer/` | Captive portal DNS library |
