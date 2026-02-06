@@ -23,6 +23,7 @@ JSON Format (Incoming from ESP32 - Status):
     - mcc: Mobile Country Code (e.g. 310 for US)
     - mnc: Mobile Network Code (e.g. 260 for T-Mobile US)
     - cellId: Cell Tower ID - unique ID of the serving cell tower
+    - tac: Tracking Area Code - identifies the tracking area for the cell
 
 JSON Format (Incoming from ESP32 - Passthrough Request):
     {"passthrough":"remote 60"}
@@ -110,6 +111,7 @@ class SerialManager:
         self.esp32_mcc = None            # Mobile Country Code (e.g. 310 for US)
         self.esp32_mnc = None            # Mobile Network Code (e.g. 260 for T-Mobile)
         self.esp32_cell_id = None        # Cell Tower ID (unique cell identifier)
+        self.esp32_tac = None            # Tracking Area Code
         
         # Passthrough mode callback (called when passthrough value changes)
         # Set this to a function that takes (old_value, new_value) as arguments
@@ -528,6 +530,7 @@ class SerialManager:
             - self.esp32_mcc             - Mobile Country Code
             - self.esp32_mnc             - Mobile Network Code
             - self.esp32_cell_id         - Cell Tower ID
+            - self.esp32_tac             - Tracking Area Code
             - self.esp32_last_update     - time.time() of update
             
         Triggers on_passthrough_change callback if passthrough value changes.
@@ -641,6 +644,12 @@ class SerialManager:
                     self.esp32_cell_id = int(data['cellId']) if data['cellId'] else None
                 except (ValueError, TypeError):
                     self.esp32_cell_id = None
+            
+            if 'tac' in data:
+                try:
+                    self.esp32_tac = int(data['tac']) if data['tac'] else None
+                except (ValueError, TypeError):
+                    self.esp32_tac = None
                 
             self.esp32_last_update = time.time()
             
@@ -651,7 +660,7 @@ class SerialManager:
                               f'rsrp={self.esp32_rsrp}, rsrq={self.esp32_rsrq}, '
                               f'op={self.esp32_operator}, band={self.esp32_band}, '
                               f'mcc={self.esp32_mcc}, mnc={self.esp32_mnc}, '
-                              f'cellId={self.esp32_cell_id}')
+                              f'cellId={self.esp32_cell_id}, tac={self.esp32_tac}')
             
             # Trigger callback if passthrough status changed
             if self.esp32_passthrough != old_passthrough:
@@ -735,7 +744,8 @@ class SerialManager:
             'band': self.esp32_band,
             'mcc': self.esp32_mcc,
             'mnc': self.esp32_mnc,
-            'cell_id': self.esp32_cell_id
+            'cell_id': self.esp32_cell_id,
+            'tac': self.esp32_tac
         }
         
     def get_cell_tower_info(self):
@@ -752,13 +762,14 @@ class SerialManager:
                 'mcc': 310,            # Mobile Country Code (310 = US)
                 'mnc': 260,            # Mobile Network Code (260 = T-Mobile)
                 'cell_id': 12345678,   # Unique cell tower identifier
+                'tac': 5678,           # Tracking Area Code
                 'plmn': '310260'       # Combined MCC+MNC string
             }
             
         Usage:
             tower = manager.get_cell_tower_info()
             if tower:
-                print(f"Connected to {tower['operator']} tower {tower['cell_id']}")
+                print(f"Connected to {tower['operator']} tower {tower['cell_id']} TAC {tower['tac']}")
         '''
         if self.esp32_mcc is None and self.esp32_cell_id is None:
             return None
@@ -774,6 +785,7 @@ class SerialManager:
             'mcc': self.esp32_mcc,
             'mnc': self.esp32_mnc,
             'cell_id': self.esp32_cell_id,
+            'tac': self.esp32_tac,
             'plmn': plmn
         }
 
@@ -798,6 +810,7 @@ class SerialManager:
                 'mcc': 310,
                 'mnc': 260,
                 'cell_id': 12345678,
+                'tac': 5678,
                 'last_update': 1738171234.567,
                 'age_seconds': 5.2
             }
@@ -830,6 +843,7 @@ class SerialManager:
             'mcc': self.esp32_mcc,
             'mnc': self.esp32_mnc,
             'cell_id': self.esp32_cell_id,
+            'tac': self.esp32_tac,
             'last_update': self.esp32_last_update,
             'age_seconds': round(time.time() - self.esp32_last_update, 1)
         }

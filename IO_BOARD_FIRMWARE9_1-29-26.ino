@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 9.4d
+ *  Walter IO Board Firmware - Rev 9.4e
  *  Date: 2/6/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,20 @@
  *  =====================================================================
  *  REVISION HISTORY
  *  =====================================================================
+ *  
+ *  Rev 9.4e (2/6/2026) - CRITICAL: Fix Overfill Polarity Inversion
+ *  - FIXED: gpioB_value polarity was inverted vs real MCP23017 behavior
+ *    * Real MCP23017: pin HIGH (1) = normal, pin LOW (0) = overfill alarm
+ *    * Emulation had it backwards: 0x00 for "safe" which Linux reads as LOW = alarm!
+ *    * This caused FALSE OVERFILL ALARMS on every ESP32 reboot/flash
+ *    * Also caused real overfill alarms to be INVISIBLE to Linux master
+ *  - All gpioB_value assignments now match real MCP23017 pin behavior:
+ *    * Boot/lockout safe value: 0x01 (HIGH = normal, no alarm)
+ *    * Alarm active: 0x00 (LOW = sensor triggered)
+ *    * No alarm: 0x01 (HIGH = pull-up, normal)
+ *  - Updated I2C handler lockout return from 0x00 to 0x01
+ *  - Affects: global init, mcpEmulatorTask, mcpReadInputsFromPhysicalPins,
+ *    handleI2CRead (GPIOA sequential + GPIOB), passthrough boot, setup() pre-init
  *  
  *  Rev 9.4d (2/6/2026) - Cell Tower Info + Scheduled Firmware Checks
  *  - NEW: Cell tower info on web dashboard (MCC/MNC, Cell ID)
@@ -197,7 +211,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 9.4d"
+#define VERSION "Rev 9.4e"
 String ver = VERSION;
 
 // ### Libraries ###
@@ -276,7 +290,7 @@ String mode_names[] = {"Idle", "Run", "Purge", "Burp"};
 // Note: Real MCP23017 defaults IODIR to 0xFF (all inputs), but we override for our application
 // CRITICAL: gpioA_value bit 4 (0x10) = DISP_SHUTDN - MUST start ON to match physical state
 volatile uint8_t gpioA_value = 0x10;  // V6/DISP_SHUTDN starts ON
-volatile uint8_t gpioB_value = 0x00;
+volatile uint8_t gpioB_value = 0x01;  // GPB0 HIGH = normal (no overfill), LOW = alarm
 volatile uint8_t iodirA_value = 0x00;  // 0x00 = All OUTPUT (GPA0-GPA4 are relay outputs)
 volatile uint8_t iodirB_value = 0x01;  // 0x01 = GPB0 is INPUT (overfill sensor)
 volatile uint8_t ipolA_value = 0x00;   // No polarity inversion
@@ -304,11 +318,14 @@ bool overfillAlarmActive = false;
 // Overfill validation system - prevents false alarms during power cycles/flashes/reboots
 // The GPIO38 input can have transient states during startup before pull-up stabilizes
 // PROTECTION LAYERS:
-//   1. gpioB_value initialized to 0x00 (no alarm) and explicitly reset on task start
+//   1. gpioB_value initialized to 0x01 (HIGH = no alarm, matches real MCP23017 pin state)
 //   2. overfillValidationComplete=false until 15 seconds after boot
-//   3. I2C handler returns 0x00 for GPIOB if !overfillValidationComplete
+//   3. I2C handler returns 0x01 for GPIOB if !overfillValidationComplete (HIGH = normal)
 //   4. Require 8 consecutive LOW readings (8 seconds) to trigger alarm
 //   5. Require 5 consecutive HIGH readings (5 seconds) to clear alarm (hysteresis)
+//   NOTE: Real MCP23017 GPIOB reflects actual pin voltage:
+//         Pin HIGH (pull-up, normal) = bit 0 = 1 = no alarm
+//         Pin LOW  (sensor active)   = bit 0 = 0 = overfill alarm
 bool overfillValidationComplete = false;    // True after startup validation period
 unsigned long overfillStartupTime = 0;      // When overfill monitoring started
 const unsigned long OVERFILL_STARTUP_LOCKOUT = 15000;  // 15 second lockout after boot
@@ -429,7 +446,8 @@ String modemRSRP = "";            // Reference Signal Received Power in dBm (e.g
 String modemRSRQ = "";            // Reference Signal Received Quality in dB (e.g. "-11.2")
 uint16_t modemCC = 0;             // Country Code (e.g. 310 for US)
 uint16_t modemNC = 0;             // Network Code (e.g. 260 for T-Mobile US)
-uint32_t modemCID = 0;            // Cell ID - unique identifier of the serving cell tower
+uint32_t modemCID = 0;
+uint32_t modemTAC = 0;            // Cell ID - unique identifier of the serving cell tower
 String imei = "";
 String macStr = "";
 int64_t currentTimestamp = 0;
@@ -802,8 +820,9 @@ void mcpReadInputsFromPhysicalPins() {
             overfillAlarmActive = false;  // Start with alarm OFF after validation
             // Note: Serial output removed - runs on Core 0
         } else {
-            // During lockout, just set gpioB to normal (no alarm)
-            gpioB_value = 0x00;
+            // During lockout, set gpioB to HIGH (normal, no alarm)
+            // Real MCP23017: pin HIGH = bit 1 = no alarm
+            gpioB_value = 0x01;
             return;
         }
     }
@@ -841,8 +860,10 @@ void mcpReadInputsFromPhysicalPins() {
         if (overfillHighCount > 100) overfillHighCount = 100;
     }
     
-    // Set GPIOB value based on overfill alarm state
-    gpioB_value = overfillAlarmActive ? 0x01 : 0x00;
+    // Set GPIOB value to mirror real MCP23017 pin state:
+    //   Alarm active (sensor pulling LOW) → bit 0 = 0 (pin LOW)
+    //   No alarm (pull-up keeps HIGH)     → bit 0 = 1 (pin HIGH)
+    gpioB_value = overfillAlarmActive ? 0x00 : 0x01;
 }
 
 /**
@@ -1053,9 +1074,10 @@ void handleI2CRead() {
         case GPIOA:
             {
                 uint8_t byteA = getRelayStateSafe(); // Thread-safe read
-                // CRITICAL: During startup lockout, ALWAYS report no overfill
-                // This prevents false alarms from transient GPIO38 states
-                uint8_t byteB = overfillValidationComplete ? gpioB_value : 0x00;
+                // CRITICAL: During startup lockout, report pin HIGH (0x01 = normal)
+                // Real MCP23017: HIGH pin = no overfill alarm
+                // After lockout, use validated gpioB_value
+                uint8_t byteB = overfillValidationComplete ? gpioB_value : 0x01;
                 Wire.write(byteA);
                 Wire.write(byteB);
             }
@@ -1063,9 +1085,9 @@ void handleI2CRead() {
             
         case GPIOB:
             {
-                // CRITICAL: During startup lockout, ALWAYS report no overfill
-                // This prevents false alarms from transient GPIO38 states
-                uint8_t byteB = overfillValidationComplete ? gpioB_value : 0x00;
+                // CRITICAL: During startup lockout, report pin HIGH (0x01 = normal)
+                // Real MCP23017: HIGH pin = no overfill alarm
+                uint8_t byteB = overfillValidationComplete ? gpioB_value : 0x01;
                 Wire.write(byteB);
             }
             break;
@@ -1234,7 +1256,8 @@ void mcpEmulatorTask(void *parameter) {
     
     // STEP 1: Force overfill state to SAFE (no alarm) FIRST
     // This ensures any I2C read before full init returns correct value
-    gpioB_value = 0x00;                    // NO overfill alarm
+    // Real MCP23017: pin HIGH (0x01) = normal, pin LOW (0x00) = alarm
+    gpioB_value = 0x01;                    // HIGH = no overfill alarm (matches real hardware)
     overfillAlarmActive = false;           // Alarm flag OFF
     overfillValidationComplete = false;    // Force lockout period
     overfillStartupTime = 0;               // Will be set on first check
@@ -1321,7 +1344,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 9.4d</title>
+    <title>Walter IO Board - Rev 9.4e</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -1373,7 +1396,7 @@ const char* control_html = R"rawliteral(
     <div class="badge ok" id="connBadge">Connected</div>
     <div class="hdr">
         <h1>Walter IO Board</h1>
-        <p>Service Diagnostic Dashboard - Rev 9.4d</p>
+        <p>Service Diagnostic Dashboard - Rev 9.4e</p>
     </div>
 
     <div class="card">
@@ -2369,13 +2392,13 @@ void sendStatusToSerial() {
     
     // Build JSON string with all cellular info including cell tower data
     // Sent every 15 seconds to modem.py on Linux device via Serial1 (RS-232)
-    // Fields: datetime, sdcard, passthrough, lte, rsrp, rsrq, operator, band, mcc, mnc, cellId
-    char jsonBuffer[350];
+    // Fields: datetime, sdcard, passthrough, lte, rsrp, rsrq, operator, band, mcc, mnc, cellId, tac
+    char jsonBuffer[384];
     snprintf(jsonBuffer, sizeof(jsonBuffer),
              "{\"datetime\":\"%s\",\"sdcard\":\"%s\",\"passthrough\":%d,"
              "\"lte\":%d,\"rsrp\":\"%s\",\"rsrq\":\"%s\","
              "\"operator\":\"%s\",\"band\":\"%s\","
-             "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u}",
+             "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u,\"tac\":%u}",
              dateTimeStr.c_str(),
              sdStatus.c_str(),
              passthroughValue,
@@ -2384,7 +2407,7 @@ void sendStatusToSerial() {
              rsrqStr.c_str(),
              operatorStr.c_str(),
              bandStr.c_str(),
-             modemCC, modemNC, modemCID);
+             modemCC, modemNC, modemCID, modemTAC);
     
     // Send to Python device via Serial1 (RS-232)
     Serial1.println(jsonBuffer);
@@ -2998,9 +3021,11 @@ bool lteConnect() {
         modemCC = rsp.data.cellInformation.cc;                    // Country Code (e.g. 310)
         modemNC = rsp.data.cellInformation.nc;                    // Network Code (e.g. 260)
         modemCID = rsp.data.cellInformation.cid;                  // Cell Tower ID
-        Serial.printf("[CELL] Band=%s, Op=%s, RSRP=%s, RSRQ=%s, MCC=%u, MNC=%02u, CID=%u\r\n",
+        modemTAC = rsp.data.cellInformation.tac;
+ 
+        Serial.printf("[CELL] Band=%s, Op=%s, RSRP=%s, RSRQ=%s, MCC=%u, MNC=%02u, CID=%u, TAC=%u\r\n",
                       modemBand.c_str(), modemNetName.c_str(), modemRSRP.c_str(), modemRSRQ.c_str(),
-                      modemCC, modemNC, modemCID);
+                      modemCC, modemNC, modemCID, modemTAC);
     }
     
     Serial.println("LTE connection established successfully");
@@ -3222,6 +3247,7 @@ void refreshCellSignalInfo() {
         modemCC = rsp.data.cellInformation.cc;                    // Country Code (e.g. 310)
         modemNC = rsp.data.cellInformation.nc;                    // Network Code (e.g. 260)
         modemCID = rsp.data.cellInformation.cid;                  // Cell Tower ID
+        modemTAC = rsp.data.cellInformation.tac;                  // Tracking Area Code
     }
     // On failure, keep previous values rather than overwriting with "Unknown"
     // This prevents dashboard from flickering between real data and "Unknown"
@@ -3433,7 +3459,8 @@ void runPassthroughBootMode(unsigned long timeoutMinutes) {
     
     // CRITICAL: Pre-initialize overfill state to SAFE before anything else
     // This ensures no false alarms even if I2C is queried early
-    gpioB_value = 0x00;                    // NO overfill alarm
+    // Real MCP23017: pin HIGH (0x01) = normal, pin LOW (0x00) = alarm
+    gpioB_value = 0x01;                    // HIGH = no overfill alarm (matches real hardware)
     overfillAlarmActive = false;           // Alarm flag OFF
     overfillValidationComplete = false;    // Force lockout period
     overfillStartupTime = 0;
@@ -3603,8 +3630,9 @@ void setup() {
     // =====================================================================
     // CRITICAL: Pre-initialize MCP state to SAFE values before task starts
     // This prevents any race conditions if I2C is queried early
+    // Real MCP23017: pin HIGH (0x01) = normal, pin LOW (0x00) = alarm
     // =====================================================================
-    gpioB_value = 0x00;                    // NO overfill alarm
+    gpioB_value = 0x01;                    // HIGH = no overfill alarm (matches real hardware)
     overfillAlarmActive = false;           // Alarm flag OFF
     overfillValidationComplete = false;    // Force 15-second lockout period
     overfillStartupTime = 0;
@@ -3641,7 +3669,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 9.4d                 ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 9.4e                 ║");
     Serial.println("║  MCP23017 Emulation + Diagnostic Dashboard           ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -3815,7 +3843,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 9.4d initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 9.4e initialization complete!");
     Serial.println("✅ MCP I2C slave running on Core 0 (address 0x20)");
     Serial.println("✅ AJAX web interface active (no refresh flashing)");
     Serial.println("✅ Serial watchdog ready");
