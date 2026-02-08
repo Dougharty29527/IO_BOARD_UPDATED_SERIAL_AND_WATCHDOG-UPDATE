@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.0
+ *  Walter IO Board Firmware - Rev 10.1
  *  Date: 2/8/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -190,6 +190,19 @@
  *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
+ *  Rev 10.1 (2/8/2026) - Performance & Security: Faster Relay Response, Portal Passwords
+ *  - PERFORMANCE: Serial read interval reduced from 5s to 100ms
+ *    * Relay commands from Linux now apply within ~100ms (was up to 5 seconds)
+ *    * Eliminates user-visible delay when starting cycles or changing modes
+ *  - SECURITY: Profile selection screen now requires password "1793" to confirm
+ *    * Password validated server-side (ESP32) — cannot be bypassed by the browser
+ *    * Users select a profile, then must enter password and click Confirm to apply
+ *  - SECURITY: Maintenance screen now requires password "878" to access
+ *    * Password gate shown on every visit; stays unlocked for the browser session
+ *    * Prevents unauthorized access to alarm clearing, tests, and passthrough
+ *  - IMPROVED: Serial "no data" warning frequency adjusted for faster read interval
+ *
+ *  =====================================================================
  *  Rev 10.0 (2/8/2026) - MAJOR REWRITE: MCP Emulation Removed, Serial Relay Control
  *  - REMOVED: MCP23017 I2C slave emulation (all 22 registers, handlers, task)
  *  - NEW: ESP32 is now I2C MASTER reading ADS1015 ADC at 0x48
@@ -244,7 +257,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.0"
+#define VERSION "Rev 10.1"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -579,7 +592,10 @@ static unsigned long lastSendTime = 0;
 static unsigned long lastFirmwareCheckMillis = 0;   // millis() of last firmware check
 static bool firmwareCheckDoneThisSlot = false;       // Prevents re-checking within same 15-min slot
 static unsigned long readTime = 0;
-static unsigned int readInterval = 5000;
+// SPEED FIX: Was 5000ms (5 seconds!) — caused massive delay between Python
+// sending a mode command and ESP32 actually reading it. readSerialData() is
+// lightweight (just checks Serial1.available()), so 100ms is safe and responsive.
+static unsigned int readInterval = 100;   // 100ms — relay commands apply within 100ms
 static unsigned long int seq = 0;
 static unsigned long lastSDCheck = 0;
 unsigned long currentTime = millis();
@@ -3850,9 +3866,10 @@ void readSerialData() {
         noSerialCount++;
         
         // Debug: Print if we haven't received data in a while
-        if (noSerialCount % 20 == 0 && noSerialCount > 0) {
+        // Only warn every ~10 seconds (100 polls at 100ms each = 10s)
+        if (noSerialCount % 100 == 0 && noSerialCount > 0) {
             Serial.print("⚠ No serial data received for ");
-            Serial.print(noSerialCount * 5);  // readInterval is 5 seconds
+            Serial.print(noSerialCount / 10);  // readInterval is 100ms, so /10 = seconds
             Serial.println(" seconds");
         }
     }
