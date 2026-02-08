@@ -1,13 +1,13 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 9.4e
- *  Date: 2/6/2026
+ *  Walter IO Board Firmware - Rev 10.0
+ *  Date: 2/8/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
+ *  - Rev 9.4f (MCP23017 Emulator + Diagnostic Dashboard)
  *  - RMS_CBOR_1_16 (Walter RMS w/OTA and ZTA)
- *  - MCP_Simple (MCP23017 Emulator for I2C relay control)
- *  - walter_i2c_slave (Improved web interface and SD config)
+ *  - Python control.py (Relay cycle logic, profile management, alarm monitoring)
  *  
  *  =====================================================================
  *  REVISION HISTORY
@@ -190,15 +190,47 @@
  *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
+ *  Rev 10.0 (2/8/2026) - MAJOR REWRITE: MCP Emulation Removed, Serial Relay Control
+ *  - REMOVED: MCP23017 I2C slave emulation (all 22 registers, handlers, task)
+ *  - NEW: ESP32 is now I2C MASTER reading ADS1015 ADC at 0x48
+ *    * Channel 0: Pressure sensor (single-ended, 200-sample rolling average)
+ *    * Channels 2&3: Current monitoring (abs differential, 20-sample rolling avg)
+ *    * 60Hz polling on Core 0 FreeRTOS task with error recovery
+ *  - NEW: Relay control via serial JSON mode field (replaces I2C register writes)
+ *    * Linux sends {"type":"data",...,"mode":0,...} → ESP32 sets relays for mode
+ *    * setRelaysForMode(): Mode 0=Idle, 1=Run, 2=Purge, 3=Burp, 8=FreshAir
+ *  - NEW: Failsafe relay control when Comfile is down (after 2 restart attempts)
+ *    * Full autonomous cycle logic: pressure auto-start, run/purge/burp sequences
+ *    * Current monitoring: low (<3A for 9 readings), high (>25A for 2s) protection
+ *    * Adds 8192 to fault code when in failsafe mode
+ *  - NEW: ProfileManager class with 6 profiles (CS2, CS3, CS8, CS9, CS12, CS13)
+ *    * Per-profile alarm thresholds, fault code maps, cycle sequences
+ *    * Stored in EEPROM, selectable via serial command or web portal
+ *  - NEW: Full web interface SPA replicating all PySimpleGUI screens
+ *    * 20+ screens: Main, Alarms, Maintenance, Manual, Tests, Profiles, About, etc.
+ *    * Profile-dependent alarm layouts and fault code display
+ *    * Command POST endpoint for button actions
+ *  - NEW: CBOR ring buffer during passthrough mode (~10KB, 120 min capacity)
+ *    * Buffers sensor data every 15s during PPP session
+ *    * Flushes to modem after passthrough ends
+ *  - SIMPLIFIED: DISP_SHUTDN stays HIGH on boot, only goes LOW on {"mode":"shutdown"}
+ *  - SIMPLIFIED: Overfill is direct GPIO38 read (no MCP emulation needed)
+ *  - CHANGED: PPP request finishes current purge step before entering passthrough
+ *  - ESP32 sends pressure, current, overfill status to Linux via serial JSON
+ *  
+ *  =====================================================================
  *  FEATURES
  *  =====================================================================
- *  - MCP23017 I2C emulation at address 0x20 (BANK=0 mode)
- *  - 5 relay outputs (Motor, CR1, CR2, CR5, V6) on Port A
- *  - Overfill sensor input on Port B (GPIO38, active-low with pull-up)
- *  - Web interface with AJAX updates (no flashing)
- *  - Serial watchdog: 30-min timeout, GPIO39 pulse, fault code 1024
- *  - BlueCherry OTA support with graceful fallback, fault code 4096
- *  - Thread-safe operation across Core 0 (I2C) and Core 1 (Main/Web)
+ *  - ADS1015 12-bit ADC reading (pressure + current) via I2C master at 0x48
+ *  - 5 relay outputs (Motor, CR1, CR2, CR5, DISP_SHUTDN) controlled via serial
+ *  - Overfill sensor input (GPIO38, active-low with internal pull-up)
+ *  - Failsafe autonomous relay control when Comfile panel is down
+ *  - ProfileManager: 6 profiles with per-profile alarms and cycle sequences
+ *  - Full SPA web interface replicating PySimpleGUI control screens
+ *  - CBOR data buffering during PPP passthrough sessions
+ *  - Serial watchdog: 30-min timeout, GPIO39 pulse, failsafe after 2 attempts
+ *  - BlueCherry OTA support with graceful fallback
+ *  - Thread-safe operation across Core 0 (ADC) and Core 1 (Main/Web)
  *  
  *  =====================================================================
  *  FAULT CODES
@@ -206,12 +238,13 @@
  *  - 1024: Serial watchdog triggered (no serial data for 30+ minutes)
  *  - 4096: BlueCherry platform offline (OTA updates unavailable)
  *  - 5120: Both watchdog AND BlueCherry faults active
+ *  - 8192: Panel down - ESP32 in failsafe mode (Comfile not responding)
  *  - Note: These are ADDED to any existing fault codes from the device
  *  
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 9.4e"
+#define VERSION "Rev 10.0"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -233,40 +266,39 @@ String ver = VERSION;
 #include <tinycbor.h>
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>    // WS2812B RGB LED control (install via Library Manager)
-// Adafruit_ADS1X15 removed in Rev 9.4 - QC mode removed for simplification
-// Web interface HTML is embedded directly below (after web server setup section)
+#include <Adafruit_ADS1X15.h>     // ADS1015 12-bit ADC (install via Library Manager)
 
 // =====================================================================
-// MCP23017 EMULATOR CONFIGURATION
+// FORWARD DECLARATIONS
 // =====================================================================
-#define I2C_ADDRESS 0x20        // MCP23017 default address for Linux master
-#define SDA_PIN 4               // ESP32 I2C data pin
-#define SCL_PIN 5               // ESP32 I2C clock pin
+// The Arduino IDE auto-generates function prototypes, but FAILS when
+// functions are called inside lambda callbacks (e.g. AsyncWebServer
+// request handlers). These explicit forward declarations fix all
+// "not declared in this scope" errors for functions defined later
+// in the file that are referenced inside lambdas or before their
+// definition. Without these, the compiler sees the call site before
+// the function definition and has no prototype to match.
+// =====================================================================
+size_t buildCborFromReadings(uint8_t* buf, size_t bufSize, int data[][10], size_t rowCount);
+bool   sendCborArrayViaSocket(uint8_t* buffer, size_t size);
+void   cleanupOldLogFiles(int currentYear);
+String formatTimestamp(int64_t seconds);
+bool   lteConnected();
+bool   isSDCardOK();
+String getDateTimeString();
+String getJsonValue(const char* json, const char* key);
+void   parsedSerialData();
+void   sendFastSensorPacket();
 
-// MCP23017 Register addresses (BANK=0 mode, which is default)
-// See Microchip datasheet DS20001952C for full register map
-#define IODIRA   0x00   // I/O Direction Register A (1=input, 0=output)
-#define IODIRB   0x01   // I/O Direction Register B
-#define IPOLA    0x02   // Input Polarity Register A (1=inverted)
-#define IPOLB    0x03   // Input Polarity Register B
-#define GPINTENA 0x04   // Interrupt-on-change enable A
-#define GPINTENB 0x05   // Interrupt-on-change enable B
-#define DEFVALA  0x06   // Default compare value A
-#define DEFVALB  0x07   // Default compare value B
-#define INTCONA  0x08   // Interrupt control A
-#define INTCONB  0x09   // Interrupt control B
-#define IOCON    0x0A   // Configuration register (also at 0x0B)
-#define IOCON_B  0x0B   // Configuration register mirror
-#define GPPUA    0x0C   // Pull-up resistor A
-#define GPPUB    0x0D   // Pull-up resistor B
-#define INTFA    0x0E   // Interrupt flag A
-#define INTFB    0x0F   // Interrupt flag B
-#define INTCAPA  0x10   // Interrupt capture A
-#define INTCAPB  0x11   // Interrupt capture B
-#define GPIOA    0x12   // Port A GPIO
-#define GPIOB    0x13   // Port B GPIO
-#define OLATA    0x14   // Output Latch A
-#define OLATB    0x15   // Output Latch B
+// =====================================================================
+// ADS1015 ADC CONFIGURATION (Rev 10 - replaces MCP23017 emulation)
+// =====================================================================
+// ESP32 is now I2C MASTER on SDA=4, SCL=5 reading the ADS1015 ADC.
+// Linux no longer drives these I2C lines (communicates via serial only).
+#define ADS1015_ADDRESS 0x48    // ADS1015 default I2C address
+#define SDA_PIN 4               // ESP32 I2C data pin (now MASTER)
+#define SCL_PIN 5               // ESP32 I2C clock pin (now MASTER)
+Adafruit_ADS1015 ads;           // 12-bit ADC object
 
 // ESP32 GPIO pins for relay outputs (MCP Port A)
 #define CR0_MOTOR 11   // MCP GPA0 - Motor (Vac Pump)
@@ -297,69 +329,145 @@ enum RunMode {
 
 String mode_names[] = {"Idle", "Run", "Purge", "Burp"};
 
-// MCP emulator global variables (protected by mutex)
-// Note: Real MCP23017 defaults IODIR to 0xFF (all inputs), but we override for our application
-// CRITICAL: gpioA_value bit 4 (0x10) = DISP_SHUTDN - MUST start ON to match physical state
-volatile uint8_t gpioA_value = 0x10;  // V6/DISP_SHUTDN starts ON
-volatile uint8_t gpioB_value = 0x01;  // GPB0 HIGH = normal (no overfill), LOW = alarm
-volatile uint8_t iodirA_value = 0x00;  // 0x00 = All OUTPUT (GPA0-GPA4 are relay outputs)
-volatile uint8_t iodirB_value = 0x01;  // 0x01 = GPB0 is INPUT (overfill sensor)
-volatile uint8_t ipolA_value = 0x00;   // No polarity inversion
-volatile uint8_t ipolB_value = 0x00;   // No polarity inversion
-volatile uint8_t gpintenA_value = 0x00; // Interrupts disabled
-volatile uint8_t gpintenB_value = 0x00; // Interrupts disabled
-volatile uint8_t defvalA_value = 0x00;
-volatile uint8_t defvalB_value = 0x00;
-volatile uint8_t intconA_value = 0x00;
-volatile uint8_t intconB_value = 0x00;
-volatile uint8_t iocon_value = 0x00;   // BANK=0, SEQOP=0 (default)
-volatile uint8_t gppuA_value = 0x00;   // No pull-ups
-volatile uint8_t gppuB_value = 0x00;   // No pull-ups
-volatile uint8_t intfA_value = 0x00;   // No interrupt flags
-volatile uint8_t intfB_value = 0x00;
-volatile uint8_t intcapA_value = 0x00; // Interrupt capture
-volatile uint8_t intcapB_value = 0x00;
-volatile uint8_t olatA_value = 0x00;   // Output latch
-volatile uint8_t olatB_value = 0x00;
-volatile uint8_t registerPointer = 0x00;
-volatile bool pendingRelayWrite = false;  // Deferred relay pin write flag
-// Set by I2C callback, processed by task loop. Keeps I2C callbacks fast
-// to avoid clock stretching that blocks other I2C slaves (ADS1015 at 0x48).
+// =====================================================================
+// ADS1015 ADC GLOBALS (Rev 10 - replaces MCP register globals)
+// =====================================================================
+// ADC readings updated by Core 0 task at 60Hz, read by Core 1 (main loop/web)
+volatile float adcPressure = 0.0;       // Pressure in IWC (200-sample rolling average)
+volatile float adcCurrent = 0.0;        // Abs current in Amps (20-sample rolling average)
+volatile float adcPeakCurrent = 0.0;    // Peak current reading (for high-current detection)
+volatile int16_t adcRawPressure = 0;    // Raw ADC value for channel 0 (diagnostics)
+volatile int16_t adcRawCurrent = 0;     // Raw abs(ch2-ch3) value (diagnostics)
+volatile uint32_t adcErrorCount = 0;    // Consecutive read errors (resets on success)
+volatile uint32_t adcTotalErrors = 0;   // Total lifetime read errors (diagnostics)
+volatile bool adcInitialized = false;   // True once ADS1015 responds successfully
+
+// ADC calibration constants (from Python control.py)
+// Pressure: mapit(adc_value, adc_zero, 22864, 0.0, 20.8)
+// Note: ADS1015 is 12-bit (0-2047) vs ADS1115 16-bit (0-32767)
+// Scale factor: 12-bit values are ~16x smaller than 16-bit
+float adcZeroPressure = 964.0;    // 15422/16 ≈ 964 (12-bit equivalent of 15422)
+float adcFullPressure = 1429.0;   // 22864/16 ≈ 1429 (12-bit equivalent of 22864)
+float pressureRangeIWC = 20.8;    // Full scale pressure in IWC
+
+// Current: mapit(adc_rms, 1248, 4640, 2.1, 8.0) for 16-bit
+// 12-bit equivalents: 1248/16=78, 4640/16=290
+float adcZeroCurrent = 78.0;      // 12-bit equivalent
+float adcFullCurrent = 290.0;     // 12-bit equivalent
+float currentRangeLow = 2.1;      // Amps at zero ADC
+float currentRangeHigh = 8.0;     // Amps at full ADC
+
+// Rolling average buffers
+#define PRESSURE_AVG_SAMPLES 200
+#define CURRENT_AVG_SAMPLES 20
+float pressureBuffer[PRESSURE_AVG_SAMPLES] = {0};
+float currentBuffer[CURRENT_AVG_SAMPLES] = {0};
+int pressureBufferIdx = 0;
+int currentBufferIdx = 0;
+int pressureSampleCount = 0;       // Tracks how many samples collected (for initial fill)
+int currentSampleCount = 0;
+
+// =====================================================================
+// RELAY CONTROL GLOBALS (Rev 10 - controlled via serial, not I2C)
+// =====================================================================
+volatile uint8_t currentRelayMode = 0;        // Current relay mode (0-9)
+volatile bool dispShutdownActive = true;       // DISP_SHUTDN state: true=HIGH(on), false=LOW(shutdown)
+// DISP_SHUTDN starts HIGH on boot and ONLY goes LOW on {"mode":"shutdown"} serial command
+
+// =====================================================================
+// OVERFILL GLOBALS (simplified - direct GPIO38 read, no MCP emulation)
+// =====================================================================
 unsigned long overfillCheckTimer = 0;
 uint8_t overfillLowCount = 0;
 bool overfillAlarmActive = false;
 
 // Overfill validation system - prevents false alarms during power cycles/flashes/reboots
-// The GPIO38 input can have transient states during startup before pull-up stabilizes
+// GPIO38 can have transient states during startup before pull-up stabilizes
 // PROTECTION LAYERS:
-//   1. gpioB_value initialized to 0x01 (HIGH = no alarm, matches real MCP23017 pin state)
-//   2. overfillValidationComplete=false until 15 seconds after boot
-//   3. I2C handler returns 0x01 for GPIOB if !overfillValidationComplete (HIGH = normal)
-//   4. Require 8 consecutive LOW readings (8 seconds) to trigger alarm
-//   5. Require 5 consecutive HIGH readings (5 seconds) to clear alarm (hysteresis)
-//   NOTE: Real MCP23017 GPIOB reflects actual pin voltage:
-//         Pin HIGH (pull-up, normal) = bit 0 = 1 = no alarm
-//         Pin LOW  (sensor active)   = bit 0 = 0 = overfill alarm
+//   1. overfillValidationComplete=false until 15 seconds after boot
+//   2. Require 8 consecutive LOW readings (8 seconds) to trigger alarm
+//   3. Require 5 consecutive HIGH readings (5 seconds) to clear alarm (hysteresis)
+//   Overfill sensor is ACTIVE LOW: LOW = overfill detected, HIGH = normal
 bool overfillValidationComplete = false;    // True after startup validation period
 unsigned long overfillStartupTime = 0;      // When overfill monitoring started
 const unsigned long OVERFILL_STARTUP_LOCKOUT = 15000;  // 15 second lockout after boot
 const uint8_t OVERFILL_TRIGGER_COUNT = 8;   // Consecutive LOW readings to trigger
 const uint8_t OVERFILL_CLEAR_COUNT = 5;     // Consecutive HIGH readings to clear
 
-// DISP_SHUTDN (V6) Protection System - CRITICAL SAFETY RELAY
-// This relay controls site shutdown - MUST default to ON (HIGH)
-// Only allow MCP commands to turn it OFF after startup lockout period
-// Prevents accidental shutdown during power cycles and firmware flashes
-bool dispShutdownProtectionActive = true;   // True = force ON, ignore MCP commands
-unsigned long dispShutdownStartupTime = 0;  // When protection started
-const unsigned long DISP_SHUTDN_LOCKOUT = 20000;  // 20 second lockout (longer than overfill)
+// =====================================================================
+// FAILSAFE MODE GLOBALS (Rev 10 - autonomous relay control when Comfile is down)
+// =====================================================================
+bool failsafeMode = false;                  // True when ESP32 controls relays autonomously
+const int FAILSAFE_FAULT_CODE = 8192;       // Added to fault code when in failsafe
+const int MAX_WATCHDOG_ATTEMPTS_BEFORE_FAILSAFE = 2;  // Enter failsafe after 2 restart attempts
 
-// I2C transaction tracking for debugging noisy bus
-volatile uint32_t i2cTransactionCount = 0;
-volatile uint32_t i2cErrorCount = 0;
-volatile uint32_t i2cLastGoodTransaction = 0;
-volatile uint8_t lastRegisterAccessed = 0xFF;
-volatile bool i2cDebugEnabled = false;  // Set true to enable verbose I2C logging
+// Failsafe run cycle state
+bool failsafeCycleRunning = false;          // True when a failsafe cycle is active
+int failsafeCycleStep = 0;                  // Current step in the cycle sequence
+unsigned long failsafeCycleStepTimer = 0;   // Timer for current step
+unsigned long failsafeLastCycleComplete = 0;// When last cycle completed
+int failsafeHighCurrentCount = 0;           // High current event counter (max 4)
+int failsafeLowCurrentCount = 0;            // Consecutive low current readings
+const float LOW_CURRENT_THRESHOLD = 3.0;    // Amps - alarm if below for 9 readings
+const float HIGH_CURRENT_THRESHOLD = 25.0;  // Amps - alarm if above for 2 seconds
+const int LOW_CURRENT_CONSECUTIVE = 9;      // Readings below threshold to trigger
+const int MAX_HIGH_CURRENT_EVENTS = 4;      // Max high current events before stop
+unsigned long failsafeNoCommandTimeout = 0; // Safety: stop if no commands for this long
+
+// Run cycle sequences (from Python control.py)
+// Format: {mode, duration_seconds}
+struct CycleStep {
+    uint8_t mode;
+    uint16_t durationSeconds;
+};
+
+// Normal run cycle: Run 120s, Idle 3s, then 6x(Purge 50s, Burp 5s), Idle 15s
+const CycleStep NORMAL_RUN_CYCLE[] = {
+    {1, 120}, {0, 3},
+    {2, 50}, {3, 5}, {2, 50}, {3, 5}, {2, 50}, {3, 5},
+    {2, 50}, {3, 5}, {2, 50}, {3, 5}, {2, 50}, {3, 5},
+    {0, 15}
+};
+const int NORMAL_RUN_CYCLE_STEPS = 15;
+
+// Manual purge: 6x(Purge 50s, Burp 5s)
+const CycleStep MANUAL_PURGE_CYCLE[] = {
+    {2, 50}, {3, 5}, {2, 50}, {3, 5}, {2, 50}, {3, 5},
+    {2, 50}, {3, 5}, {2, 50}, {3, 5}, {2, 50}, {3, 5}
+};
+const int MANUAL_PURGE_CYCLE_STEPS = 12;
+
+// Clean canister: Run for 15 minutes
+const CycleStep CLEAN_CANISTER_CYCLE[] = {
+    {1, 900}
+};
+const int CLEAN_CANISTER_CYCLE_STEPS = 1;
+
+// Pointer to current active cycle sequence
+const CycleStep* activeCycleSequence = NORMAL_RUN_CYCLE;
+int activeCycleLength = NORMAL_RUN_CYCLE_STEPS;
+
+// =====================================================================
+// CBOR PASSTHROUGH BUFFER (Rev 10 - buffers data during PPP sessions)
+// =====================================================================
+// ~17 bytes per sample, every 15s, 120 min = 480 samples = ~8.2KB
+#define CBOR_BUFFER_MAX_SAMPLES 480    // 120 minutes at 15-second intervals
+#define CBOR_SAMPLE_SIZE 17            // timestamp(4) + mode(1) + press(4) + current(4) + fault(2) + cycles(2)
+
+struct CborBufferSample {
+    uint32_t timestamp;
+    uint8_t mode;
+    float pressure;
+    float current;
+    uint16_t fault;
+    uint16_t cycles;
+};
+
+CborBufferSample* cborPassthroughBuffer = NULL;  // Allocated in setup()
+int cborBufferWriteIdx = 0;           // Next write position
+int cborBufferCount = 0;              // Number of valid samples in buffer
+bool cborBufferingActive = false;     // True during passthrough mode
+unsigned long lastCborBufferTime = 0; // Last time a sample was buffered
 
 // Thread safety
 SemaphoreHandle_t relayMutex = NULL;
@@ -496,9 +604,12 @@ String apSuffix = "";             // Stores the current suffix (random or device
 bool apNameFromSerial = false;    // True if AP name was set from serial device ID
 
 // Status JSON output to Python device (via Serial1/RS-232)
-// Sends datetime, SD status, and passthrough value every 15 seconds
+// FULL status (datetime, SD, LTE, cell info) sent every 15 seconds
+// FAST sensor packet (pressure, current, overfill, mode) sent every 1 second
 unsigned long lastStatusSendTime = 0;
-const unsigned long STATUS_SEND_INTERVAL = 15000;  // 15 seconds in milliseconds
+const unsigned long STATUS_SEND_INTERVAL = 15000;  // 15 seconds - full status
+unsigned long lastSensorSendTime = 0;
+const unsigned long SENSOR_SEND_INTERVAL = 1000;   // 1 second - fast sensor updates
 
 // Passthrough mode - allows IO Board to act as a serial bridge to the modem
 // When enabled, Serial1 (RS-232) data is forwarded directly to/from the modem
@@ -795,20 +906,7 @@ int getBlueCherryFaultCode() {
     return blueCherryConnected ? 0 : BLUECHERRY_FAULT_CODE;
 }
 
-/**
- * Get combined fault code for all system issues
- * Combines watchdog (1024) + BlueCherry (4096) fault codes
- * 
- * Usage example:
- *   int faults = getCombinedFaultCode();  // Returns sum of active fault codes
- *   // 0 = no faults
- *   // 1024 = watchdog triggered (no serial data)
- *   // 4096 = BlueCherry disconnected
- *   // 5120 = both watchdog AND BlueCherry faults
- */
-int getCombinedFaultCode() {
-    return getWatchdogFaultCode() + getBlueCherryFaultCode();
-}
+// getCombinedFaultCode() defined later with failsafe support (Rev 10)
 
 /**
  * Reset watchdog timer when serial data is received
@@ -840,77 +938,119 @@ void resetSerialWatchdog() {
 }
 
 // =====================================================================
-// THREAD-SAFE RELAY CONTROL
+// RELAY CONTROL FUNCTIONS (Rev 10 - controlled via serial mode field)
 // =====================================================================
 
 /**
- * Thread-safe relay write with mutex protection
- * Can be called from I2C handler or internal functions
- * Uses 10ms timeout - long enough for normal use, short enough to not block
+ * Set relay outputs based on operating mode number.
+ * Ported from Python control.py set_relays() function.
  * 
- * CRITICAL: DISP_SHUTDN protection enforced - forces ON during startup lockout
+ * Mode 0 = IDLE:      All relays OFF
+ * Mode 1 = RUN:       Motor + CR1 + CR5 ON, CR2 OFF
+ * Mode 2 = PURGE:     Motor + CR2 ON, CR1 + CR5 OFF
+ * Mode 3 = BURP:      CR5 only ON, all others OFF
+ * Mode 8 = FRESH AIR: CR2 + CR5 ON, Motor + CR1 OFF
+ * Mode 9 = LEAK TEST: CR1 + CR2 + CR5 ON, Motor OFF
+ *
+ * DISP_SHUTDN is managed separately - NOT affected by mode changes.
+ * It stays HIGH unless explicitly set LOW via {"mode":"shutdown"} serial command.
+ *
+ * Usage example:
+ *   setRelaysForMode(1);  // Set relays for RUN mode
+ *   setRelaysForMode(0);  // Set relays for IDLE (all off)
  */
-void setRelayStateSafe(uint8_t relayMask) {
-    // DISP_SHUTDN Protection: Determine what state V6 should be in
-    // During protection period, ALWAYS force HIGH (ON) regardless of requested mask
-    bool dispShutdownState;
-    if (dispShutdownProtectionActive) {
-        dispShutdownState = HIGH;  // Protection active - FORCE ON
-        // Also ensure the mask bit is set so gpioA_value reflects reality
-        relayMask |= 0x10;
-    } else {
-        // Protection expired - allow requested state (bit 4)
-        dispShutdownState = (relayMask & 0x10) ? HIGH : LOW;
-    }
-    
+void setRelaysForMode(uint8_t modeNum) {
     if (relayMutex != NULL && xSemaphoreTake(relayMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        gpioA_value = relayMask;
-        
-        digitalWrite(CR0_MOTOR, (gpioA_value & 0x01) ? HIGH : LOW);
-        digitalWrite(CR1, (gpioA_value & 0x02) ? HIGH : LOW);
-        digitalWrite(CR2, (gpioA_value & 0x04) ? HIGH : LOW);
-        digitalWrite(CR5, (gpioA_value & 0x08) ? HIGH : LOW);
-        // V6 (DISP_SHUTDN) - protected during startup
-        digitalWrite(DISP_SHUTDN, dispShutdownState);
-        
+        switch (modeNum) {
+            case 0:  // IDLE - All relay outputs OFF
+                digitalWrite(CR0_MOTOR, LOW);
+                digitalWrite(CR1, LOW);
+                digitalWrite(CR2, LOW);
+                digitalWrite(CR5, LOW);
+                break;
+            case 1:  // RUN - Motor + CR1 + CR5 ON, CR2 OFF
+                digitalWrite(CR0_MOTOR, HIGH);
+                digitalWrite(CR1, HIGH);
+                digitalWrite(CR2, LOW);
+                digitalWrite(CR5, HIGH);
+                break;
+            case 2:  // PURGE - Motor + CR2 ON, CR1 + CR5 OFF
+                digitalWrite(CR0_MOTOR, HIGH);
+                digitalWrite(CR1, LOW);
+                digitalWrite(CR2, HIGH);
+                digitalWrite(CR5, LOW);
+                break;
+            case 3:  // BURP - Only CR5 ON, everything else OFF
+                digitalWrite(CR0_MOTOR, LOW);
+                digitalWrite(CR1, LOW);
+                digitalWrite(CR2, LOW);
+                digitalWrite(CR5, HIGH);
+                break;
+            case 8:  // FRESH AIR / SPECIAL BURP - CR2 + CR5 ON
+                digitalWrite(CR0_MOTOR, LOW);
+                digitalWrite(CR1, LOW);
+                digitalWrite(CR2, HIGH);
+                digitalWrite(CR5, HIGH);
+                break;
+            case 9:  // LEAK TEST - CR1 + CR2 + CR5 ON (no motor)
+                digitalWrite(CR0_MOTOR, LOW);
+                digitalWrite(CR1, HIGH);
+                digitalWrite(CR2, HIGH);
+                digitalWrite(CR5, HIGH);
+                break;
+            default:
+                // Unknown mode - safe state (all off)
+                digitalWrite(CR0_MOTOR, LOW);
+                digitalWrite(CR1, LOW);
+                digitalWrite(CR2, LOW);
+                digitalWrite(CR5, LOW);
+                break;
+        }
+        currentRelayMode = modeNum;
+        // Update current_mode enum for LED color display
+        if (modeNum <= 3) {
+            current_mode = (RunMode)modeNum;
+        }
         xSemaphoreGive(relayMutex);
     } else {
-        // Mutex timeout - log error but still try to set relays
-        // This shouldn't happen in normal operation
-        // Note: Serial output removed - may run from Core 0 context
-        gpioA_value = relayMask;
-        digitalWrite(CR0_MOTOR, (relayMask & 0x01) ? HIGH : LOW);
-        digitalWrite(CR1, (relayMask & 0x02) ? HIGH : LOW);
-        digitalWrite(CR2, (relayMask & 0x04) ? HIGH : LOW);
-        digitalWrite(CR5, (relayMask & 0x08) ? HIGH : LOW);
-        // V6 (DISP_SHUTDN) - protected during startup
-        digitalWrite(DISP_SHUTDN, dispShutdownState);
+        // Mutex unavailable - write directly (safety fallback)
+        switch (modeNum) {
+            case 0: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, LOW); break;
+            case 1: digitalWrite(CR0_MOTOR, HIGH); digitalWrite(CR1, HIGH); digitalWrite(CR2, LOW); digitalWrite(CR5, HIGH); break;
+            case 2: digitalWrite(CR0_MOTOR, HIGH); digitalWrite(CR1, LOW); digitalWrite(CR2, HIGH); digitalWrite(CR5, LOW); break;
+            case 3: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, HIGH); break;
+            default: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, LOW); break;
+        }
+        currentRelayMode = modeNum;
+        if (modeNum <= 3) current_mode = (RunMode)modeNum;
     }
+    // DISP_SHUTDN is NOT changed here - managed separately via serial shutdown command
+    digitalWrite(DISP_SHUTDN, dispShutdownActive ? HIGH : LOW);
 }
 
 /**
- * Thread-safe relay read with mutex protection
- * Uses short timeout for I2C callback compatibility
- * 
- * IMPORTANT: I2C slave callbacks must respond within microseconds.
- * If mutex is held, we return the cached value without waiting.
+ * Activate DISP_SHUTDN (site shutdown) - sets GPIO13 LOW.
+ * Called ONLY when {"mode":"shutdown"} is received via serial.
+ * This is the ONLY way to shut down the site in Rev 10.
  */
-uint8_t getRelayStateSafe() {
-    uint8_t value = gpioA_value;  // Default to current value (volatile read)
-    
-    // Try to get mutex with very short timeout (1ms max)
-    // If mutex is busy, return cached value - better than blocking I2C
-    if (relayMutex != NULL && xSemaphoreTake(relayMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-        value = gpioA_value;
-        xSemaphoreGive(relayMutex);
-    }
-    return value;
+void activateDispShutdown() {
+    dispShutdownActive = false;
+    digitalWrite(DISP_SHUTDN, LOW);
+    Serial.println("[SHUTDOWN] DISP_SHUTDN set LOW - site shutdown activated");
 }
 
-// set_relay_mode() removed in Rev 9.4 - relay control is exclusively via I2C from Linux master
+/**
+ * Deactivate DISP_SHUTDN (restore site) - sets GPIO13 HIGH.
+ * Called when a non-shutdown mode is received after a shutdown.
+ */
+void deactivateDispShutdown() {
+    dispShutdownActive = true;
+    digitalWrite(DISP_SHUTDN, HIGH);
+    Serial.println("[SHUTDOWN] DISP_SHUTDN set HIGH - site restored");
+}
 
 // =====================================================================
-// MCP23017 EMULATOR FUNCTIONS
+// OVERFILL INPUT VALIDATION (Rev 10 - direct GPIO38 read, no MCP emulation)
 // =====================================================================
 
 /**
@@ -923,38 +1063,49 @@ uint8_t getRelayStateSafe() {
  * 
  * SOLUTION: Multi-layer validation
  *   1. Startup lockout: Ignore readings for first 15 seconds after boot
- *   2. High threshold: Require 8 consecutive LOW readings (was 5) to trigger
- *   3. Hysteresis: Require 5 consecutive HIGH readings (was 3) to clear
+ *   2. High threshold: Require 8 consecutive LOW readings (8 seconds) to trigger
+ *   3. Hysteresis: Require 5 consecutive HIGH readings (5 seconds) to clear
  *   4. Validation flag: Track when monitoring is considered reliable
  * 
  * Overfill sensor is ACTIVE LOW: LOW = overfill detected, HIGH = normal
+ * GPIO38 has internal pull-up enabled via INPUT_PULLUP.
+ * 
+ * Usage example:
+ *   readOverfillSensor();  // Call every ~1 second from ADC task or main loop
+ *   if (overfillAlarmActive) { ... stop relays ... }
  */
 static uint8_t overfillHighCount = 0;  // Counter for HIGH readings to clear alarm
 
-void mcpReadInputsFromPhysicalPins() {
+/**
+ * Read overfill sensor from GPIO38 with validation and hysteresis.
+ * Direct GPIO read - no MCP23017 emulation needed in Rev 10.
+ * Called every ~1 second from the ADS1015 task on Core 0.
+ * 
+ * Sets overfillAlarmActive = true when overfill detected (8 consecutive LOW)
+ * Sets overfillAlarmActive = false when cleared (5 consecutive HIGH)
+ * 
+ * Usage example:
+ *   readOverfillSensor();  // Call periodically (~1 second)
+ *   if (overfillAlarmActive) { setRelaysForMode(0); } // Emergency stop
+ */
+void readOverfillSensor() {
     unsigned long currentMillis = millis();
     
     // Initialize startup time on first call
     if (overfillStartupTime == 0) {
         overfillStartupTime = currentMillis;
-        // Note: Serial output removed - runs on Core 0, corrupts Core 1 output
     }
     
     // STARTUP LOCKOUT: Don't process readings for first 15 seconds
-    // This allows GPIO38 and pull-up resistor to fully stabilize
+    // This allows GPIO38 and internal pull-up resistor to fully stabilize
     if (!overfillValidationComplete) {
         if (currentMillis - overfillStartupTime >= OVERFILL_STARTUP_LOCKOUT) {
             overfillValidationComplete = true;
             overfillLowCount = 0;
             overfillHighCount = 0;
             overfillAlarmActive = false;  // Start with alarm OFF after validation
-            // Note: Serial output removed - runs on Core 0
-        } else {
-            // During lockout, set gpioB to HIGH (normal, no alarm)
-            // Real MCP23017: pin HIGH = bit 1 = no alarm
-            gpioB_value = 0x01;
-            return;
         }
+        return;  // Skip processing during lockout
     }
     
     // Normal operation: Check GPIO38 state every second for overfill alarm detection
@@ -971,7 +1122,6 @@ void mcpReadInputsFromPhysicalPins() {
             // Require OVERFILL_TRIGGER_COUNT consecutive LOW readings to trigger alarm
             if (overfillLowCount >= OVERFILL_TRIGGER_COUNT && !overfillAlarmActive) {
                 overfillAlarmActive = true;
-                // Note: Serial output removed - runs on Core 0
             }
         } else {
             // Normal state (HIGH due to pull-up)
@@ -981,7 +1131,6 @@ void mcpReadInputsFromPhysicalPins() {
             // Require OVERFILL_CLEAR_COUNT consecutive HIGH readings to clear alarm (hysteresis)
             if (overfillHighCount >= OVERFILL_CLEAR_COUNT && overfillAlarmActive) {
                 overfillAlarmActive = false;
-                // Note: Serial output removed - runs on Core 0
             }
         }
         
@@ -989,359 +1138,263 @@ void mcpReadInputsFromPhysicalPins() {
         if (overfillLowCount > 100) overfillLowCount = 100;
         if (overfillHighCount > 100) overfillHighCount = 100;
     }
-    
-    // Set GPIOB value to mirror real MCP23017 pin state:
-    //   Alarm active (sensor pulling LOW) → bit 0 = 0 (pin LOW)
-    //   No alarm (pull-up keeps HIGH)     → bit 0 = 1 (pin HIGH)
-    gpioB_value = overfillAlarmActive ? 0x00 : 0x01;
 }
 
-/**
- * DISP_SHUTDN (V6) Startup Protection Check
- * 
- * PROBLEM: During power cycles and firmware flashes, GPIO13 can momentarily
- * go LOW before the firmware fully initializes, causing unintended site shutdown.
- * 
- * SOLUTION: 20-second lockout period after boot where DISP_SHUTDN is FORCED ON
- * regardless of any MCP or web commands. After lockout, normal control resumes.
- * 
- * Call this function periodically (e.g., from MCP emulator task loop)
- */
-void checkDispShutdownProtection() {
-    unsigned long currentMillis = millis();
+// =====================================================================
+// PROFILE MANAGER CLASS (Rev 10)
+// =====================================================================
+// Manages compressor profiles with per-profile alarm thresholds,
+// fault code maps, and cycle parameters. Stored in flash as const arrays,
+// active profile selection saved to EEPROM (Preferences).
+//
+// Profiles from Python control.py:
+//   CS2  - North American
+//   CS3  - International
+//   CS8  - Mexican Non-GVR (full alarm set, 72-hour shutdown)
+//   CS9  - Mexican GVR
+//   CS12 - Franklin Mini-Jet (72-hour shutdown)
+//   CS13 - Simplified
+//
+// Usage example:
+//   profileManager.loadActiveProfile();           // Load from EEPROM in setup()
+//   profileManager.setActiveProfile("CS8");       // Change via serial or web
+//   ProfileConfig* p = profileManager.getActiveProfile();
+//   if (p->hasLowPressAlarm && pressure < p->lowPressThreshold) { /* alarm */ }
+
+struct ProfileConfig {
+    const char* name;            // "CS8", "CS12", etc.
+    const char* description;     // "Mexican Non-GVR"
+    float pressureSetPoint;      // Auto-start threshold (IWC) for failsafe
+    bool hasZeroPressAlarm;      // Zero-pressure alarm enabled
+    bool hasLowPressAlarm;       // Low-pressure alarm enabled
+    bool hasHighPressAlarm;      // High-pressure alarm enabled
+    bool hasVarPressAlarm;       // Variable-pressure alarm enabled
+    bool has72HourShutdown;      // 72-hour shutdown timer enabled
+    bool hasPanelPowerAlarm;     // Panel power alarm enabled
+    bool hasMotorCurrentAlarm;   // Motor current alarm enabled
+    bool hasOverfillAlarm;       // Overfill alarm enabled
+    // Alarm thresholds
+    float zeroPressLow;          // Zero-press alarm lower bound (e.g., -0.15)
+    float zeroPressHigh;         // Zero-press alarm upper bound (e.g., +0.15)
+    float lowPressThreshold;     // Low-press alarm threshold (e.g., -6.0)
+    float highPressThreshold;    // High-press alarm threshold (e.g., 2.0)
+    float varPressRange;         // Variable-press alarm range (e.g., 0.20)
+    float lowCurrentThreshold;   // Low motor current alarm (e.g., 3.0A)
+    float highCurrentThreshold;  // High motor current alarm (e.g., 25.0A)
+};
+
+// Profile definitions (const, stored in flash)
+const ProfileConfig PROFILES[] = {
+    // CS2 - North American
+    {"CS2", "North American", -3.0,
+     false, false, false, false, false, true, true, true,
+     -0.15, 0.15, -6.0, 2.0, 0.20, 3.0, 25.0},
+    // CS3 - International
+    {"CS3", "International", -3.0,
+     false, false, false, false, false, true, true, true,
+     -0.15, 0.15, -6.0, 2.0, 0.20, 3.0, 25.0},
+    // CS8 - Mexican Non-GVR (full alarm set)
+    {"CS8", "Mexican Non-GVR", -3.0,
+     true, true, true, true, true, true, true, true,
+     -0.15, 0.15, -6.0, 2.0, 0.20, 3.0, 25.0},
+    // CS9 - Mexican GVR
+    {"CS9", "Mexican GVR", -3.0,
+     false, false, true, false, false, true, true, true,
+     -0.15, 0.15, -6.0, 2.0, 0.20, 3.0, 25.0},
+    // CS12 - Franklin Mini-Jet
+    {"CS12", "Franklin Mini-Jet", -3.0,
+     false, false, false, false, true, false, true, true,
+     -0.15, 0.15, -6.0, 2.0, 0.20, 3.0, 25.0},
+    // CS13 - Simplified
+    {"CS13", "Simplified", -3.0,
+     false, false, false, false, false, false, true, true,
+     -0.15, 0.15, -6.0, 2.0, 0.20, 3.0, 25.0}
+};
+const int PROFILE_COUNT = 6;
+
+class ProfileManager {
+public:
+    int activeProfileIndex;   // Index into PROFILES array (default 0 = CS2)
     
-    // Initialize startup time on first call
-    if (dispShutdownStartupTime == 0) {
-        dispShutdownStartupTime = currentMillis;
-        dispShutdownProtectionActive = true;
-        // Force DISP_SHUTDN ON immediately
-        digitalWrite(DISP_SHUTDN, HIGH);
-        // Note: Serial output removed - runs on Core 0
-    }
+    ProfileManager() : activeProfileIndex(0) {}
     
-    // Check if lockout period has expired
-    if (dispShutdownProtectionActive) {
-        if (currentMillis - dispShutdownStartupTime >= DISP_SHUTDN_LOCKOUT) {
-            dispShutdownProtectionActive = false;
-            // Note: Serial output removed - runs on Core 0
-        } else {
-            // Still in lockout - ensure relay stays ON
-            // This catches any edge cases where the relay might have been set LOW
-            if (digitalRead(DISP_SHUTDN) == LOW) {
-                digitalWrite(DISP_SHUTDN, HIGH);
-                // Note: Serial output removed - runs on Core 0
+    /**
+     * Load active profile selection from EEPROM (Preferences).
+     * Call once in setup() after preferences are available.
+     */
+    void loadActiveProfile() {
+        Preferences prefs;
+        prefs.begin("RMS", true);  // Read-only
+        String savedProfile = prefs.getString("profile", "CS2");
+        prefs.end();
+        
+        for (int i = 0; i < PROFILE_COUNT; i++) {
+            if (String(PROFILES[i].name) == savedProfile) {
+                activeProfileIndex = i;
+                Serial.printf("[PROFILE] Loaded active profile from EEPROM: %s (%s)\r\n",
+                              PROFILES[i].name, PROFILES[i].description);
+                return;
             }
         }
-    }
-}
-
-/**
- * Write gpioA_value to physical relay pins
- * Called from I2C handler - must be FAST (no long waits)
- * Returns true if write was performed, false if blocked by web override
- * 
- * CRITICAL: DISP_SHUTDN protection enforced here - forces ON during lockout
- */
-bool mcpWriteOutputsToPhysicalPins() {
-    // Capture gpioA_value atomically ONCE at the start
-    // This prevents race conditions where value changes mid-function
-    uint8_t capturedValue = gpioA_value;
-    
-    // DISP_SHUTDN Protection: Determine what state V6 should be in
-    // During protection period, ALWAYS force HIGH (ON) regardless of MCP command
-    bool dispShutdownState;
-    if (dispShutdownProtectionActive) {
-        dispShutdownState = HIGH;  // Protection active - FORCE ON
-    } else {
-        // Protection expired - allow MCP command (bit 4 of captured value)
-        dispShutdownState = (capturedValue & 0x10) ? HIGH : LOW;
+        activeProfileIndex = 0;  // Default to CS2
+        Serial.printf("[PROFILE] Unknown saved profile '%s', defaulting to CS2\r\n", savedProfile.c_str());
     }
     
-    // Write to physical pins with minimal mutex wait (1ms max)
-    // I2C callbacks must respond quickly to avoid bus timeouts
-    if (relayMutex != NULL && xSemaphoreTake(relayMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-        digitalWrite(CR0_MOTOR, (capturedValue & 0x01) ? HIGH : LOW);
-        digitalWrite(CR1, (capturedValue & 0x02) ? HIGH : LOW);
-        digitalWrite(CR2, (capturedValue & 0x04) ? HIGH : LOW);
-        digitalWrite(CR5, (capturedValue & 0x08) ? HIGH : LOW);
-        // V6 (DISP_SHUTDN) - protected during startup
-        digitalWrite(DISP_SHUTDN, dispShutdownState);
-        xSemaphoreGive(relayMutex);
-        return true;
-    } else {
-        // Mutex busy - write anyway to keep I2C responsive
-        // Use the captured value for consistency
-        digitalWrite(CR0_MOTOR, (capturedValue & 0x01) ? HIGH : LOW);
-        digitalWrite(CR1, (capturedValue & 0x02) ? HIGH : LOW);
-        digitalWrite(CR2, (capturedValue & 0x04) ? HIGH : LOW);
-        digitalWrite(CR5, (capturedValue & 0x08) ? HIGH : LOW);
-        // V6 (DISP_SHUTDN) - protected during startup
-        digitalWrite(DISP_SHUTDN, dispShutdownState);
-        return true;
-    }
-}
-
-/**
- * Handle I2C write transactions from master
- * Uses mutex to protect gpioA_value for thread-safe relay control
- * 
- * Transaction format: [register_address] [data_byte(s)]
- * If only register address is sent, it sets the register pointer for subsequent reads
- */
-void handleI2CWrite(int numBytes) {
-    if (numBytes == 0) {
-        i2cErrorCount++;
-        return;
-    }
-    
-    i2cTransactionCount++;
-    
-    uint8_t reg = Wire.read();
-    numBytes--;
-    
-    // If only register address sent, just set pointer for read
-    if (numBytes == 0) {
-        registerPointer = reg;
-        lastRegisterAccessed = reg;
-        return;
-    }
-    
-    // Process data bytes
-    while (Wire.available() && numBytes > 0) {
-        uint8_t value = Wire.read();
-        numBytes--;
-        lastRegisterAccessed = reg;
-        
-        // Note: I2C debug removed - I2C callbacks run on Core 0, corrupt Core 1 serial
-        
-        switch (reg) {
-            case IODIRA:
-                iodirA_value = value;
-                break;
-                
-            case IODIRB:
-                iodirB_value = value;
-                break;
-                
-            case GPIOA:
-            case OLATA:
-                // CRITICAL: During protection period, FORCE bit 4 (DISP_SHUTDN) to stay ON
-                // This ensures the master cannot accidentally turn off the site during startup
-                if (dispShutdownProtectionActive) {
-                    value |= 0x10;  // Force V6 bit ON regardless of what master sent
-                }
-                
-                // Store value via volatile write (atomic for uint8_t on ESP32)
-                // Do NOT call mcpWriteOutputsToPhysicalPins() here!
-                // GPIO writes + mutex waits cause clock stretching that blocks the
-                // I2C bus, preventing the master from reaching the ADS1015 at 0x48.
-                // The task loop picks up pendingRelayWrite within 1-50ms instead.
-                gpioA_value = value;
-                pendingRelayWrite = true;  // Deferred - task loop does actual pin writes
-                break;
-                
-            case GPIOB:
-            case OLATB:
-                // Port B is input only - ignore writes
-                break;
-                
-            // Store other registers but don't act on them
-            case IPOLA:
-                ipolA_value = value;
-                break;
-            case IPOLB:
-                ipolB_value = value;
-                break;
-            case IOCON:
-            case IOCON_B:
-                iocon_value = value & 0x7F;  // Force BANK=0
-                break;
-            case GPPUA:
-                gppuA_value = value;
-                break;
-            case GPPUB:
-                gppuB_value = value;
-                break;
-                
-            default:
-                // Other registers - just increment
-                break;
+    /**
+     * Set the active profile by name and save to EEPROM.
+     * Returns true if profile was found and set, false if name is unknown.
+     * 
+     * Usage example:
+     *   profileManager.setActiveProfile("CS8");  // Switch to CS8
+     */
+    bool setActiveProfile(const char* profileName) {
+        for (int i = 0; i < PROFILE_COUNT; i++) {
+            if (strcmp(PROFILES[i].name, profileName) == 0) {
+                activeProfileIndex = i;
+                // Save to EEPROM
+                Preferences prefs;
+                prefs.begin("RMS", false);
+                prefs.putString("profile", profileName);
+                prefs.end();
+                Serial.printf("[PROFILE] Active profile changed to: %s (%s)\r\n",
+                              PROFILES[i].name, PROFILES[i].description);
+                return true;
+            }
         }
-        
-        reg++;  // Sequential addressing
+        Serial.printf("[PROFILE] Unknown profile name: %s\r\n", profileName);
+        return false;
     }
     
-    // Rebuild register file immediately so the next I2C read reflects this write.
-    // This is CRITICAL for IPOL: Linux writes IPOLB=0x01 then immediately reads GPIOB.
-    // Without rebuilding, the read returns the stale (non-inverted) value and Linux
-    // sees a false overfill alarm. This function is fast (~1-2µs, just 22 byte writes).
-    // NOTE: mcpWriteOutputsToPhysicalPins() is the slow operation (mutex + GPIO writes)
-    // and is deferred to the task loop via pendingRelayWrite flag -- NOT called here.
-    rebuildMcpRegisterFile();
+    /**
+     * Get pointer to the currently active profile configuration.
+     */
+    const ProfileConfig* getActiveProfile() const {
+        return &PROFILES[activeProfileIndex];
+    }
     
-    i2cLastGoodTransaction = millis();
-}
+    /**
+     * Get the active profile name as a String.
+     */
+    String getActiveProfileName() const {
+        return String(PROFILES[activeProfileIndex].name);
+    }
+    
+    /**
+     * Get the active profile description as a String.
+     */
+    String getActiveProfileDescription() const {
+        return String(PROFILES[activeProfileIndex].description);
+    }
+};
+
+// Global profile manager instance
+ProfileManager profileManager;
+
+// =====================================================================
+// ADS1015 ADC HELPER FUNCTIONS
+// =====================================================================
 
 /**
- * Handle I2C read requests from master
- * Uses pre-built register file for instant, reliable responses
+ * Map a value from one range to another (floating point version).
+ * Ported from Python control.py mapit() function.
  * 
- * Returns register value at current register pointer
- * For GPIOA and IODIRA, writes both A and B bytes (sequential read)
- * NO polarity inversion applied - returns raw values
- */
-// Track last GPIOB value sent over I2C for diagnostics
-// Compare with web dashboard's overfillAlarmActive to detect I2C vs GPIO mismatch
-volatile uint8_t lastI2C_GPIOB_sent = 0x01;  // Last value returned for Port B reads
-volatile uint8_t lastI2C_register = 0xFF;     // Last register read by master
-
-// =====================================================================
-// MCP23017 REGISTER SHADOW MAP
-// =====================================================================
-// Pre-built 22-byte register file that mirrors a real MCP23017's memory map.
-// Updated every 50ms by the emulator task loop. The I2C read handler simply
-// copies from this array — no per-register logic, no multi-byte Wire.write()
-// issues, and register pointer auto-increments exactly like real hardware.
-//
-// Register layout (BANK=0):
-//   0x00 IODIRA    0x01 IODIRB    0x02 IPOLA     0x03 IPOLB
-//   0x04 GPINTENA  0x05 GPINTENB  0x06 DEFVALA   0x07 DEFVALB
-//   0x08 INTCONA   0x09 INTCONB   0x0A IOCON     0x0B IOCON(mirror)
-//   0x0C GPPUA     0x0D GPPUB     0x0E INTFA     0x0F INTFB
-//   0x10 INTCAPA   0x11 INTCAPB   0x12 GPIOA     0x13 GPIOB
-//   0x14 OLATA     0x15 OLATB
-// =====================================================================
-#define MCP_REG_COUNT 22
-volatile uint8_t mcpRegisterFile[MCP_REG_COUNT];
-
-/**
- * Rebuild the MCP23017 register shadow map from current state.
- * Called from MCP emulator task loop every 50ms (same frequency as pin reads).
- * Keeps the entire register file consistent and ready for instant I2C reads.
- *
  * Usage example:
- *   rebuildMcpRegisterFile();  // Call after mcpReadInputsFromPhysicalPins()
+ *   float pressure = mapFloat(adcValue, 964.0, 1429.0, 0.0, 20.8);
+ *   float current = mapFloat(adcRms, 78.0, 290.0, 2.1, 8.0);
  */
-void rebuildMcpRegisterFile() {
-    uint8_t relayState = gpioA_value;  // Volatile read once
-    uint8_t gpiobVal = overfillValidationComplete ? gpioB_value : 0x01;
-    
-    // =====================================================================
-    // CRITICAL: Apply IPOL (Input Polarity) inversion to GPIO reads
-    // =====================================================================
-    // On a real MCP23017, reading the GPIO register returns:
-    //   actual_pin_value XOR IPOL_register
-    // The Adafruit MCP23017 library on Linux may set IPOLB = 0x01 to invert
-    // GPB0 for active-low sensors. Without applying this inversion, the
-    // emulator returns the raw pin value, which Linux interprets BACKWARDS:
-    //   Real MCP23017:  pin HIGH (1) XOR IPOL (1) = 0 → Linux: "normal"
-    //   Old emulator:   pin HIGH (1), no XOR       = 1 → Linux: "OVERFILL!"
-    // =====================================================================
-    uint8_t gpioA_read = relayState ^ ipolA_value;   // Apply Port A inversion
-    uint8_t gpioB_read = gpiobVal   ^ ipolB_value;   // Apply Port B inversion
-    
-    mcpRegisterFile[0x00] = iodirA_value;
-    mcpRegisterFile[0x01] = iodirB_value;
-    mcpRegisterFile[0x02] = ipolA_value;
-    mcpRegisterFile[0x03] = ipolB_value;
-    mcpRegisterFile[0x04] = gpintenA_value;
-    mcpRegisterFile[0x05] = gpintenB_value;
-    mcpRegisterFile[0x06] = defvalA_value;
-    mcpRegisterFile[0x07] = defvalB_value;
-    mcpRegisterFile[0x08] = intconA_value;
-    mcpRegisterFile[0x09] = intconB_value;
-    mcpRegisterFile[0x0A] = iocon_value;
-    mcpRegisterFile[0x0B] = iocon_value;       // IOCON mirror
-    mcpRegisterFile[0x0C] = gppuA_value;
-    mcpRegisterFile[0x0D] = gppuB_value;
-    mcpRegisterFile[0x0E] = 0x00;              // INTFA - no interrupts
-    mcpRegisterFile[0x0F] = 0x00;              // INTFB - no interrupts
-    mcpRegisterFile[0x10] = gpioA_read;        // INTCAPA - GPIO with IPOL applied
-    mcpRegisterFile[0x11] = gpioB_read;        // INTCAPB - GPIO with IPOL applied
-    mcpRegisterFile[0x12] = gpioA_read;        // GPIOA  - GPIO with IPOL applied
-    mcpRegisterFile[0x13] = gpioB_read;        // GPIOB  - GPIO with IPOL applied
-    mcpRegisterFile[0x14] = relayState;        // OLATA  - raw output latch (no IPOL)
-    mcpRegisterFile[0x15] = gpiobVal;          // OLATB  - raw value (no IPOL)
-    
-    // Store the value that will actually be sent for GPIOB (with IPOL applied)
-    lastI2C_GPIOB_sent = gpioB_read;
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+    if (in_max == in_min) return out_min;  // Avoid divide by zero
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
 /**
- * Handle I2C read requests from master using pre-built register file.
+ * Add a sample to the pressure rolling average buffer.
+ * Returns the current rolling average.
  * 
- * CRITICAL FIX: Uses a single Wire.write(buffer, length) call instead of
- * multiple Wire.write(byte) calls. On ESP32-S3, separate Wire.write() calls
- * in onRequest may not buffer correctly, causing the master to receive only
- * the first byte with 0x00 padding for subsequent bytes.
- *
- * Also implements register pointer auto-increment (SEQOP=0, MCP23017 default)
- * so sequential reads advance through registers like real hardware.
- * Master reads from GPIOA (0x12) expecting 2 bytes will get:
- *   Byte 1: GPIOA (0x12) = relay states
- *   Byte 2: GPIOB (0x13) = overfill state
+ * Usage: Called from ADS1015 task at 60Hz.
  */
-void handleI2CRead() {
-    i2cTransactionCount++;
-    lastRegisterAccessed = registerPointer;
-    lastI2C_register = registerPointer;
+float addPressureSample(float sample) {
+    pressureBuffer[pressureBufferIdx] = sample;
+    pressureBufferIdx = (pressureBufferIdx + 1) % PRESSURE_AVG_SAMPLES;
+    if (pressureSampleCount < PRESSURE_AVG_SAMPLES) pressureSampleCount++;
     
-    // Build response buffer starting from current register pointer
-    // Send up to 2 bytes (covers all sequential A+B read patterns)
-    // Uses the pre-built register file for instant, consistent data
-    uint8_t buf[2];
-    uint8_t bytesToSend = 0;
+    // Calculate average over available samples
+    float sum = 0;
+    int count = min(pressureSampleCount, PRESSURE_AVG_SAMPLES);
+    for (int i = 0; i < count; i++) {
+        sum += pressureBuffer[i];
+    }
+    return sum / count;
+}
+
+/**
+ * Add a sample to the current rolling average buffer.
+ * Returns the current rolling average.
+ * 
+ * Usage: Called from ADS1015 task at 60Hz.
+ */
+float addCurrentSample(float sample) {
+    currentBuffer[currentBufferIdx] = sample;
+    currentBufferIdx = (currentBufferIdx + 1) % CURRENT_AVG_SAMPLES;
+    if (currentSampleCount < CURRENT_AVG_SAMPLES) currentSampleCount++;
     
-    if (registerPointer < MCP_REG_COUNT) {
-        buf[0] = mcpRegisterFile[registerPointer];
-        bytesToSend = 1;
-        
-        // For even-numbered registers (Port A), also include the B register
-        // This handles sequential 2-byte reads (e.g., read GPIOA gets GPIOA+GPIOB)
-        if ((registerPointer & 0x01) == 0 && (registerPointer + 1) < MCP_REG_COUNT) {
-            buf[1] = mcpRegisterFile[registerPointer + 1];
-            bytesToSend = 2;
-        }
-    } else {
-        // Unknown register - return 0xFF (idle bus state)
-        buf[0] = 0xFF;
-        bytesToSend = 1;
+    // Calculate average over available samples
+    float sum = 0;
+    int count = min(currentSampleCount, CURRENT_AVG_SAMPLES);
+    for (int i = 0; i < count; i++) {
+        sum += currentBuffer[i];
+    }
+    return sum / count;
+}
+
+// =====================================================================
+// ADS1015 ADC + OVERFILL FREERTOS TASK (Core 0)
+// =====================================================================
+// Replaces the MCP23017 emulator task. Runs on Core 0 at 60Hz.
+// Reads pressure (ch0 single-ended) and current (abs(ch2-ch3) differential).
+// Also monitors the overfill sensor (GPIO38) every ~1 second.
+//
+// Error handling: If ADS1015 read returns -1 or times out, skip that sample
+// and increment error counter. After 10 consecutive errors, attempt reinit.
+// =====================================================================
+
+/**
+ * Initialize ADS1015 as I2C master with bus recovery.
+ * Returns true if ADS1015 responded successfully.
+ * 
+ * Usage example:
+ *   if (!initializeADS1015()) { Serial.println("ADS1015 not found!"); }
+ */
+bool initializeADS1015() {
+    // Perform bus recovery first (clears stuck SDA)
+    i2cBusRecovery();
+    
+    // Initialize I2C as MASTER (not slave like Rev 9)
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(100000);  // 100kHz I2C clock
+    
+    // Initialize ADS1015
+    if (!ads.begin(ADS1015_ADDRESS, &Wire)) {
+        return false;
     }
     
-    // CRITICAL: Single Wire.write(buffer, length) call for reliability
-    // Avoids ESP32-S3 Wire slave buffering issues with multiple Wire.write(byte) calls
-    Wire.write(buf, bytesToSend);
+    // Set gain to +/-4.096V range (matches Python GAIN=1)
+    ads.setGain(GAIN_ONE);
     
-    // Auto-increment register pointer (MCP23017 SEQOP=0 default behavior)
-    // After reading, pointer advances to next register for sequential access
-    registerPointer = (registerPointer + bytesToSend) % MCP_REG_COUNT;
+    // Set data rate to 3300 SPS (fastest for ADS1015) for 60Hz polling
+    ads.setDataRate(RATE_ADS1015_3300SPS);
     
-    i2cLastGoodTransaction = millis();
+    adcInitialized = true;
+    adcErrorCount = 0;
+    return true;
 }
 
-// =====================================================================
-// I2C BUS RECOVERY AND HEALTH MONITORING
-// =====================================================================
-
-// Health monitoring variables
-volatile unsigned long i2cLastActivity = 0;      // Timestamp of last I2C activity
-volatile bool i2cBusHealthy = true;              // Flag for bus health status
-const unsigned long I2C_HEALTH_CHECK_INTERVAL = 30000;  // Check every 30 seconds
-const unsigned long I2C_STALE_THRESHOLD = 120000;       // Consider stale after 2 minutes of no activity
-
 /**
- * I2C Bus Recovery - Clears stuck SDA line
- * 
- * When an I2C transaction is interrupted (power cycle, reset, etc.), the SDA line
- * can get stuck LOW by a slave that was in the middle of sending data.
- * This function toggles SCL up to 9 times to allow the slave to complete its byte
- * and release the bus.
- * 
- * Usage: Call before Wire.begin() at startup or when bus errors detected
+ * I2C Bus Recovery for ADS1015 master mode.
+ * Clears stuck SDA line by toggling SCL up to 9 times.
+ * Called before Wire.begin() or when bus errors detected.
  */
 void i2cBusRecovery() {
-    // Note: Serial output removed - runs on Core 0, corrupts Core 1 output
-    
     // Temporarily configure pins as GPIO
     pinMode(SDA_PIN, INPUT_PULLUP);
     pinMode(SCL_PIN, OUTPUT);
@@ -1354,14 +1407,9 @@ void i2cBusRecovery() {
             delayMicroseconds(5);
             digitalWrite(SCL_PIN, HIGH);
             delayMicroseconds(5);
-            
-            // Check if SDA is released
-            if (digitalRead(SDA_PIN) == HIGH) {
-                break;
-            }
+            if (digitalRead(SDA_PIN) == HIGH) break;
         }
-        
-        // Generate STOP condition (SDA LOW->HIGH while SCL HIGH)
+        // Generate STOP condition
         pinMode(SDA_PIN, OUTPUT);
         digitalWrite(SDA_PIN, LOW);
         delayMicroseconds(5);
@@ -1370,177 +1418,498 @@ void i2cBusRecovery() {
         digitalWrite(SDA_PIN, HIGH);
         delayMicroseconds(5);
     }
-    
-    // Brief delay before reinitializing (100µs is enough for bus to settle)
     delayMicroseconds(100);
 }
 
 /**
- * Initialize I2C Slave with bus recovery
- * Call this at startup and when recovering from errors
+ * ADS1015 ADC Reader + Overfill Monitor - FreeRTOS task running on Core 0.
+ * 
+ * Polls ADS1015 at ~60Hz (16ms interval):
+ *   - Channel 0: Pressure sensor (single-ended)
+ *   - Channels 2 & 3: Current monitoring (abs differential)
+ * 
+ * Also reads GPIO38 overfill sensor every ~1 second.
+ * 
+ * Error recovery: After 10 consecutive read errors, attempts ADS1015 reinit.
+ * 
+ * Data is written to volatile globals readable by Core 1 (main loop, web).
  */
-void initI2CSlave() {
-    // First, attempt bus recovery to clear any stuck conditions
-    i2cBusRecovery();
-    
-    // Initialize I2C as slave
-    Wire.begin((uint8_t)I2C_ADDRESS, SDA_PIN, SCL_PIN, 100000UL);
-    Wire.onReceive(handleI2CWrite);
-    Wire.onRequest(handleI2CRead);
-    
-    // Reset health monitoring
-    i2cLastActivity = millis();
-    i2cBusHealthy = true;
-    i2cTransactionCount = 0;
-    i2cErrorCount = 0;
-    // Note: Serial output removed - runs on Core 0
-}
-
-/**
- * Reset I2C Slave - Full reset with bus recovery
- * Use when bus appears stuck or after errors
- */
-void resetI2CSlave() {
-    // Note: Serial output removed - runs on Core 0
-    Wire.end();
-    delayMicroseconds(500);  // 0.5ms is sufficient for bus settle (was 50ms!)
-    // Old delay(50) blocked the entire Core 0 for 50ms, killing ALL I2C traffic
-    // including ADS1015 transactions. 500µs is more than enough for the I2C
-    // peripheral to release the bus and the pull-ups to restore idle state.
-    
-    initI2CSlave();
-}
-
-/**
- * Check I2C bus health and auto-recover if needed
- * Called periodically from the MCP emulator task
- */
-void checkI2CHealth() {
-    unsigned long now = millis();
-    
-    // Update activity timestamp when transactions occur
-    if (i2cTransactionCount > 0 && i2cLastGoodTransaction > i2cLastActivity) {
-        i2cLastActivity = i2cLastGoodTransaction;
-    }
-    
-    // Check for error conditions that warrant a reset
-    // If we have errors but no successful transactions, bus might be stuck
-    if (i2cErrorCount > 10 && i2cTransactionCount == 0) {
-        // Note: Serial output removed - runs on Core 0
-        resetI2CSlave();
-        return;
-    }
-    
-    // Check if SDA is stuck LOW (indicating a stuck slave condition)
-    // Only check if we haven't had recent activity
-    // This is informational only - we don't auto-reset just for inactivity
-    // because the master might simply not be communicating
-}
-
-// =====================================================================
-// MCP EMULATOR FREERTOS TASK
-// =====================================================================
-void mcpEmulatorTask(void *parameter) {
-    // =========================================================================
-    // CRITICAL: Initialize all MCP state BEFORE I2C starts accepting requests
-    // This prevents false alarms and incorrect relay states during boot
-    // =========================================================================
-    
-    // STEP 1: Force overfill state to SAFE (no alarm) FIRST
-    // This ensures any I2C read before full init returns correct value
-    // Real MCP23017: pin HIGH (0x01) = normal, pin LOW (0x00) = alarm
-    gpioB_value = 0x01;                    // HIGH = no overfill alarm (matches real hardware)
-    overfillAlarmActive = false;           // Alarm flag OFF
-    overfillValidationComplete = false;    // Force lockout period
-    overfillStartupTime = 0;               // Will be set on first check
-    overfillLowCount = 0;                  // Reset trigger counter
-    overfillHighCount = 0;                 // Reset clear counter  
-    overfillCheckTimer = 0;                // Reset check timer
-    
-    // STEP 2: Configure overfill input pin EARLY with pull-up
-    // Do this BEFORE relay outputs to give pull-up time to stabilize
-    // Overfill sensor is active-LOW (pulled LOW when overfill detected)
-    // Internal pull-up keeps line HIGH when sensor not active, prevents floating
+void adcReaderTask(void *parameter) {
+    // STEP 1: Configure overfill input pin with internal pull-up
     pinMode(ESP_OVERFILL, INPUT_PULLUP);
+    vTaskDelay(10 / portTICK_PERIOD_MS);  // Let pull-up stabilize
     
-    // Brief delay to let pull-up stabilize GPIO38
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-    
-    // STEP 3: Configure relay output pins
+    // STEP 2: Configure relay output pins to safe states
     pinMode(CR0_MOTOR, OUTPUT);
     pinMode(CR1, OUTPUT);
     pinMode(CR2, OUTPUT);
     pinMode(CR5, OUTPUT);
     pinMode(DISP_SHUTDN, OUTPUT);
     
-    digitalWrite(CR0_MOTOR, LOW);
-    digitalWrite(CR1, LOW);
-    digitalWrite(CR2, LOW);
-    digitalWrite(CR5, LOW);
-    // V6 MUST stay ON by default - only turn off via explicit I2C command
-    // V6 is ACTIVE HIGH: HIGH = ON, LOW = OFF
-    digitalWrite(DISP_SHUTDN, HIGH);
+    digitalWrite(CR0_MOTOR, LOW);     // Motor OFF
+    digitalWrite(CR1, LOW);           // Relay 1 OFF
+    digitalWrite(CR2, LOW);           // Relay 2 OFF
+    digitalWrite(CR5, LOW);           // Relay 5 OFF
+    digitalWrite(DISP_SHUTDN, HIGH);  // CRITICAL: DISP_SHUTDN ON (safety)
     
-    // STEP 4: Ensure gpioA_value matches physical state
-    // gpioA_value MUST have bit 4 set to reflect DISP_SHUTDN = ON
-    // This prevents I2C read-back issues where master thinks V6 is OFF
-    gpioA_value = 0x10;  // Only V6/DISP_SHUTDN ON, all others OFF
+    // STEP 3: Initialize ADS1015 I2C master
+    bool adsOk = initializeADS1015();
+    if (!adsOk) {
+        // ADS1015 not responding - keep trying in the loop
+        adcInitialized = false;
+        adcErrorCount = 10;  // Start at threshold to trigger reinit
+    }
     
-    // STEP 5: Reset DISP_SHUTDN protection state
-    dispShutdownProtectionActive = true;   // Enable protection
-    dispShutdownStartupTime = 0;           // Will be set on first check
+    // Initialize overfill state
+    overfillAlarmActive = false;
+    overfillValidationComplete = false;
+    overfillStartupTime = 0;
+    overfillLowCount = 0;
+    overfillHighCount = 0;
+    overfillCheckTimer = 0;
     
-    // STEP 6: Build register file BEFORE I2C starts
-    // Ensures first I2C read returns correct data, not uninitialized values
-    rebuildMcpRegisterFile();
+    unsigned long lastAdcRead = 0;
+    const unsigned long ADC_POLL_INTERVAL = 16;  // ~60Hz (1000ms / 60 ≈ 16ms)
     
-    // STEP 7: Initialize I2C slave with bus recovery
-    // ONLY after all state is properly initialized
-    // This clears any stuck conditions from previous power cycle
-    initI2CSlave();
-    
-    unsigned long lastUpdate = 0;
-    unsigned long lastHealthCheck = 0;
-    
-    // Main MCP emulator loop
+    // Main ADC reader loop
     while (true) {
+        unsigned long now = millis();
+        
         // =====================================================================
-        // DEFERRED RELAY WRITE: Process pending relay commands from I2C callback
+        // ADC READING: Poll ADS1015 at ~60Hz
         // =====================================================================
-        // The I2C write callback sets pendingRelayWrite instead of calling
-        // mcpWriteOutputsToPhysicalPins() directly. This avoids clock stretching
-        // inside the I2C callback that would block the bus and prevent the master
-        // from communicating with other slaves (e.g., ADS1015 at 0x48).
-        // Worst-case latency: ~1ms (task loop delay), typical: <1ms.
-        // =====================================================================
-        if (pendingRelayWrite) {
-            pendingRelayWrite = false;
-            mcpWriteOutputsToPhysicalPins();
-            rebuildMcpRegisterFile();  // Update register file immediately after relay change
+        if (now - lastAdcRead >= ADC_POLL_INTERVAL) {
+            lastAdcRead = now;
+            
+            if (adcInitialized) {
+                // Read Channel 0: Pressure sensor (single-ended)
+                int16_t rawPressure = ads.readADC_SingleEnded(0);
+                
+                if (rawPressure >= 0) {
+                    // Success - convert to pressure IWC using rolling average
+                    adcRawPressure = rawPressure;
+                    float pressureIWC = mapFloat((float)rawPressure, adcZeroPressure, adcFullPressure, 0.0, pressureRangeIWC);
+                    // Negate because negative IWC is the normal operating range
+                    adcPressure = addPressureSample(-pressureIWC);
+                    adcErrorCount = 0;  // Reset consecutive error count
+                } else {
+                    adcErrorCount++;
+                    adcTotalErrors++;
+                }
+                
+                // Read Channels 2 & 3: Current monitoring (abs differential)
+                int16_t rawCh2 = ads.readADC_SingleEnded(2);
+                int16_t rawCh3 = ads.readADC_SingleEnded(3);
+                
+                if (rawCh2 >= 0 && rawCh3 >= 0) {
+                    // Calculate absolute differential current
+                    int16_t rawDiff = abs(rawCh2 - rawCh3);
+                    adcRawCurrent = rawDiff;
+                    float currentAmps = mapFloat((float)rawDiff, adcZeroCurrent, adcFullCurrent, currentRangeLow, currentRangeHigh);
+                    if (currentAmps < 0) currentAmps = 0;  // Clamp negative values
+                    adcCurrent = addCurrentSample(currentAmps);
+                    
+                    // Track peak current for high-current detection
+                    if (currentAmps > adcPeakCurrent) {
+                        adcPeakCurrent = currentAmps;
+                    }
+                } else {
+                    adcErrorCount++;
+                    adcTotalErrors++;
+                }
+                
+                // Error recovery: After 10 consecutive errors, attempt reinit
+                if (adcErrorCount >= 10) {
+                    adcInitialized = false;
+                    Wire.end();
+                    vTaskDelay(100 / portTICK_PERIOD_MS);
+                    if (initializeADS1015()) {
+                        adcErrorCount = 0;
+                    } else {
+                        vTaskDelay(1000 / portTICK_PERIOD_MS);  // Wait 1 second before retry
+                    }
+                }
+            } else {
+                // ADS1015 not initialized - try periodically
+                static unsigned long lastReinitAttempt = 0;
+                if (now - lastReinitAttempt >= 5000) {  // Try every 5 seconds
+                    lastReinitAttempt = now;
+                    if (initializeADS1015()) {
+                        adcErrorCount = 0;
+                    }
+                }
+            }
         }
         
-        // Update input states every 50ms
-        if (millis() - lastUpdate >= 50) {
-            mcpReadInputsFromPhysicalPins();
-            
-            // Check DISP_SHUTDN protection status (handles startup lockout)
-            checkDispShutdownProtection();
-            
-            // Rebuild the register shadow map so I2C reads are instant and consistent
-            // This updates all 22 registers from current volatile state in one pass
-            rebuildMcpRegisterFile();
-            
-            lastUpdate = millis();
-        }
+        // =====================================================================
+        // OVERFILL: Check GPIO38 every ~1 second (handled inside readOverfillSensor)
+        // =====================================================================
+        readOverfillSensor();
         
-        // Periodic I2C health check (every 30 seconds)
-        if (millis() - lastHealthCheck >= I2C_HEALTH_CHECK_INTERVAL) {
-            checkI2CHealth();
-            lastHealthCheck = millis();
-        }
-        
+        // Minimum task delay (1ms) for FreeRTOS scheduling
         vTaskDelay(1 / portTICK_PERIOD_MS);
     }
+}
+
+// =====================================================================
+// FAILSAFE RELAY CONTROL (Rev 10)
+// =====================================================================
+// When the Comfile (Linux panel) is down (after 2 watchdog restart attempts),
+// the ESP32 takes over autonomous relay control based on ADC pressure readings.
+//
+// Activation: watchdogRebootAttempts >= 2 AND no serial data
+// Adds 8192 to fault code to indicate "panel down"
+// Runs normal cycle sequences based on pressure thresholds
+// Monitors current and overfill for safety cutoffs
+
+/**
+ * Check if the system should enter failsafe mode.
+ * Called from the main loop when the watchdog detects extended serial loss.
+ * Returns true if failsafe should be activated.
+ * 
+ * Conditions for failsafe:
+ *   1. Watchdog is triggered (no serial data for 30+ min)
+ *   2. At least 2 restart attempts have been made
+ *   3. Not already in failsafe mode
+ */
+bool shouldEnterFailsafeMode() {
+    return watchdogTriggered && 
+           watchdogRebootAttempts >= MAX_WATCHDOG_ATTEMPTS_BEFORE_FAILSAFE && 
+           !failsafeMode;
+}
+
+/**
+ * Enter failsafe mode - ESP32 takes over relay control.
+ * Sets failsafe flag, resets cycle state, and logs activation.
+ */
+void enterFailsafeMode() {
+    failsafeMode = true;
+    failsafeCycleRunning = false;
+    failsafeCycleStep = 0;
+    failsafeHighCurrentCount = 0;
+    failsafeLowCurrentCount = 0;
+    failsafeNoCommandTimeout = millis() + (30UL * 60UL * 1000UL);  // 30 min safety timeout
+    
+    Serial.println("\n╔════════════════════════════════════════════════════════╗");
+    Serial.println("║  ⚠️ FAILSAFE MODE ACTIVATED - ESP32 Controls Relays    ║");
+    Serial.println("║  Comfile panel down after 2 restart attempts           ║");
+    Serial.println("║  Fault code +8192 active                              ║");
+    Serial.println("╚════════════════════════════════════════════════════════╝\n");
+}
+
+/**
+ * Exit failsafe mode - return to serial-controlled operation.
+ * Called when serial data resumes from the Comfile.
+ */
+void exitFailsafeMode() {
+    if (!failsafeMode) return;
+    
+    failsafeMode = false;
+    failsafeCycleRunning = false;
+    failsafeCycleStep = 0;
+    setRelaysForMode(0);  // Idle all relays
+    
+    Serial.println("[FAILSAFE] Exiting failsafe mode - serial data resumed");
+}
+
+/**
+ * Start a failsafe run cycle (normal, purge, or clean).
+ * Sets up the cycle sequence and starts the first step.
+ * 
+ * @param cycleType 0=normal, 1=manual purge, 2=clean canister
+ */
+void startFailsafeCycle(int cycleType) {
+    switch (cycleType) {
+        case 0:  // Normal run cycle
+            activeCycleSequence = NORMAL_RUN_CYCLE;
+            activeCycleLength = NORMAL_RUN_CYCLE_STEPS;
+            break;
+        case 1:  // Manual purge
+            activeCycleSequence = MANUAL_PURGE_CYCLE;
+            activeCycleLength = MANUAL_PURGE_CYCLE_STEPS;
+            break;
+        case 2:  // Clean canister
+            activeCycleSequence = CLEAN_CANISTER_CYCLE;
+            activeCycleLength = CLEAN_CANISTER_CYCLE_STEPS;
+            break;
+        default:
+            return;
+    }
+    
+    failsafeCycleRunning = true;
+    failsafeCycleStep = 0;
+    failsafeHighCurrentCount = 0;
+    failsafeLowCurrentCount = 0;
+    failsafeCycleStepTimer = millis();
+    
+    // Start first step
+    setRelaysForMode(activeCycleSequence[0].mode);
+    Serial.printf("[FAILSAFE] Starting cycle type %d, step 0: mode %d for %d sec\r\n",
+                  cycleType, activeCycleSequence[0].mode, activeCycleSequence[0].durationSeconds);
+}
+
+/**
+ * Stop the current failsafe cycle and idle all relays.
+ * Called on alarm conditions, overfill, or timeout.
+ */
+void stopFailsafeCycle(const char* reason) {
+    if (failsafeCycleRunning) {
+        failsafeCycleRunning = false;
+        failsafeCycleStep = 0;
+        setRelaysForMode(0);
+        Serial.printf("[FAILSAFE] Cycle stopped: %s\r\n", reason);
+    }
+}
+
+/**
+ * Check if the current failsafe cycle step is a purge-related mode.
+ * Used by PPP to determine if we need to finish the current step.
+ */
+bool isCurrentStepPurgeMode() {
+    if (!failsafeCycleRunning) return false;
+    uint8_t currentStepMode = activeCycleSequence[failsafeCycleStep].mode;
+    return (currentStepMode == 2 || currentStepMode == 3);  // PURGE or BURP
+}
+
+/**
+ * Run one iteration of the failsafe cycle state machine.
+ * Called from the main loop when failsafeMode is true.
+ * 
+ * Handles:
+ *   - Cycle step progression (timer-based)
+ *   - Auto-start based on pressure threshold
+ *   - Low current alarm (3.0A for 9 consecutive readings)
+ *   - High current alarm (25.0A for 2 seconds, max 4 events)
+ *   - Overfill detection (immediate stop)
+ *   - Safety timeout (no commands for 30 minutes)
+ */
+void runFailsafeCycleLogic() {
+    if (!failsafeMode) return;
+    
+    const ProfileConfig* profile = profileManager.getActiveProfile();
+    
+    // Safety timeout check
+    if (millis() > failsafeNoCommandTimeout) {
+        stopFailsafeCycle("Safety timeout - no commands received");
+        return;
+    }
+    
+    // Overfill check - immediate stop
+    if (overfillAlarmActive) {
+        stopFailsafeCycle("Overfill alarm detected");
+        return;
+    }
+    
+    // Pressure sensor sanity check
+    if (adcRawPressure < 1 || adcPressure < -40.0) {
+        stopFailsafeCycle("Pressure sensor fault (ADC < 1 or pressure < -40 IWC)");
+        return;
+    }
+    
+    // If cycle is running, monitor current and advance steps
+    if (failsafeCycleRunning) {
+        uint8_t currentStepMode = activeCycleSequence[failsafeCycleStep].mode;
+        
+        // Current monitoring during motor-on modes (1=RUN, 2=PURGE)
+        if (currentStepMode == 1 || currentStepMode == 2) {
+            // Low current alarm: below threshold for consecutive readings
+            if (adcCurrent <= profile->lowCurrentThreshold && adcCurrent > 0) {
+                failsafeLowCurrentCount++;
+                if (failsafeLowCurrentCount >= LOW_CURRENT_CONSECUTIVE) {
+                    stopFailsafeCycle("Low current alarm - motor fault");
+                    return;
+                }
+            } else {
+                failsafeLowCurrentCount = 0;
+            }
+            
+            // High current alarm: above threshold for 2 seconds
+            if (adcCurrent >= profile->highCurrentThreshold) {
+                failsafeHighCurrentCount++;
+                if (failsafeHighCurrentCount >= MAX_HIGH_CURRENT_EVENTS) {
+                    stopFailsafeCycle("High current alarm - exceeded max events");
+                    return;
+                }
+                // Pause briefly (2 seconds), then resume
+                setRelaysForMode(0);
+                vTaskDelay(2000 / portTICK_PERIOD_MS);
+                setRelaysForMode(currentStepMode);
+            }
+        }
+        
+        // Check if current step duration has elapsed
+        unsigned long stepDurationMs = (unsigned long)activeCycleSequence[failsafeCycleStep].durationSeconds * 1000UL;
+        if (millis() - failsafeCycleStepTimer >= stepDurationMs) {
+            // Advance to next step
+            failsafeCycleStep++;
+            
+            if (failsafeCycleStep >= activeCycleLength) {
+                // Cycle complete
+                failsafeCycleRunning = false;
+                failsafeCycleStep = 0;
+                failsafeLastCycleComplete = millis();
+                setRelaysForMode(0);
+                Serial.println("[FAILSAFE] Cycle completed successfully");
+            } else {
+                // Start next step
+                setRelaysForMode(activeCycleSequence[failsafeCycleStep].mode);
+                failsafeCycleStepTimer = millis();
+                Serial.printf("[FAILSAFE] Step %d: mode %d for %d sec\r\n",
+                              failsafeCycleStep,
+                              activeCycleSequence[failsafeCycleStep].mode,
+                              activeCycleSequence[failsafeCycleStep].durationSeconds);
+            }
+        }
+    } else {
+        // No cycle running - check auto-start condition
+        // If pressure exceeds set point and no alarms, start a normal run cycle
+        if (adcPressure >= profile->pressureSetPoint && !overfillAlarmActive && adcInitialized) {
+            // Don't auto-start too frequently (wait 60 seconds between cycles)
+            if (millis() - failsafeLastCycleComplete >= 60000) {
+                Serial.printf("[FAILSAFE] Auto-start: pressure %.2f >= setpoint %.2f\r\n",
+                              adcPressure, profile->pressureSetPoint);
+                startFailsafeCycle(0);  // Normal run cycle
+            }
+        }
+    }
+}
+
+/**
+ * Get combined fault code including failsafe indicator.
+ * Returns base faults + 8192 if in failsafe mode.
+ * 
+ * Usage example:
+ *   int faultCode = getCombinedFaultCode();  // e.g., 1024 + 4096 + 8192 = 13312
+ */
+int getCombinedFaultCode() {
+    int code = 0;
+    if (isInWatchdogState()) code += WATCHDOG_FAULT_CODE;
+    if (!blueCherryConnected) code += BLUECHERRY_FAULT_CODE;
+    if (failsafeMode) code += FAILSAFE_FAULT_CODE;
+    return code;
+}
+
+// =====================================================================
+// CBOR PASSTHROUGH BUFFER FUNCTIONS (Rev 10)
+// =====================================================================
+// During PPP passthrough, normal CBOR data transmission is suspended.
+// These functions buffer sensor data to be transmitted after the session.
+
+/**
+ * Allocate the CBOR passthrough ring buffer.
+ * Call once in setup(). Uses heap memory (~8.2KB for 120 minutes).
+ */
+void allocateCborPassthroughBuffer() {
+    cborPassthroughBuffer = (CborBufferSample*)malloc(sizeof(CborBufferSample) * CBOR_BUFFER_MAX_SAMPLES);
+    if (cborPassthroughBuffer == NULL) {
+        Serial.println("[CBOR] WARNING: Failed to allocate passthrough buffer!");
+    } else {
+        Serial.printf("[CBOR] Passthrough buffer allocated: %d samples (%d bytes, ~%d min)\r\n",
+                      CBOR_BUFFER_MAX_SAMPLES,
+                      (int)(sizeof(CborBufferSample) * CBOR_BUFFER_MAX_SAMPLES),
+                      CBOR_BUFFER_MAX_SAMPLES * 15 / 60);
+    }
+    cborBufferWriteIdx = 0;
+    cborBufferCount = 0;
+    cborBufferingActive = false;
+}
+
+/**
+ * Add a sensor data sample to the passthrough buffer.
+ * Called every 15 seconds during passthrough mode.
+ * Wraps around if buffer is full (oldest samples overwritten).
+ */
+void addSampleToCborBuffer() {
+    if (cborPassthroughBuffer == NULL) return;
+    
+    CborBufferSample sample;
+    sample.timestamp = (uint32_t)currentTimestamp;
+    sample.mode = currentRelayMode;
+    sample.pressure = adcPressure;
+    sample.current = adcCurrent;
+    sample.fault = (uint16_t)(faults + getCombinedFaultCode());
+    sample.cycles = (uint16_t)cycles;
+    
+    cborPassthroughBuffer[cborBufferWriteIdx] = sample;
+    cborBufferWriteIdx = (cborBufferWriteIdx + 1) % CBOR_BUFFER_MAX_SAMPLES;
+    if (cborBufferCount < CBOR_BUFFER_MAX_SAMPLES) cborBufferCount++;
+}
+
+/**
+ * Start buffering CBOR data (called when entering passthrough).
+ */
+void startCborBuffering() {
+    cborBufferingActive = true;
+    cborBufferWriteIdx = 0;
+    cborBufferCount = 0;
+    lastCborBufferTime = millis();
+    Serial.println("[CBOR] Passthrough buffering started");
+}
+
+/**
+ * Stop buffering and flush all buffered samples via modem.
+ * Called after PPP session ends and modem reconnects.
+ * Encodes all buffered samples as a CBOR array-of-arrays and sends.
+ */
+void flushCborPassthroughBuffer() {
+    cborBufferingActive = false;
+    
+    if (cborPassthroughBuffer == NULL || cborBufferCount == 0) {
+        Serial.println("[CBOR] No buffered data to flush");
+        return;
+    }
+    
+    Serial.printf("[CBOR] Flushing %d buffered samples...\r\n", cborBufferCount);
+    
+    // Encode buffered data as CBOR array-of-arrays
+    // Each sample: [timestamp, mode, pressure*100, current*100, fault, cycles]
+    // Process in batches of 12 (same as normal CBOR transmission)
+    int startIdx = (cborBufferWriteIdx - cborBufferCount + CBOR_BUFFER_MAX_SAMPLES) % CBOR_BUFFER_MAX_SAMPLES;
+    
+    int batchReadings[12][10];
+    int batchCount = 0;
+    
+    for (int i = 0; i < cborBufferCount; i++) {
+        int idx = (startIdx + i) % CBOR_BUFFER_MAX_SAMPLES;
+        CborBufferSample* s = &cborPassthroughBuffer[idx];
+        
+        // Extract device ID from deviceName
+        String idStr_local = String(deviceName);
+        if (idStr_local.startsWith("CSX-")) idStr_local = idStr_local.substring(4);
+        else if (idStr_local.startsWith("RND-")) idStr_local = idStr_local.substring(4);
+        int id = idStr_local.toInt();
+        
+        batchReadings[batchCount][0] = id;
+        batchReadings[batchCount][1] = (int)seq++;
+        batchReadings[batchCount][2] = (int)(s->pressure * 100);
+        batchReadings[batchCount][3] = s->cycles;
+        batchReadings[batchCount][4] = s->fault;
+        batchReadings[batchCount][5] = s->mode;
+        batchReadings[batchCount][6] = 0;  // temp placeholder
+        batchReadings[batchCount][7] = (int)(s->current * 100);
+        batchCount++;
+        
+        // Send in batches of 12
+        if (batchCount >= 12) {
+            size_t cborSize = buildCborFromReadings(cborBuffer, sizeof(cborBuffer), batchReadings, batchCount);
+            if (cborSize > 0) {
+                sendCborArrayViaSocket(cborBuffer, cborSize);
+            }
+            batchCount = 0;
+        }
+    }
+    
+    // Send remaining samples
+    if (batchCount > 0) {
+        size_t cborSize = buildCborFromReadings(cborBuffer, sizeof(cborBuffer), batchReadings, batchCount);
+        if (cborSize > 0) {
+            sendCborArrayViaSocket(cborBuffer, cborSize);
+        }
+    }
+    
+    cborBufferCount = 0;
+    cborBufferWriteIdx = 0;
+    Serial.println("[CBOR] Passthrough buffer flushed successfully");
 }
 
 // =====================================================================
@@ -1559,13 +1928,22 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 9.4e</title>
+    <title>Walter IO Board - Rev 10.0</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 12px; background: #f0f2f5; color: #222; }
-        .hdr { text-align: center; padding: 12px 0; }
-        .hdr h1 { font-size: 1.3em; color: #1a1a2e; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 0; background: #f0f2f5; color: #222; }
+        /* SPA Navigation & Layout */
+        .topbar { background: #1a1a2e; color: #fff; padding: 8px 14px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 200; }
+        .topbar .title { font-size: 1em; font-weight: 700; }
+        .topbar .info { font-size: 0.7em; color: #aaa; }
+        .screen { display: none; padding: 12px; }
+        .screen.active { display: block; }
+        .nav-footer { position: fixed; bottom: 0; left: 0; right: 0; max-width: 600px; margin: 0 auto; background: #fff; border-top: 1px solid #ddd; display: flex; padding: 6px 10px; gap: 6px; z-index: 200; }
+        .nav-footer button { flex: 1; padding: 10px 4px; border: none; border-radius: 8px; background: #e0e0e0; font-size: 0.82em; font-weight: 600; cursor: pointer; }
+        .nav-footer button.active { background: #1565c0; color: #fff; }
+        .hdr { text-align: center; padding: 10px 0; }
+        .hdr h1 { font-size: 1.2em; color: #1a1a2e; }
         .hdr p { margin: 4px 0 0; color: #666; font-size: 0.82em; }
         .badge { position: fixed; top: 8px; right: 8px; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; z-index: 100; }
         .badge.ok { background: #4CAF50; color: #fff; }
@@ -1601,106 +1979,328 @@ const char* control_html = R"rawliteral(
         .modal { background: #fff; border-radius: 8px; max-width: 90%%; width: 360px; overflow: hidden; }
         .modal-hdr { background: #e65100; color: #fff; padding: 12px 16px; font-weight: 700; }
         .modal-body { padding: 16px; color: #333; font-size: 0.9em; line-height: 1.5; }
+        .modal-bg { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 300; align-items: center; justify-content: center; }
+        .modal { background: #fff; border-radius: 12px; width: 90%%; max-width: 400px; overflow: hidden; }
+        .modal-hdr { background: #c62828; color: #fff; padding: 12px 16px; font-weight: 700; }
+        .modal-body { padding: 16px; font-size: 0.9em; }
         .modal-body ul { margin: 4px 0 10px; padding-left: 18px; }
         .modal-foot { padding: 10px 16px; background: #f5f5f5; display: flex; justify-content: flex-end; gap: 8px; }
         .btn-cancel { background: #9e9e9e; }
         .btn-danger { background: #c62828; }
+        /* Indicators */
+        .ind { display: inline-block; width: 14px; height: 14px; border-radius: 50%%; margin-right: 6px; vertical-align: middle; }
+        .ind-r { background: #f44336; } .ind-g { background: #4CAF50; } .ind-y { background: #FF9800; }
+        /* Grid layouts for screens */
+        .menu-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 8px 0; }
+        .menu-btn { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 18px 8px; border: none; border-radius: 10px; background: #e8eaf6; font-size: 0.85em; font-weight: 600; color: #1a1a2e; cursor: pointer; min-height: 70px; }
+        .menu-btn:active { background: #c5cae9; }
+        .profile-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+        .profile-btn { padding: 14px 8px; border: 2px solid #ccc; border-radius: 8px; background: #fff; font-size: 0.9em; font-weight: 700; cursor: pointer; text-align: center; }
+        .profile-btn.active-profile { border-color: #1565c0; background: #e3f2fd; color: #1565c0; }
+        .alarm-row { display: flex; align-items: center; padding: 6px 0; border-bottom: 1px solid #f0f0f0; }
+        .alarm-row .name { flex: 1; font-size: 0.85em; }
+        .keypad { display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; max-width: 280px; margin: 10px auto; }
+        .keypad button { padding: 14px; border: 1px solid #ccc; border-radius: 8px; background: #fff; font-size: 1.1em; font-weight: 600; cursor: pointer; }
+        .keypad button:active { background: #e0e0e0; }
+        .key-wide { grid-column: span 2; }
+        .countdown { font-size: 2em; font-weight: 700; text-align: center; padding: 20px; color: #c62828; }
+        .test-status { font-size: 1.1em; text-align: center; padding: 10px; font-weight: 600; }
+        /* Padding at bottom for fixed nav */
+        .content-wrap { padding-bottom: 60px; }
     </style>
 </head>
 <body>
-    <div class="badge ok" id="connBadge">Connected</div>
-    <div class="hdr">
-        <h1>Walter IO Board</h1>
-        <p>Service Diagnostic Dashboard - Rev 9.4e</p>
+    <!-- Top bar with status -->
+    <div class="topbar">
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.0</span></div>
+        <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
+    </div>
+    <div class="content-wrap">
+
+    <!-- ============ MAIN SCREEN ============ -->
+    <div class="screen active" id="scr-main">
+        <div class="hdr"><h1>%DEVICENAME%</h1>
+        <p id="mainProfile">--</p></div>
+        <div class="card"><div class="card-title bg-blue">System Status</div><div class="card-body">
+            <div class="row"><span class="lbl">Pressure (IWC)</span><span class="val" id="pressure">--</span></div>
+            <div class="row"><span class="lbl">Current (A)</span><span class="val" id="mainCurrent">--</span></div>
+            <div class="row"><span class="lbl">Mode</span><span class="val" id="mainMode">Idle</span></div>
+            <div class="row"><span class="lbl">Run Cycles</span><span class="val" id="mainCycles">0</span></div>
+            <div class="row"><span class="lbl">Overfill</span><span class="val" id="mainOverfill">Normal</span></div>
+            <div class="row"><span class="lbl">Status</span><span class="val" id="mainStatus">--</span></div>
+            <div class="row"><span class="lbl">Failsafe</span><span class="val" id="mainFailsafe">Inactive</span></div>
+        </div></div>
+        <div style="display:flex;gap:8px;margin:10px 0">
+            <button class="btn" style="flex:1;padding:12px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-size:0.9em;font-weight:700" onclick="sendCmd('start_cycle','run')">Start Cycle</button>
+            <button class="btn" style="flex:1;padding:12px;background:#c62828;color:#fff;border:none;border-radius:8px;font-size:0.9em;font-weight:700" onclick="sendCmd('stop_cycle')">Stop</button>
+        </div>
+    </div><!-- end scr-main -->
+
+    <!-- ============ ALARMS SCREEN ============ -->
+    <div class="screen" id="scr-alarms">
+        <div class="hdr"><h1>Alarm Status</h1><p id="alarmProfile">--</p></div>
+        <div class="card"><div class="card-title bg-blue">Active Alarms</div><div class="card-body" id="alarmGrid">
+            <div class="alarm-row"><span class="name">Overfill</span><span class="ind ind-g" id="aOvfl"></span></div>
+            <div class="alarm-row"><span class="name">Low Pressure</span><span class="ind ind-g" id="aLowP"></span></div>
+            <div class="alarm-row"><span class="name">High Pressure</span><span class="ind ind-g" id="aHighP"></span></div>
+            <div class="alarm-row"><span class="name">Zero Pressure</span><span class="ind ind-g" id="aZeroP"></span></div>
+            <div class="alarm-row"><span class="name">Var Pressure</span><span class="ind ind-g" id="aVarP"></span></div>
+            <div class="alarm-row"><span class="name">Low Current</span><span class="ind ind-g" id="aLowC"></span></div>
+            <div class="alarm-row"><span class="name">High Current</span><span class="ind ind-g" id="aHighC"></span></div>
+            <div class="alarm-row"><span class="name">Panel Power</span><span class="ind ind-g" id="aPanelPwr"></span></div>
+            <div class="alarm-row"><span class="name">72-Hour Timer</span><span class="ind ind-g" id="a72Hr"></span></div>
+            <div class="alarm-row"><span class="name">Watchdog</span><span class="ind ind-g" id="aWatch"></span></div>
+            <div class="alarm-row"><span class="name">Failsafe Mode</span><span class="ind ind-g" id="aFailsafe"></span></div>
+        </div></div>
+        <div class="card"><div class="card-title bg-gray">Fault Code</div><div class="card-body">
+            <div class="row"><span class="lbl">Combined Code</span><span class="val" id="alarmFault">0</span></div>
+        </div></div>
+    </div><!-- end scr-alarms -->
+
+    <!-- ============ MAINTENANCE PASSWORD GATE ============ -->
+    <!-- User must enter PW 878 before seeing maintenance options.   -->
+    <!-- Once unlocked, maintUnlocked stays true for the session.    -->
+    <div class="screen" id="scr-maint">
+        <div class="hdr"><h1>Maintenance</h1></div>
+        <!-- Password gate (shown when locked) -->
+        <div id="maintLock" style="text-align:center;padding:30px 10px">
+            <p style="color:#666;font-size:0.9em;margin-bottom:12px">Enter maintenance password to continue</p>
+            <input type="password" id="maintPwd" maxlength="10" placeholder="Password" style="padding:10px 14px;border:1px solid #ccc;border-radius:6px;font-size:1em;width:140px;text-align:center">
+            <div style="margin-top:12px">
+                <button class="btn" style="padding:10px 28px;background:#1565c0;color:#fff;border:none;border-radius:6px;font-weight:700" onclick="checkMaintPw()">Unlock</button>
+            </div>
+            <p id="maintPwMsg" style="color:#c62828;font-size:0.85em;margin-top:8px"></p>
+        </div>
+        <!-- Maintenance menu (shown when unlocked) -->
+        <div id="maintMenu" style="display:none">
+            <div class="menu-grid">
+                <button class="menu-btn" onclick="sendCmd('clear_press_alarm')">Clear Press Alarm</button>
+                <button class="menu-btn" onclick="sendCmd('clear_motor_alarm')">Clear Motor Alarm</button>
+                <button class="menu-btn" onclick="nav('tests')">Run Tests</button>
+                <button class="menu-btn" onclick="nav('diagnostics')">Diagnostics</button>
+                <button class="menu-btn" onclick="nav('clean')">Clean Canister</button>
+                <button class="menu-btn" onclick="showPtModal()">Passthrough</button>
+            </div>
+        </div>
+    </div><!-- end scr-maint -->
+
+    <!-- ============ TESTS SCREEN ============ -->
+    <div class="screen" id="scr-tests">
+        <div class="hdr"><h1>Tests</h1></div>
+        <div class="card"><div class="card-body">
+            <div class="row"><span class="lbl">Pressure</span><span class="val" id="testPressure">--</span></div>
+        </div></div>
+        <div class="menu-grid">
+            <button class="menu-btn" onclick="nav('leak')">Leak Test</button>
+            <button class="menu-btn" onclick="nav('func')">Functionality Test</button>
+            <button class="menu-btn" onclick="nav('eff')">Efficiency Test</button>
+        </div>
     </div>
 
-    <div class="card">
-        <div class="card-title bg-blue">Serial Data (from Linux Device)</div>
-        <div class="card-body">
+    <!-- ============ LEAK TEST SCREEN ============ -->
+    <div class="screen" id="scr-leak">
+        <div class="hdr"><h1>Leak Test</h1></div>
+        <div class="card"><div class="card-body">
+            <div class="countdown" id="leakTimer">--:--</div>
+            <div class="test-status" id="leakStatus">Ready</div>
+        </div></div>
+        <div style="display:flex;gap:8px;margin:10px 0">
+            <button class="btn" style="flex:1;padding:12px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('start_test','leak')">Start</button>
+            <button class="btn" style="flex:1;padding:12px;background:#c62828;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('stop_test')">Stop</button>
+        </div>
+    </div>
+
+    <!-- ============ FUNCTIONALITY TEST SCREEN ============ -->
+    <div class="screen" id="scr-func">
+        <div class="hdr"><h1>Functionality Test</h1></div>
+        <div class="card"><div class="card-body">
+            <div class="countdown" id="funcTimer">--</div>
+            <div class="test-status" id="funcStatus">Ready</div>
+        </div></div>
+        <div style="display:flex;gap:8px;margin:10px 0">
+            <button class="btn" style="flex:1;padding:12px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('start_test','func')">Start</button>
+            <button class="btn" style="flex:1;padding:12px;background:#c62828;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('stop_test')">Stop</button>
+        </div>
+    </div>
+
+    <!-- ============ EFFICIENCY TEST SCREEN ============ -->
+    <div class="screen" id="scr-eff">
+        <div class="hdr"><h1>Efficiency Test</h1></div>
+        <div class="card"><div class="card-body">
+            <div class="row"><span class="lbl">Step</span><span class="val" id="effStep">--</span></div>
+            <div class="row"><span class="lbl">Mode</span><span class="val" id="effMode">--</span></div>
+            <div class="row"><span class="lbl">Time</span><span class="val" id="effTime">--</span></div>
+        </div></div>
+        <div style="display:flex;gap:8px;margin:10px 0">
+            <button class="btn" style="flex:1;padding:12px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('start_test','eff')">Start</button>
+            <button class="btn" style="flex:1;padding:12px;background:#c62828;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('stop_test')">Stop</button>
+        </div>
+    </div>
+
+    <!-- ============ CLEAN CANISTER SCREEN ============ -->
+    <div class="screen" id="scr-clean">
+        <div class="hdr"><h1>Clean Canister</h1></div>
+        <div class="card"><div class="card-body">
+            <p style="color:#c62828;font-weight:700;text-align:center;padding:8px">WARNING: This runs the motor for 15 minutes.<br>Asegurese de que el recipiente este vacio.</p>
+            <div class="countdown" id="cleanTimer">15:00</div>
+            <div class="test-status" id="cleanStatus">Ready</div>
+        </div></div>
+        <div style="display:flex;gap:8px;margin:10px 0">
+            <button class="btn" style="flex:1;padding:12px;background:#e65100;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('start_cycle','clean')">Start Clean</button>
+            <button class="btn" style="flex:1;padding:12px;background:#c62828;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('stop_cycle')">Stop</button>
+        </div>
+    </div>
+
+    <!-- ============ STARTUP/SETTINGS SCREEN ============ -->
+    <div class="screen" id="scr-settings">
+        <div class="hdr"><h1>Settings</h1></div>
+        <div class="menu-grid">
+            <button class="menu-btn" onclick="nav('manual')">Manual Mode</button>
+            <button class="menu-btn" onclick="nav('profiles')">Profiles</button>
+            <button class="menu-btn" onclick="nav('overfill')">Overfill Override</button>
+            <button class="menu-btn" onclick="nav('about')">About</button>
+            <button class="menu-btn" onclick="nav('config')">Configuration</button>
+            <button class="menu-btn" onclick="sendCmd('restart')">Reboot ESP32</button>
+        </div>
+    </div>
+
+    <!-- ============ MANUAL MODE SCREEN ============ -->
+    <div class="screen" id="scr-manual">
+        <div class="hdr"><h1>Manual Mode</h1></div>
+        <div class="card"><div class="card-body">
+            <div class="row"><span class="lbl">Pressure</span><span class="val" id="manPressure">--</span></div>
+            <div class="row"><span class="lbl">Current</span><span class="val" id="manCurrent">--</span></div>
+            <div class="row"><span class="lbl">Run Cycles</span><span class="val" id="manCycles">0</span></div>
+            <div class="row"><span class="lbl">Mode</span><span class="val" id="manMode">Idle</span></div>
+        </div></div>
+        <div style="display:flex;gap:8px;margin:10px 0">
+            <button class="btn" style="flex:1;padding:12px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('start_cycle','manual_purge')">Manual Purge</button>
+            <button class="btn" style="flex:1;padding:12px;background:#c62828;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('stop_cycle')">Stop</button>
+        </div>
+    </div>
+
+    <!-- ============ PROFILES SCREEN ============ -->
+    <!-- Select a profile, then confirm with password 1793 before applying. -->
+    <!-- Buttons highlight on select; "Confirm" sends the change.           -->
+    <div class="screen" id="scr-profiles">
+        <div class="hdr"><h1>Select Profile</h1><p>Current: <span id="profCurrent">--</span></p></div>
+        <div class="profile-grid" id="profGrid">
+            <button class="profile-btn" onclick="selectProfile('CS2',this)">CS2<br><small>N. American</small></button>
+            <button class="profile-btn" onclick="selectProfile('CS3',this)">CS3<br><small>International</small></button>
+            <button class="profile-btn" onclick="selectProfile('CS8',this)">CS8<br><small>Mex Non-GVR</small></button>
+            <button class="profile-btn" onclick="selectProfile('CS9',this)">CS9<br><small>Mex GVR</small></button>
+            <button class="profile-btn" onclick="selectProfile('CS12',this)">CS12<br><small>Mini-Jet</small></button>
+            <button class="profile-btn" onclick="selectProfile('CS13',this)">CS13<br><small>Simplified</small></button>
+        </div>
+        <!-- Confirm section: password + confirm button (hidden until profile selected) -->
+        <div id="profConfirm" style="display:none;text-align:center;padding:14px 10px;margin-top:10px;background:#f5f5f5;border-radius:8px">
+            <p style="margin:0 0 8px;font-weight:700;color:#333">Change to: <span id="profSelected" style="color:#1565c0">--</span></p>
+            <input type="password" id="profPwd" maxlength="10" placeholder="Password" style="padding:8px 12px;border:1px solid #ccc;border-radius:6px;font-size:1em;width:120px;text-align:center">
+            <button class="btn" style="margin-left:8px;padding:8px 22px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-weight:700" onclick="confirmProfile()">Confirm</button>
+            <p id="profPwMsg" style="color:#c62828;font-size:0.85em;margin-top:6px"></p>
+        </div>
+    </div>
+
+    <!-- ============ OVERFILL OVERRIDE SCREEN ============ -->
+    <div class="screen" id="scr-overfill">
+        <div class="hdr"><h1>Overfill Override</h1></div>
+        <div class="card"><div class="card-body">
+            <p style="color:#c62828;font-weight:700;text-align:center;padding:12px">WARNING: Overriding the overfill sensor bypasses a critical safety protection. Only use during maintenance.</p>
+            <div style="text-align:center;padding:10px">
+                <button class="btn" style="padding:14px 28px;background:#e65100;color:#fff;border:none;border-radius:8px;font-weight:700;font-size:1em" onclick="sendCmd('overfill_override')">Confirm Override</button>
+            </div>
+        </div></div>
+    </div>
+
+    <!-- ============ ABOUT SCREEN ============ -->
+    <div class="screen" id="scr-about">
+        <div class="hdr"><h1>About</h1></div>
+        <div class="card"><div class="card-body">
+            <div class="row"><span class="lbl">Profile</span><span class="val" id="aboutProfile">--</span></div>
+            <div class="row"><span class="lbl">Firmware</span><span class="val" id="aboutVersion">--</span></div>
+            <div class="row"><span class="lbl">Device Name</span><span class="val" id="aboutDevice">--</span></div>
+            <div class="row"><span class="lbl">IMEI</span><span class="val" id="aboutImei">--</span></div>
+            <div class="row"><span class="lbl">MAC Address</span><span class="val" id="aboutMac">--</span></div>
+            <div class="row"><span class="lbl">Modem Status</span><span class="val" id="aboutModem">--</span></div>
+            <div class="row"><span class="lbl">IP Address</span><span class="val">192.168.4.1</span></div>
+            <div class="row"><span class="lbl">Uptime</span><span class="val" id="aboutUptime">--</span></div>
+            <div class="row"><span class="lbl">Board Temp</span><span class="val" id="aboutTemp">--</span></div>
+            <div class="row"><span class="lbl">ADC Errors</span><span class="val" id="aboutAdcErr">0</span></div>
+        </div></div>
+    </div>
+
+    <!-- ============ CONFIGURATION SCREEN ============ -->
+    <div class="screen" id="scr-config">
+        <div class="hdr"><h1>Configuration</h1></div>
+        <div class="card"><div class="card-title bg-orange">Device Settings</div><div class="card-body">
+            <div class="cfg-row" style="padding:6px 0">
+                <span class="lbl">Password:</span>
+                <input type="password" id="cfgPwd" maxlength="20" placeholder="Required" style="padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:14px;width:120px;">
+            </div>
+            <div style="font-size:0.75em;color:#999;padding:2px 0 8px">Password required for changes</div>
+            <div class="cfg-row" style="padding:6px 0;display:flex;gap:6px;align-items:center">
+                <span class="lbl">Device Name:</span>
+                <input type="text" id="nameInput" maxlength="20" value="%DEVICENAME%" style="padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:14px;flex:1">
+                <button style="padding:6px 14px;background:#1565c0;color:#fff;border:none;border-radius:4px;font-weight:600;cursor:pointer" onclick="saveName()">Save</button>
+            </div>
+            <span id="nameMsg" style="font-size:11px"></span>
+            <div class="cfg-row" style="padding:6px 0;display:flex;gap:6px;align-items:center">
+                <span class="lbl">Serial Watchdog:</span>
+                <label style="display:flex;align-items:center;cursor:pointer">
+                    <input type="checkbox" id="wdToggle" onchange="setWatchdog(this.checked)" style="width:20px;height:20px;margin-right:6px">
+                    <span id="wdLabel" style="font-weight:600;font-size:0.85em">--</span>
+                </label>
+            </div>
+            <div style="font-size:0.75em;color:#999;padding:2px 0 8px">Pulses GPIO39 if no serial data for 30 min</div>
+        </div></div>
+    </div><!-- end scr-config -->
+
+    <!-- ============ DIAGNOSTICS SCREEN ============ -->
+    <div class="screen" id="scr-diagnostics">
+        <div class="hdr"><h1>Diagnostics</h1></div>
+        <div class="card"><div class="card-title bg-blue">Serial Data</div><div class="card-body">
             <div class="row"><span class="lbl">Serial Status</span><span class="val" id="serialStatus">--</span></div>
             <div class="row"><span class="lbl">Device ID</span><span class="val" id="deviceId">--</span></div>
-            <div class="row"><span class="lbl">Pressure (IWC)</span><span class="val" id="pressure">--</span></div>
-            <div class="row"><span class="lbl">Current (Amps)</span><span class="val" id="current">--</span></div>
-            <div class="row"><span class="lbl">Operating Mode</span><span class="val" id="mode">--</span></div>
-            <div class="row"><span class="lbl">Run Cycles</span><span class="val" id="cycles">--</span></div>
-            <div class="row"><span class="lbl">Fault Code</span><span class="val" id="fault">--</span></div>
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="card-title bg-green">Cellular Modem</div>
-        <div class="card-body">
+            <div class="row"><span class="lbl">Fault Code</span><span class="val" id="fault">0</span></div>
+        </div></div>
+        <div class="card"><div class="card-title bg-green">ADC Readings</div><div class="card-body">
+            <div class="row"><span class="lbl">ADC Pressure (raw)</span><span class="val" id="adcRawP">--</span></div>
+            <div class="row"><span class="lbl">ADC Current (raw)</span><span class="val" id="adcRawC">--</span></div>
+            <div class="row"><span class="lbl">ADC Initialized</span><span class="val" id="adcInit">--</span></div>
+            <div class="row"><span class="lbl">ADC Errors</span><span class="val" id="adcErrors">0</span></div>
+        </div></div>
+        <div class="card"><div class="card-title bg-green">Cellular Modem</div><div class="card-body">
             <div class="row"><span class="lbl">LTE Status</span><span class="val" id="lteStatus">--</span></div>
-            <div class="row"><span class="lbl">RSRP (Signal)</span><span class="val" id="rsrp">--</span></div>
-            <div class="row"><span class="lbl">RSRQ (Quality)</span><span class="val" id="rsrq">--</span></div>
-            <div class="row"><span class="lbl">Signal Level</span><span class="val"><span class="signal-wrap"><span id="signalLevel">--</span><span class="signal-bar"><span class="signal-fill" id="signalBar"></span></span></span></span></div>
-            <div class="row"><span class="lbl">Operator</span><span class="val" id="operator">--</span></div>
+            <div class="row"><span class="lbl">RSRP</span><span class="val" id="rsrp">--</span></div>
+            <div class="row"><span class="lbl">RSRQ</span><span class="val" id="rsrq">--</span></div>
+            <div class="row"><span class="lbl">Operator</span><span class="val" id="diagOperator">--</span></div>
             <div class="row"><span class="lbl">Band</span><span class="val" id="band">--</span></div>
             <div class="row"><span class="lbl">MCC/MNC</span><span class="val" id="mccmnc">--</span></div>
-            <div class="row"><span class="lbl">Cell Tower ID</span><span class="val" id="cellId">--</span></div>
-            <div class="row"><span class="lbl">TAC</span><span class="val" id="tac">--</span></div>
-            <div class="row"><span class="lbl">BlueCherry Cloud</span><span class="val" id="blueCherry">--</span></div>
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="card-title bg-gray">IO Board Status</div>
-        <div class="card-body">
+            <div class="row"><span class="lbl">Cell ID</span><span class="val" id="cellId">--</span></div>
+            <div class="row"><span class="lbl">BlueCherry</span><span class="val" id="blueCherry">--</span></div>
+        </div></div>
+        <div class="card"><div class="card-title bg-gray">IO Board</div><div class="card-body">
             <div class="row"><span class="lbl">Firmware</span><span class="val" id="version">--</span></div>
             <div class="row"><span class="lbl">Board Temp</span><span class="val" id="temperature">--</span></div>
             <div class="row"><span class="lbl">SD Card</span><span class="val" id="sdCard">--</span></div>
             <div class="row"><span class="lbl">Overfill Sensor</span><span class="val" id="overfill">--</span></div>
-            <div class="row"><span class="lbl">GPIO38 Raw / Counts</span><span class="val" id="overfillDebug" style="font-size:0.78em;color:#888;">--</span></div>
-            <div class="row"><span class="lbl">I2C Last Read</span><span class="val" id="i2cDebug" style="font-size:0.78em;color:#888;">--</span></div>
-            <div class="row"><span class="lbl">I2C Transactions</span><span class="val" id="i2cTx">--</span></div>
-            <div class="row"><span class="lbl">I2C Errors</span><span class="val" id="i2cErr">--</span></div>
+            <div class="row"><span class="lbl">GPIO38 Raw</span><span class="val" id="overfillDebug" style="font-size:0.78em;color:#888">--</span></div>
             <div class="row"><span class="lbl">Watchdog</span><span class="val" id="watchdog">--</span></div>
             <div class="row"><span class="lbl">Uptime</span><span class="val" id="uptime">--</span></div>
-            <div class="row"><span class="lbl">MAC Address</span><span class="val" id="mac">--</span></div>
-        </div>
-    </div>
+            <div class="row"><span class="lbl">MAC</span><span class="val" id="mac">--</span></div>
+        </div></div>
+    </div><!-- end scr-diagnostics -->
 
-    <div class="card">
-        <div class="card-title bg-orange">Configuration</div>
-        <div class="card-body">
-            <div class="cfg-row">
-                <span class="lbl">Password:</span>
-                <input type="password" id="cfgPwd" maxlength="20" placeholder="Required" style="padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:14px;width:120px;">
-            </div>
-            <div class="hint">Password required to change settings below</div>
-            <div class="cfg-row">
-                <span class="lbl">Device Name:</span>
-                <input type="text" id="nameInput" maxlength="20" value="%DEVICENAME%">
-                <button class="btn btn-save" onclick="saveName()">Save</button>
-                <span id="nameMsg" style="font-size:11px;"></span>
-            </div>
-            <div class="hint">Used for WiFi AP name and data identification</div>
-            <div class="cfg-row">
-                <span class="lbl">Serial Watchdog:</span>
-                <label style="display:flex;align-items:center;cursor:pointer;">
-                    <input type="checkbox" id="wdToggle" onchange="setWatchdog(this.checked)" style="width:20px;height:20px;margin-right:6px;">
-                    <span id="wdLabel" style="font-weight:600;font-size:0.85em;">--</span>
-                </label>
-            </div>
-            <div class="hint">Pulses GPIO39 if no serial data for 30 min</div>
-            <div style="border-top:1px solid #eee;padding-top:10px;margin-top:4px;">
-                <div class="cfg-row">
-                    <span class="lbl">Modem Passthrough:</span>
-                    <button class="btn btn-pt" id="ptBtn" onclick="showPtModal()">Enter Passthrough</button>
-                    <span id="ptStatus" style="font-weight:600;font-size:0.85em;color:#999;">Inactive</span>
-                </div>
-                <div class="hint">Bridges serial to modem for PPP. ESP32 restarts and auto-returns after 60 min.</div>
-            </div>
-        </div>
-    </div>
+    </div><!-- end content-wrap -->
 
+    <!-- Passthrough Modal -->
     <div class="modal-bg" id="ptModal">
         <div class="modal">
             <div class="modal-hdr">Enter Passthrough Mode?</div>
             <div class="modal-body">
-                <p style="margin-bottom:8px;"><b>This will:</b></p>
-                <ul><li>Restart ESP32 into passthrough mode</li><li>Bridge RS-232 serial directly to modem</li><li>Disable WiFi and web server</li></ul>
-                <p style="color:#c62828;"><b>Auto-returns to normal after 60 min.</b></p>
+                <p style="margin-bottom:8px"><b>This will:</b></p>
+                <ul><li>Finish current purge step (if running)</li><li>Idle all relays</li><li>Restart ESP32 into passthrough mode</li><li>Bridge serial directly to modem</li></ul>
+                <p style="color:#c62828"><b>Auto-returns to normal after 60 min.</b></p>
             </div>
             <div class="modal-foot">
                 <button class="btn btn-cancel" onclick="closePtModal()">Cancel</button>
@@ -1709,90 +2309,128 @@ const char* control_html = R"rawliteral(
         </div>
     </div>
 
-    <div class="ts" id="lastUpdate">Waiting for data...</div>
+    <!-- Bottom Navigation -->
+    <div class="nav-footer">
+        <button id="nb-main" class="active" onclick="nav('main')">Main</button>
+        <button id="nb-alarms" onclick="nav('alarms')">Alarms</button>
+        <button id="nb-maint" onclick="nav('maint')">Maint</button>
+        <button id="nb-settings" onclick="nav('settings')">Settings</button>
+    </div>
 
     <script>
     (function(){
-        var errs=0;
-        var IP='192.168.4.1';
-
+        var errs=0,IP='192.168.4.1',curScr='main';
+        var navStack=['main'];
         function $(id){return document.getElementById(id);}
         function upd(id,v){var e=$(id);if(e&&e.textContent!==String(v))e.textContent=v;}
-        function conn(ok){var b=$('connBadge');b.textContent=ok?'Connected':'Disconnected';b.className='badge '+(ok?'ok':'err');if(ok)errs=0;}
+        function conn(ok){var b=$('connBadge');if(b){b.textContent=ok?'OK':'ERR';b.className='badge '+(ok?'ok':'err');}if(ok)errs=0;}
+        function setInd(id,alarm){var e=$(id);if(e)e.className='ind '+(alarm?'ind-r':'ind-g');}
 
-        function signalInfo(rsrp){
-            var v=parseFloat(rsrp);
-            // RSRP is always negative (typical range: -60 to -140 dBm)
-            // A value of 0 or positive means "no data yet"
-            if(isNaN(v)||v>=0)return{pct:0,clr:'#ccc',txt:'--'};
-            if(v>=-80)return{pct:100,clr:'#4CAF50',txt:'Excellent'};
-            if(v>=-90)return{pct:75,clr:'#8BC34A',txt:'Good'};
-            if(v>=-100)return{pct:50,clr:'#FF9800',txt:'Fair'};
-            return{pct:25,clr:'#f44336',txt:'Poor'};
-        }
+        // SPA navigation: show one screen, hide others
+        window.nav=function(scr){
+            var screens=document.querySelectorAll('.screen');
+            for(var i=0;i<screens.length;i++)screens[i].classList.remove('active');
+            var target=$('scr-'+scr);if(target)target.classList.add('active');
+            // Update nav footer active state
+            var btns=document.querySelectorAll('.nav-footer button');
+            for(var i=0;i<btns.length;i++)btns[i].classList.remove('active');
+            var nb=$('nb-'+scr);if(nb)nb.classList.add('active');
+            if(scr!==curScr){navStack.push(scr);curScr=scr;}
+        };
 
-        function poll(){
+        // Send command to ESP32 via POST /api/command
+        window.sendCmd=function(cmd,val){
             var x=new XMLHttpRequest();
-            x.timeout=4000;
-            x.onreadystatechange=function(){
-                if(x.readyState!==4)return;
-                if(x.status===200){
-                    try{
-                        var d=JSON.parse(x.responseText);
-                        conn(true);
-                        var ss=$('serialStatus');
-                        if(d.serialActive){ss.textContent='Receiving Data';ss.className='val ok-text';}
-                        else{ss.textContent='No Data';ss.className='val err-text';}
-                        upd('deviceId',d.deviceName||'--');
-                        upd('pressure',d.pressure);upd('current',d.current);upd('mode',d.mode);
-                        upd('cycles',d.cycles);
-                        var fe=$('fault');if(fe){fe.textContent=d.fault||'0';fe.className='val'+(parseInt(d.fault)>0?' warn-text':'');}
-                        var le=$('lteStatus');
-                        if(d.lteConnected){le.innerHTML='<span class=ok-text>Connected</span>';}
-                        else{le.innerHTML='<span class=err-text>Disconnected</span>';}
-                        upd('rsrp',d.rsrp+' dBm');upd('rsrq',d.rsrq+' dB');
-                        var si=signalInfo(d.rsrp);upd('signalLevel',si.txt);
-                        var bar=$('signalBar');if(bar){bar.style.width=si.pct+'%%';bar.style.background=si.clr;}
-                        upd('operator',d.operator||'--');upd('band',d.band||'--');
-                        upd('mccmnc',d.mcc&&d.mnc?(d.mcc+'/'+d.mnc):'--');
-                        upd('cellId',d.cellId||'--');
-                        upd('tac',d.tac||'--');
-                        var bc=$('blueCherry');
-                        if(d.blueCherryConnected){bc.innerHTML='<span class=ok-text>Connected</span>';}
-                        else{bc.innerHTML='<span class=warn-text>Offline</span>';}
-                        upd('version',d.version);upd('temperature',d.temperature+' F');
-                        var sd=$('sdCard');
-                        if(d.sdCardOK){sd.innerHTML='<span class=ok-text>OK</span>';}
-                        else{sd.innerHTML='<span class=err-text>FAULT</span>';}
-                        var ov=$('overfill');
-                        if(d.overfillAlarm){ov.innerHTML='<span class=err-text>ALARM</span>';}
-                        else{ov.innerHTML='<span class=ok-text>Normal</span>';}
-                        var od=$('overfillDebug');
-                        if(od){od.innerHTML='Pin='+(d.gpio38Raw?'<span style=color:#2e7d32>HIGH</span>':'<span style=color:#c62828>LOW</span>')+' L:'+d.overfillLowCnt+' H:'+d.overfillHighCnt+(d.overfillValidated?'':' <span style=color:#e65100>LOCKOUT</span>');}
-                        var id=$('i2cDebug');
-                        if(id){id.innerHTML='Reg='+d.i2cLastReg+' Sent=0x'+('0'+d.i2cLastGPIOB.toString(16)).slice(-2)+' IPOL='+(d.ipolB?'<span style=color:#e65100>0x'+('0'+d.ipolB.toString(16)).slice(-2)+'</span>':'off');}
-                        upd('i2cTx',d.i2cTransactions);upd('i2cErr',d.i2cErrors);
-                        upd('watchdog',d.watchdogEnabled?'Enabled':'Disabled');
-                        var wt=$('wdToggle'),wl=$('wdLabel');
-                        if(wt)wt.checked=d.watchdogEnabled;
-                        if(wl){wl.textContent=d.watchdogEnabled?'ENABLED':'DISABLED';wl.style.color=d.watchdogEnabled?'#2e7d32':'#999';}
-                        upd('uptime',d.uptime);upd('mac',d.macAddress);
-                        $('lastUpdate').textContent='Updated: '+new Date().toLocaleTimeString();
-                    }catch(e){errs++;if(errs>=3)conn(false);}
-                }else{errs++;if(errs>=3)conn(false);}
-            };
-            x.onerror=function(){errs++;if(errs>=3)conn(false);};
-            x.ontimeout=function(){errs++;if(errs>=3)conn(false);};
-            x.open('GET','http://'+IP+'/api/status',true);
-            x.send();
-        }
+            x.open('POST','http://'+IP+'/api/command',true);
+            x.setRequestHeader('Content-Type','application/json');
+            var body=JSON.stringify({command:cmd,value:val||''});
+            x.send(body);
+        };
 
-        // Configuration functions - attached to window for onclick handlers
+        // ---- PROFILE SELECT + PASSWORD CONFIRM (PW: validated server-side) ----
+        // Step 1: User clicks a profile button -> highlights it, shows confirm area
+        var pendingProfile='';   // Tracks which profile the user selected
+        window.selectProfile=function(name,btn){
+            pendingProfile=name;
+            // Highlight selected button, remove highlight from others
+            var btns=document.querySelectorAll('.profile-btn');
+            for(var i=0;i<btns.length;i++) btns[i].classList.remove('active-profile');
+            btn.classList.add('active-profile');
+            // Show the confirm section with selected profile name
+            upd('profSelected',name);
+            $('profPwMsg').textContent='';
+            $('profPwd').value='';
+            $('profConfirm').style.display='block';
+        };
+
+        // Step 2: User enters password and clicks Confirm -> sends to server
+        // Server validates password "1793" before applying the profile change.
+        window.confirmProfile=function(){
+            if(!pendingProfile){return;}
+            var pw=$('profPwd').value;
+            if(!pw){$('profPwMsg').textContent='Password required';return;}
+            var x=new XMLHttpRequest();
+            x.open('POST','http://'+IP+'/api/command',true);
+            x.setRequestHeader('Content-Type','application/json');
+            x.onload=function(){
+                if(x.status===200){
+                    // Success - update display
+                    upd('profCurrent',pendingProfile);
+                    $('profPwMsg').style.color='#2e7d32';
+                    $('profPwMsg').textContent='Profile changed to '+pendingProfile;
+                    $('profPwd').value='';
+                    // Auto-hide confirm area after 2s
+                    setTimeout(function(){$('profConfirm').style.display='none';$('profPwMsg').textContent='';$('profPwMsg').style.color='#c62828';},2000);
+                } else if(x.status===403){
+                    $('profPwMsg').style.color='#c62828';
+                    $('profPwMsg').textContent='Wrong password';
+                } else {
+                    $('profPwMsg').style.color='#c62828';
+                    $('profPwMsg').textContent='Error: '+x.status;
+                }
+            };
+            x.onerror=function(){$('profPwMsg').style.color='#c62828';$('profPwMsg').textContent='Connection error';};
+            // Send profile change with password for server-side validation
+            x.send(JSON.stringify({command:'set_profile',value:pendingProfile,password:pw}));
+        };
+
+        // ---- MAINTENANCE PASSWORD GATE (PW: 878, checked client-side) ----
+        // Keeps maintenance locked until correct password is entered.
+        // Password stays unlocked for the rest of the browser session.
+        var maintUnlocked=false;
+        window.checkMaintPw=function(){
+            var pw=$('maintPwd').value;
+            if(pw==='878'){
+                maintUnlocked=true;
+                $('maintLock').style.display='none';
+                $('maintMenu').style.display='block';
+                $('maintPwMsg').textContent='';
+            } else {
+                $('maintPwMsg').textContent='Incorrect password';
+            }
+        };
+        // Intercept nav to maint: if already unlocked, show menu directly
+        var origNav=window.nav;
+        window.nav=function(scr){
+            origNav(scr);
+            if(scr==='maint'){
+                if(maintUnlocked){
+                    $('maintLock').style.display='none';
+                    $('maintMenu').style.display='block';
+                } else {
+                    $('maintLock').style.display='block';
+                    $('maintMenu').style.display='none';
+                    $('maintPwd').value='';
+                    $('maintPwMsg').textContent='';
+                }
+            }
+        };
+
+        // Config functions
         window.saveName=function(){
-            var n=$('nameInput').value.replace(/^\s+|\s+$/g,''),m=$('nameMsg');
-            var p=$('cfgPwd').value;
+            var n=$('nameInput').value.replace(/^\s+|\s+$/g,''),m=$('nameMsg'),p=$('cfgPwd').value;
             if(!p){m.textContent='Password required';m.style.color='#c62828';return;}
-            if(n.length<3||n.length>20){m.textContent='3-20 chars required';m.style.color='#c62828';return;}
+            if(n.length<3||n.length>20){m.textContent='3-20 chars';m.style.color='#c62828';return;}
             m.textContent='Saving...';m.style.color='#666';
             var x=new XMLHttpRequest();
             x.open('GET','http://'+IP+'/setdevicename?name='+encodeURIComponent(n)+'&pwd='+encodeURIComponent(p),true);
@@ -1805,7 +2443,7 @@ const char* control_html = R"rawliteral(
         };
         window.setWatchdog=function(on){
             var p=$('cfgPwd').value;
-            if(!p){alert('Password required to change watchdog setting');$('wdToggle').checked=!on;return;}
+            if(!p){alert('Password required');$('wdToggle').checked=!on;return;}
             var x=new XMLHttpRequest();
             x.open('GET','http://'+IP+'/setwatchdog?enabled='+(on?'1':'0')+'&pwd='+encodeURIComponent(p),true);
             x.onload=function(){
@@ -1818,18 +2456,80 @@ const char* control_html = R"rawliteral(
         window.closePtModal=function(){$('ptModal').style.display='none';};
         window.confirmPassthrough=function(){
             closePtModal();
-            var b=$('ptBtn'),s=$('ptStatus');
-            s.textContent='Activating...';s.style.color='#e65100';b.disabled=true;
             var x=new XMLHttpRequest();
             x.open('GET','http://'+IP+'/setpassthrough?enabled=1',true);
-            x.onload=function(){s.textContent='Restarting...';s.style.color='#c62828';};
-            x.onerror=function(){s.textContent='Sent (ESP32 restarting)';s.style.color='#e65100';};
             x.send();
         };
 
-        // Start polling immediately, then every 2 seconds
-        poll();
-        setInterval(poll,2000);
+        // Mode name lookup
+        var modeNames={0:'Idle',1:'Run',2:'Purge',3:'Burp',8:'Fresh Air',9:'Leak Test'};
+
+        function poll(){
+            var x=new XMLHttpRequest();
+            x.timeout=4000;
+            x.onreadystatechange=function(){
+                if(x.readyState!==4)return;
+                if(x.status===200){
+                    try{
+                        var d=JSON.parse(x.responseText);
+                        conn(true);
+                        // Top bar
+                        upd('topTime',d.datetime||'--');
+                        // Main screen
+                        upd('pressure',d.pressure);upd('mainCurrent',d.current);
+                        upd('mainMode',modeNames[d.mode]||d.mode);upd('mainCycles',d.cycles);
+                        upd('mainProfile',d.profile||'--');
+                        var ovEl=$('mainOverfill');if(ovEl){ovEl.textContent=d.overfillAlarm?'ALARM':'Normal';ovEl.style.color=d.overfillAlarm?'#c62828':'#2e7d32';}
+                        var fsEl=$('mainFailsafe');if(fsEl){fsEl.textContent=d.failsafe?'ACTIVE':'Inactive';fsEl.style.color=d.failsafe?'#c62828':'#2e7d32';}
+                        upd('mainStatus',d.serialActive?'Online':'No Serial');
+                        // Alarms
+                        upd('alarmProfile',d.profile);upd('alarmFault',d.fault||'0');
+                        setInd('aOvfl',d.overfillAlarm);setInd('aWatch',d.watchdogTriggered);setInd('aFailsafe',d.failsafe);
+                        setInd('aLowP',d.alarmLowPress);setInd('aHighP',d.alarmHighPress);
+                        setInd('aZeroP',d.alarmZeroPress);setInd('aVarP',d.alarmVarPress);
+                        setInd('aLowC',d.alarmLowCurrent);setInd('aHighC',d.alarmHighCurrent);
+                        setInd('aPanelPwr',d.failsafe);setInd('a72Hr',false);
+                        // Manual mode
+                        upd('manPressure',d.pressure);upd('manCurrent',d.current);
+                        upd('manCycles',d.cycles);upd('manMode',modeNames[d.mode]||d.mode);
+                        // Tests
+                        upd('testPressure',d.pressure);
+                        // Profiles
+                        upd('profCurrent',d.profile);
+                        var btns=document.querySelectorAll('.profile-btn');
+                        for(var i=0;i<btns.length;i++){btns[i].classList.remove('active-profile');if(btns[i].textContent.indexOf(d.profile)>=0)btns[i].classList.add('active-profile');}
+                        // About
+                        upd('aboutProfile',d.profile);upd('aboutVersion',d.version);
+                        upd('aboutDevice',d.deviceName);upd('aboutImei',d.imei||'--');
+                        upd('aboutMac',d.macAddress);upd('aboutModem',d.modemStatus);
+                        upd('aboutUptime',d.uptime);upd('aboutTemp',d.temperature+' F');
+                        upd('aboutAdcErr',d.adcErrors||'0');
+                        // Diagnostics
+                        var ss=$('serialStatus');if(ss){ss.textContent=d.serialActive?'Receiving':'No Data';ss.style.color=d.serialActive?'#2e7d32':'#c62828';}
+                        upd('deviceId',d.deviceName);upd('fault',d.fault||'0');
+                        upd('adcRawP',d.adcRawPressure||'--');upd('adcRawC',d.adcRawCurrent||'--');
+                        upd('adcInit',d.adcInitialized?'Yes':'No');upd('adcErrors',d.adcErrors||'0');
+                        var le=$('lteStatus');if(le)le.innerHTML=d.lteConnected?'<span style=color:#2e7d32>Connected</span>':'<span style=color:#c62828>Disconnected</span>';
+                        upd('rsrp',(d.rsrp||'--')+' dBm');upd('rsrq',(d.rsrq||'--')+' dB');
+                        upd('diagOperator',d.operator||'--');upd('band',d.band||'--');
+                        upd('mccmnc',d.mcc&&d.mnc?(d.mcc+'/'+d.mnc):'--');upd('cellId',d.cellId||'--');
+                        var bc=$('blueCherry');if(bc)bc.innerHTML=d.blueCherryConnected?'<span style=color:#2e7d32>Connected</span>':'<span style=color:#e65100>Offline</span>';
+                        upd('version',d.version);upd('temperature',d.temperature+' F');
+                        var sd=$('sdCard');if(sd)sd.innerHTML=d.sdCardOK?'<span style=color:#2e7d32>OK</span>':'<span style=color:#c62828>FAULT</span>';
+                        var ov=$('overfill');if(ov)ov.innerHTML=d.overfillAlarm?'<span style=color:#c62828>ALARM</span>':'<span style=color:#2e7d32>Normal</span>';
+                        var od=$('overfillDebug');if(od)od.innerHTML='Pin='+(d.gpio38Raw?'HIGH':'LOW')+' L:'+d.overfillLowCnt+' H:'+d.overfillHighCnt;
+                        upd('watchdog',d.watchdogEnabled?'Enabled':'Disabled');
+                        var wt=$('wdToggle'),wl=$('wdLabel');if(wt)wt.checked=d.watchdogEnabled;if(wl){wl.textContent=d.watchdogEnabled?'ENABLED':'DISABLED';wl.style.color=d.watchdogEnabled?'#2e7d32':'#999';}
+                        upd('uptime',d.uptime);upd('mac',d.macAddress);
+                    }catch(e){errs++;if(errs>=3)conn(false);}
+                }else{errs++;if(errs>=3)conn(false);}
+            };
+            x.onerror=function(){errs++;if(errs>=3)conn(false);};
+            x.ontimeout=function(){errs++;if(errs>=3)conn(false);};
+            x.open('GET','http://'+IP+'/api/status',true);
+            x.send();
+        }
+        poll();setInterval(poll,2000);
     })();
     </script>
 </body>
@@ -2304,16 +3004,21 @@ void startConfigAP() {
         String operatorStr = modemNetName.length() > 0 ? modemNetName : "--";
         String bandStr = modemBand.length() > 0 ? modemBand : "--";
         
-        // Build JSON response with all diagnostic fields
+        // Build JSON response with all status fields (Rev 10)
         String json = "{";
-        // Serial data from Linux device
+        // Serial data
         json += "\"serialActive\":" + String(serialActive ? "true" : "false") + ",";
         json += "\"deviceName\":\"" + DeviceName + "\",";
-        json += "\"pressure\":\"" + String(pressure, 2) + "\",";
-        json += "\"current\":\"" + String(current, 2) + "\",";
-        json += "\"mode\":\"" + mode_names[current_mode] + "\",";
+        // ADC readings (from ADS1015, replaces Linux-sourced pressure/current)
+        json += "\"pressure\":\"" + String(adcPressure, 2) + "\",";
+        json += "\"current\":\"" + String(adcCurrent, 2) + "\",";
+        json += "\"mode\":" + String(currentRelayMode) + ",";
         json += "\"cycles\":\"" + String(cycles) + "\",";
-        json += "\"fault\":\"" + String(getCombinedFaultCode()) + "\",";
+        json += "\"fault\":\"" + String(faults + getCombinedFaultCode()) + "\",";
+        // Profile
+        json += "\"profile\":\"" + profileManager.getActiveProfileName() + "\",";
+        // Failsafe
+        json += "\"failsafe\":" + String(failsafeMode ? "true" : "false") + ",";
         // Cellular modem
         json += "\"lteConnected\":" + String(lteConnected() ? "true" : "false") + ",";
         json += "\"rsrp\":\"" + rsrpStr + "\",";
@@ -2325,33 +3030,132 @@ void startConfigAP() {
         json += "\"cellId\":" + String(modemCID) + ",";
         json += "\"tac\":" + String(modemTAC) + ",";
         json += "\"blueCherryConnected\":" + String(blueCherryConnected ? "true" : "false") + ",";
+        json += "\"modemStatus\":\"" + Modem_Status + "\",";
+        json += "\"imei\":\"" + imei + "\",";
         // IO Board status
         json += "\"version\":\"" + ver + "\",";
         json += "\"temperature\":\"" + String(fahrenheit, 1) + "\",";
         json += "\"sdCardOK\":" + String(isSDCardOK() ? "true" : "false") + ",";
+        // Overfill (direct GPIO38 read)
         json += "\"overfillAlarm\":" + String(overfillAlarmActive ? "true" : "false") + ",";
-        // Overfill debug: raw GPIO38 pin state and internal counters
-        // gpio38Raw: 1=HIGH (normal pull-up), 0=LOW (sensor triggered or floating)
-        // overfillLow/High: consecutive reading counters (alarm at 8 LOW, clear at 5 HIGH)
-        // overfillValidated: false during 15-sec boot lockout
         json += "\"gpio38Raw\":" + String(digitalRead(ESP_OVERFILL)) + ",";
         json += "\"overfillLowCnt\":" + String(overfillLowCount) + ",";
         json += "\"overfillHighCnt\":" + String(overfillHighCount) + ",";
         json += "\"overfillValidated\":" + String(overfillValidationComplete ? "true" : "false") + ",";
-        // I2C debug: last register Linux read and last GPIOB value sent
-        // Helps diagnose if Linux reads wrong register (e.g., INTCAPB=0x11 vs GPIOB=0x13)
-        json += "\"i2cLastReg\":\"0x" + String(lastI2C_register, HEX) + "\",";
-        json += "\"i2cLastGPIOB\":" + String(lastI2C_GPIOB_sent) + ",";
-        // IPOLB: if Linux sets this to 0x01, GPIO reads are inverted (real MCP23017 behavior)
-        json += "\"ipolB\":" + String(ipolB_value) + ",";
-        json += "\"i2cTransactions\":" + String(i2cTransactionCount) + ",";
-        json += "\"i2cErrors\":" + String(i2cErrorCount) + ",";
+        // ADC debug
+        json += "\"adcRawPressure\":" + String(adcRawPressure) + ",";
+        json += "\"adcRawCurrent\":" + String(adcRawCurrent) + ",";
+        json += "\"adcInitialized\":" + String(adcInitialized ? "true" : "false") + ",";
+        json += "\"adcErrors\":" + String(adcTotalErrors) + ",";
+        // Alarm states for web display
+        json += "\"alarmLowPress\":" + String((adcPressure < profileManager.getActiveProfile()->lowPressThreshold && currentRelayMode > 0) ? "true" : "false") + ",";
+        json += "\"alarmHighPress\":" + String((adcPressure > profileManager.getActiveProfile()->highPressThreshold && currentRelayMode > 0) ? "true" : "false") + ",";
+        json += "\"alarmZeroPress\":" + String((profileManager.getActiveProfile()->hasZeroPressAlarm && fabs(adcPressure) < 0.15 && currentRelayMode > 0) ? "true" : "false") + ",";
+        json += "\"alarmVarPress\":false,";
+        json += "\"alarmLowCurrent\":" + String((adcCurrent > 0 && adcCurrent < LOW_CURRENT_THRESHOLD && currentRelayMode > 0) ? "true" : "false") + ",";
+        json += "\"alarmHighCurrent\":" + String((adcCurrent > HIGH_CURRENT_THRESHOLD) ? "true" : "false") + ",";
+        json += "\"watchdogTriggered\":" + String(watchdogTriggered ? "true" : "false") + ",";
         json += "\"watchdogEnabled\":" + String(watchdogEnabled ? "true" : "false") + ",";
+        // Datetime
+        json += "\"datetime\":\"" + getDateTimeString() + "\",";
         json += "\"uptime\":\"" + String(uptimeStr) + "\",";
         json += "\"macAddress\":\"" + macStr + "\"";
         json += "}";
         
         request->send(200, "application/json", json);
+    });
+    
+    // ---- COMMAND ENDPOINT (Rev 10) ----
+    // POST /api/command - handles button actions from web interface
+    // Body: {"command":"start_cycle","value":"run"}
+    server.on("/api/command", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+        // Parse the POST body as JSON
+        String body = "";
+        for (size_t i = 0; i < len; i++) body += (char)data[i];
+        
+        String cmd = getJsonValue(body.c_str(), "command");
+        String val = getJsonValue(body.c_str(), "value");
+        
+        Serial.printf("[WEB CMD] command=%s value=%s\r\n", cmd.c_str(), val.c_str());
+        
+        if (cmd == "start_cycle") {
+            if (failsafeMode) {
+                // =========================================================
+                // FAILSAFE MODE: ESP32 runs cycles autonomously (Linux down)
+                // Use the local failsafe cycle engine directly.
+                // =========================================================
+                if (val == "run") startFailsafeCycle(0);
+                else if (val == "manual_purge") startFailsafeCycle(1);
+                else if (val == "clean") startFailsafeCycle(2);
+            } else {
+                // =========================================================
+                // NORMAL MODE: Linux is connected and controls relays.
+                // Forward the start_cycle command to Linux via Serial1.
+                // Linux's IOManager will run the cycle through its normal
+                // cycle management (alarms, DB logging, pause/resume, etc.)
+                //
+                // Previously this called startFailsafeCycle() which would
+                // set relays, but Linux would override them within 500ms
+                // because its ModeManager was still in rest mode.
+                // =========================================================
+                char cmdBuf[128];
+                snprintf(cmdBuf, sizeof(cmdBuf),
+                         "{\"command\":\"start_cycle\",\"type\":\"%s\"}", val.c_str());
+                Serial1.println(cmdBuf);
+                Serial.printf("[WEB CMD] Forwarded to Linux: %s\r\n", cmdBuf);
+            }
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        else if (cmd == "stop_cycle") {
+            if (failsafeMode) {
+                stopFailsafeCycle("Web command");
+            } else {
+                // Forward stop to Linux — Linux manages its own cycle processes
+                Serial1.println("{\"command\":\"stop_cycle\"}");
+                Serial.println("[WEB CMD] Forwarded stop_cycle to Linux");
+            }
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        // =========================================================
+        // SET PROFILE — Password-protected (PW: 1793)
+        // The web UI sends {command:"set_profile", value:"CS8", password:"1793"}
+        // We validate the password server-side before applying the change.
+        // =========================================================
+        else if (cmd == "set_profile") {
+            String pw = getJsonValue(body.c_str(), "password");
+            if (pw != "1793") {
+                // Wrong or missing password — reject with 403 Forbidden
+                Serial.printf("[WEB CMD] set_profile REJECTED - wrong password\r\n");
+                request->send(403, "application/json", "{\"ok\":false,\"error\":\"Wrong password\"}");
+            }
+            else if (profileManager.setActiveProfile(val.c_str())) {
+                Serial.printf("[WEB CMD] Profile changed to %s (password OK)\r\n", val.c_str());
+                request->send(200, "application/json", "{\"ok\":true}");
+            } else {
+                request->send(400, "application/json", "{\"ok\":false,\"error\":\"Unknown profile\"}");
+            }
+        }
+        else if (cmd == "overfill_override") {
+            overfillAlarmActive = false;
+            overfillLowCount = 0;
+            Serial.println("[WEB] Overfill override activated");
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        else if (cmd == "clear_press_alarm" || cmd == "clear_motor_alarm") {
+            failsafeLowCurrentCount = 0;
+            failsafeHighCurrentCount = 0;
+            Serial.printf("[WEB] Cleared alarm: %s\r\n", cmd.c_str());
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        else if (cmd == "restart") {
+            request->send(200, "application/json", "{\"ok\":true}");
+            delay(500);
+            ESP.restart();
+        }
+        else {
+            request->send(400, "application/json", "{\"ok\":false,\"error\":\"Unknown command\"}");
+        }
     });
     
     // ---- CAPTIVE PORTAL DETECTION HANDLERS ----
@@ -2657,15 +3461,17 @@ void sendStatusToSerial() {
     String operatorStr = modemNetName.length() > 0 ? modemNetName : "--";
     String bandStr = modemBand.length() > 0 ? modemBand : "--";
     
-    // Build JSON string with all cellular info including cell tower data
+    // Build JSON string with all status info (Rev 10 - includes pressure, current, overfill, profile)
     // Sent every 15 seconds to modem.py on Linux device via Serial1 (RS-232)
-    // Fields: datetime, sdcard, passthrough, lte, rsrp, rsrq, operator, band, mcc, mnc, cellId, tac
-    char jsonBuffer[384];
+    // New Rev 10 fields: pressure, current (from ADS1015), overfill (GPIO38), profile, failsafe
+    char jsonBuffer[512];
     snprintf(jsonBuffer, sizeof(jsonBuffer),
              "{\"datetime\":\"%s\",\"sdcard\":\"%s\",\"passthrough\":%d,"
              "\"lte\":%d,\"rsrp\":\"%s\",\"rsrq\":\"%s\","
              "\"operator\":\"%s\",\"band\":\"%s\","
-             "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u,\"tac\":%u}",
+             "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u,\"tac\":%u,"
+             "\"pressure\":%.2f,\"current\":%.2f,\"overfill\":%d,"
+             "\"profile\":\"%s\",\"failsafe\":%d}",
              dateTimeStr.c_str(),
              sdStatus.c_str(),
              passthroughValue,
@@ -2674,7 +3480,10 @@ void sendStatusToSerial() {
              rsrqStr.c_str(),
              operatorStr.c_str(),
              bandStr.c_str(),
-             modemCC, modemNC, modemCID, modemTAC);
+             modemCC, modemNC, modemCID, modemTAC,
+             adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
+             profileManager.getActiveProfileName().c_str(),
+             failsafeMode ? 1 : 0);
     
     // Send to Python device via Serial1 (RS-232)
     Serial1.println(jsonBuffer);
@@ -2685,13 +3494,40 @@ void sendStatusToSerial() {
 }
 
 /**
- * Check if it's time to send status to Python and send if due
- * Called from main loop - handles timing internally
+ * Send a lightweight sensor-only packet to Python every 1 second.
+ * Contains ONLY the fast-changing values that the UI needs in real-time:
+ *   pressure (IWC), current (amps), overfill state, relay mode
+ * 
+ * This is much smaller (~60 bytes) than the full status (~500 bytes)
+ * and avoids expensive modem/SD card queries.
+ * 
+ * Python modem.py parses "pressure", "current", "overfill" fields from
+ * ANY incoming JSON — same parser handles both fast and full packets.
+ * 
+ * Usage example:
+ *   sendFastSensorPacket();  // Call every 1 second from main loop
+ */
+void sendFastSensorPacket() {
+    // Lightweight JSON — only real-time sensor data, no modem/SD/cell queries
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"pressure\":%.2f,\"current\":%.2f,\"overfill\":%d,\"relayMode\":%d}",
+             adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0, currentRelayMode);
+    Serial1.println(buf);
+}
+
+/**
+ * Check if it's time to send status/sensor data to Python and send if due.
+ * Called from main loop - handles timing internally.
+ * 
+ * Two send rates:
+ *   - Every 1 second:  Fast sensor packet (pressure, current, overfill, mode)
+ *   - Every 15 seconds: Full status (datetime, SD, LTE, cell info, profile, etc.)
  * 
  * IMPORTANT: Skips sending during passthrough mode to avoid interfering
  * with modem communication (PPP/AT commands)
  * 
- * Usage: Call in loop() - it will only send every STATUS_SEND_INTERVAL ms
+ * Usage: Call in loop() - handles both intervals internally
  */
 void checkAndSendStatusToSerial() {
     // Skip during passthrough mode - serial ports are dedicated to modem bridge
@@ -2701,6 +3537,13 @@ void checkAndSendStatusToSerial() {
     
     unsigned long currentTime = millis();
     
+    // Fast sensor packet every 1 second — pressure/current for UI updates
+    if (currentTime - lastSensorSendTime >= SENSOR_SEND_INTERVAL) {
+        sendFastSensorPacket();
+        lastSensorSendTime = currentTime;
+    }
+    
+    // Full status packet every 15 seconds — includes cell info, SD, datetime
     if (currentTime - lastStatusSendTime >= STATUS_SEND_INTERVAL) {
         sendStatusToSerial();
         lastStatusSendTime = currentTime;
@@ -2778,15 +3621,16 @@ bool sendPassthroughRequestToLinux(unsigned long timeoutMinutes) {
 }
 
 /**
- * Request passthrough mode - notifies Linux, then sets preference and restarts
+ * Request passthrough mode - notifies Linux, saves state, and restarts IMMEDIATELY.
  * 
- * Sequence:
- * 1. Send {"passthrough":"remote XX"} to Linux device via Serial1
- * 2. Wait up to 10 seconds for "ready" confirmation from Linux
- * 3. If confirmed (or timeout), store preference and restart into passthrough boot
+ * CRITICAL TIMING: Linux starts its chat script the instant it receives our
+ * passthrough message, so the modem MUST be available with zero delay. We:
+ *   1. Save any active relay cycle state (mode + remaining seconds) to preferences
+ *   2. Send {"passthrough":"remote XX"} to Linux
+ *   3. Restart into passthrough boot mode immediately (no confirmation wait)
  * 
- * On boot, the firmware checks for this preference BEFORE loading the WalterModem
- * library and runs a minimal passthrough-only mode if set.
+ * The passthrough boot mode restores the saved relay state and finishes the
+ * purge step quietly in the background while the modem bridge is already active.
  * 
  * @param timeoutMinutes Duration before auto-restart (default 60 minutes, max 1440 = 24hrs)
  * 
@@ -2794,8 +3638,6 @@ bool sendPassthroughRequestToLinux(unsigned long timeoutMinutes) {
  * - "remote" → 60 minutes (default)
  * - "remote 30" → 30 minutes
  * - "remote 120" → 120 minutes (2 hours)
- * 
- * Early Exit: Linux device can set MCP GPA5 (bit 5) via I2C to trigger early return
  */
 void enterPassthroughMode(unsigned long timeoutMinutes) {
     // Clamp timeout to reasonable range
@@ -2804,22 +3646,47 @@ void enterPassthroughMode(unsigned long timeoutMinutes) {
     
     Serial.printf("[PASSTHROUGH] Requesting %lu min timeout\r\n", timeoutMinutes);
     
-    // Notify Linux device and wait for confirmation
-    bool linuxReady = sendPassthroughRequestToLinux(timeoutMinutes);
-    
-    if (!linuxReady) {
-        // Proceed anyway - Linux may still be ready even without confirmation
-        Serial.println("[PASSTHROUGH] Proceeding without Linux confirmation");
-    }
-    
-    // Store passthrough request in preferences
+    // =====================================================================
+    // Rev 10 Step 5: START PPP IMMEDIATELY - modem must be ready for Linux.
+    // Linux begins its chat script the instant it gets our passthrough message,
+    // so any delay here means a failed PPP negotiation.
+    //
+    // If a relay cycle is running, save the current step's relay mode and
+    // remaining seconds into preferences so the passthrough boot mode can
+    // quietly finish the step AFTER the modem bridge is already running.
+    // =====================================================================
     preferences.begin("RMS", false);
     preferences.putBool("ptBoot", true);
     preferences.putULong("ptTimeout", timeoutMinutes);
+    
+    if (failsafeCycleRunning) {
+        // Save current step so passthrough boot can finish it quietly
+        uint8_t stepMode = activeCycleSequence[failsafeCycleStep].mode;
+        unsigned long elapsed = millis() - failsafeCycleStepTimer;
+        unsigned long totalMs = (unsigned long)activeCycleSequence[failsafeCycleStep].durationSeconds * 1000UL;
+        unsigned long remainingMs = (elapsed < totalMs) ? (totalMs - elapsed) : 0;
+        unsigned long remainingSec = remainingMs / 1000UL;
+        
+        preferences.putUChar("ptRelayMode", stepMode);
+        preferences.putULong("ptRelaySec", remainingSec);
+        
+        Serial.printf("[PASSTHROUGH] Saving cycle state: mode %d, %lu sec remaining\r\n",
+                      stepMode, remainingSec);
+    } else {
+        // No cycle running - clear any stale relay state
+        preferences.putUChar("ptRelayMode", 0);
+        preferences.putULong("ptRelaySec", 0);
+    }
     preferences.end();
     
-    Serial.println("[PASSTHROUGH] Restarting into passthrough mode...");
-    delay(500);
+    // Notify Linux THEN restart immediately - no waiting for purge, no confirmation delay
+    // Linux starts chat script as soon as it receives this message, so speed is critical
+    String request = "{\"passthrough\":\"remote " + String(timeoutMinutes) + "\"}";
+    Serial1.println(request);
+    Serial.printf("[PASSTHROUGH] Sent to Linux: %s\r\n", request.c_str());
+    
+    Serial.println("[PASSTHROUGH] Restarting into passthrough mode NOW...");
+    delay(100);  // Minimal delay - just enough for serial TX to flush
     ESP.restart();
 }
 
@@ -2845,6 +3712,21 @@ void exitPassthroughMode() {
 void runPassthroughLoop() {
     // Not used in preference-based boot approach
     // Passthrough runs from runPassthroughBootMode() on boot
+}
+
+/**
+ * Get the current date/time as a formatted string from currentTimestamp.
+ * Returns "YYYY-MM-DD HH:MM:SS" or "--" if timestamp is not set.
+ */
+String getDateTimeString() {
+    if (currentTimestamp == 0) return "--";
+    time_t rawTime = (time_t)currentTimestamp;
+    struct tm *timeInfo = gmtime(&rawTime);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             timeInfo->tm_year + 1900, timeInfo->tm_mon + 1, timeInfo->tm_mday,
+             timeInfo->tm_hour, timeInfo->tm_min, timeInfo->tm_sec);
+    return String(buf);
 }
 
 bool isInteger(const char* str) {
@@ -2905,21 +3787,44 @@ void readSerialData() {
             if (ch == '}') {
                 Serial.println(jsonBuffer);  // Print complete JSON
                 
-                // Check for passthrough command from Linux: {"command":"passthrough","timeout":XX}
-                if (jsonBuffer.indexOf("\"command\"") >= 0 && 
-                    jsonBuffer.indexOf("\"passthrough\"") >= 0) {
-                    // Extract timeout value
-                    int timeoutIdx = jsonBuffer.indexOf("\"timeout\":");
-                    unsigned long timeout = 60;  // Default 60 minutes
-                    if (timeoutIdx >= 0) {
-                        String timeoutStr = jsonBuffer.substring(timeoutIdx + 10);
-                        timeout = timeoutStr.toInt();
-                        if (timeout < 1) timeout = 60;
+                // Check for command messages (passthrough, set_profile, start/stop cycle)
+                if (jsonBuffer.indexOf("\"command\"") >= 0) {
+                    String cmdType = getJsonValue(jsonBuffer.c_str(), "command");
+                    
+                    if (cmdType == "passthrough") {
+                        int timeoutIdx = jsonBuffer.indexOf("\"timeout\":");
+                        unsigned long timeout = 60;
+                        if (timeoutIdx >= 0) {
+                            String timeoutStr = jsonBuffer.substring(timeoutIdx + 10);
+                            timeout = timeoutStr.toInt();
+                            if (timeout < 1) timeout = 60;
+                        }
+                        Serial.printf("[SERIAL] Passthrough command - %lu min\r\n", timeout);
+                        enterPassthroughMode(timeout);
+                        jsonBuffer = "";
+                        return;
                     }
-                    Serial.printf("[SERIAL] Passthrough command received - %lu min\r\n", timeout);
-                    enterPassthroughMode(timeout);
-                    jsonBuffer = "";
-                    return;  // Don't process as normal data
+                    else if (cmdType == "set_profile") {
+                        String profName = getJsonValue(jsonBuffer.c_str(), "profile");
+                        if (profName.length() > 0) {
+                            profileManager.setActiveProfile(profName.c_str());
+                        }
+                        jsonBuffer = "";
+                        return;
+                    }
+                    else if (cmdType == "start_cycle") {
+                        String cycleType = getJsonValue(jsonBuffer.c_str(), "type");
+                        if (cycleType == "run") startFailsafeCycle(0);
+                        else if (cycleType == "purge") startFailsafeCycle(1);
+                        else if (cycleType == "clean") startFailsafeCycle(2);
+                        jsonBuffer = "";
+                        return;
+                    }
+                    else if (cmdType == "stop_cycle") {
+                        stopFailsafeCycle("Serial command");
+                        jsonBuffer = "";
+                        return;
+                    }
                 }
                 
                 strcpy(dataBuffer, jsonBuffer.c_str());
@@ -3033,12 +3938,30 @@ void parsedSerialData() {
     String faultStr = getJsonValue(dataBuffer, "fault");
     String cyclesStr = getJsonValue(dataBuffer, "cycles");
     
-    // Convert to appropriate types (all from Python except temperature)
+    // Check for shutdown command: {"mode":"shutdown"} (string value, not integer)
+    // This is the ONLY way to trigger DISP_SHUTDN LOW in Rev 10
+    if (modeStr == "shutdown") {
+        activateDispShutdown();
+        return;  // Don't process as normal data packet
+    }
+    
+    // If we're in failsafe mode and serial data resumes, exit failsafe
+    if (failsafeMode) {
+        exitFailsafeMode();
+    }
+    
+    // Convert to appropriate types
     if (pressStr.length() > 0) pressure = pressStr.toFloat();
     if (modeStr.length() > 0) mode = modeStr.toInt();
     if (currentStr.length() > 0) current = currentStr.toFloat();
     if (faultStr.length() > 0) faults = faultStr.toInt();
     if (cyclesStr.length() > 0) cycles = cyclesStr.toInt();
+    
+    // Rev 10: Set relay outputs based on mode field from Linux
+    // This replaces the old I2C register write approach
+    if (modeStr.length() > 0 && !failsafeMode) {
+        setRelaysForMode((uint8_t)mode);
+    }
     
     // Update device name if provided and different
     if (gmidStr.length() > 0 && gmidStr != String(deviceName)) {
@@ -3749,13 +4672,11 @@ bool sendStatusUpdateViaSocket() {
 // =====================================================================
 // Minimal boot mode for serial passthrough - runs INSTEAD of normal firmware
 // when passthrough preference is set. WalterModem library is NEVER loaded.
-// Only runs: 3.3V power, MCP emulator, and serial passthrough bridge.
+// Only runs: 3.3V power, ADC reader, and serial passthrough bridge.
+// Rev 10: Buffers CBOR data during passthrough for later transmission.
 // 
-// Early Exit: Linux can set MCP GPA5 (bit 5) via I2C to trigger early exit.
 // Timer: Auto-restarts after timeout (stored in preferences, default 60 min).
 // =====================================================================
-
-#define PASSTHROUGH_EXIT_BIT 0x20  // GPA5 (bit 5) - early exit trigger
 
 // Escape sequence from Linux to stop passthrough: "+++STOPPPP\n"
 const char PASSTHROUGH_STOP_SEQ[] = "+++STOPPPP";
@@ -3763,35 +4684,47 @@ const int PASSTHROUGH_STOP_SEQ_LEN = 10;
 
 void runPassthroughBootMode(unsigned long timeoutMinutes) {
     Serial.printf("\n[PASSTHROUGH] Boot mode active - timeout %lu min\r\n", timeoutMinutes);
-    Serial.println("[PASSTHROUGH] Exit: MCP GPA5 via I2C, or send +++STOPPPP");
+    Serial.println("[PASSTHROUGH] Exit: send +++STOPPPP or timeout");
     
-    // CRITICAL: Pre-initialize overfill state to SAFE before anything else
-    // This ensures no false alarms even if I2C is queried early
-    // Real MCP23017: pin HIGH (0x01) = normal, pin LOW (0x00) = alarm
-    gpioB_value = 0x01;                    // HIGH = no overfill alarm (matches real hardware)
-    overfillAlarmActive = false;           // Alarm flag OFF
-    overfillValidationComplete = false;    // Force lockout period
+    // Pre-initialize overfill state
+    overfillAlarmActive = false;
+    overfillValidationComplete = false;
     overfillStartupTime = 0;
     overfillLowCount = 0;
     overfillHighCount = 0;
     overfillCheckTimer = 0;
     
-    // Pre-initialize DISP_SHUTDN protection state
-    gpioA_value = 0x10;                    // V6 ON
-    dispShutdownProtectionActive = true;
-    dispShutdownStartupTime = 0;
-    
-    // Initialize relay pins to safe states (same as normal mode)
+    // =====================================================================
+    // RELAY INITIALIZATION: Restore saved cycle state if a purge was in progress.
+    // The relay mode and remaining seconds were saved by enterPassthroughMode()
+    // so the purge step can finish quietly while the modem bridge is running.
+    // =====================================================================
     pinMode(CR0_MOTOR, OUTPUT);
-    digitalWrite(CR0_MOTOR, LOW);     // Motor OFF
     pinMode(CR1, OUTPUT);
-    digitalWrite(CR1, LOW);           // Relay 1 OFF
     pinMode(CR2, OUTPUT);
-    digitalWrite(CR2, LOW);           // Relay 2 OFF
     pinMode(CR5, OUTPUT);
-    digitalWrite(CR5, LOW);           // Relay 5 OFF
     pinMode(DISP_SHUTDN, OUTPUT);
     digitalWrite(DISP_SHUTDN, HIGH);  // CRITICAL: DISP_SHUTDN ON (safety)
+    
+    // Read saved relay state from preferences (written by enterPassthroughMode)
+    preferences.begin("RMS", true);  // Read-only
+    uint8_t savedRelayMode = preferences.getUChar("ptRelayMode", 0);
+    unsigned long savedRelaySec = preferences.getULong("ptRelaySec", 0);
+    preferences.end();
+    
+    // If a cycle step was saved, restore the relay state so it continues quietly
+    // Otherwise all relays start idle (OFF)
+    bool purgeFinishing = (savedRelayMode > 0 && savedRelaySec > 0);
+    unsigned long purgeEndTime = 0;
+    
+    if (purgeFinishing) {
+        Serial.printf("[PASSTHROUGH] Restoring relay mode %d for %lu sec (finishing purge quietly)\r\n",
+                      savedRelayMode, savedRelaySec);
+        purgeEndTime = millis() + (savedRelaySec * 1000UL);
+    } else {
+        // No saved cycle - start with all relays OFF
+        Serial.println("[PASSTHROUGH] No active cycle - relays idle");
+    }
     
     // Create mutex for thread-safe relay control
     relayMutex = xSemaphoreCreateMutex();
@@ -3800,17 +4733,29 @@ void runPassthroughBootMode(unsigned long timeoutMinutes) {
         ESP.restart();
     }
     
-    // Start MCP emulator on Core 0 (same as normal mode)
+    // Set relays to saved state (or idle if no saved state)
+    // This happens BEFORE the serial bridge starts, but takes < 1ms
+    if (purgeFinishing) {
+        setRelaysForMode(savedRelayMode);
+    } else {
+        setRelaysForMode(0);
+    }
+    
+    // Start ADC reader on Core 0 (handles overfill monitoring)
     xTaskCreatePinnedToCore(
-        mcpEmulatorTask,
-        "MCP_Emulator",
+        adcReaderTask,
+        "ADC_Reader",
         8192,
         NULL,
         1,
         NULL,
         0
     );
-    Serial.println("[PASSTHROUGH] MCP23017 emulator started");
+    Serial.println("[PASSTHROUGH] ADC reader task started on Core 0");
+    
+    // Start CBOR buffering during passthrough
+    allocateCborPassthroughBuffer();
+    startCborBuffering();
     
     // Configure modem pins directly (matching walter-as-linux-modem.txt)
     pinMode(WALTER_MODEM_PIN_RX, INPUT);
@@ -3852,11 +4797,28 @@ void runPassthroughBootMode(unsigned long timeoutMinutes) {
             ESP.restart();
         }
         
-        // Check for early exit (GPA5 set via I2C)
-        if (gpioA_value & PASSTHROUGH_EXIT_BIT) {
-            Serial.println("[PASSTHROUGH] Early exit (GPA5) - restarting...");
-            delay(500);
-            ESP.restart();
+        // Buffer CBOR data every 15 seconds during passthrough
+        if (cborBufferingActive && millis() - lastCborBufferTime >= 15000) {
+            addSampleToCborBuffer();
+            lastCborBufferTime = millis();
+        }
+        
+        // =====================================================================
+        // QUIET PURGE COMPLETION: If a purge step was in progress when passthrough
+        // started, let its timer expire naturally then idle all relays.
+        // This runs silently in the background while the modem bridge is active.
+        // =====================================================================
+        if (purgeFinishing && millis() >= purgeEndTime) {
+            setRelaysForMode(0);  // Idle all relays - purge step time expired
+            purgeFinishing = false;
+            Serial.println("[PASSTHROUGH] Purge step completed quietly - relays idled");
+        }
+        
+        // Emergency: if overfill trips during passthrough, stop relays immediately
+        if (purgeFinishing && overfillAlarmActive) {
+            setRelaysForMode(0);
+            purgeFinishing = false;
+            Serial.println("[PASSTHROUGH] Overfill alarm - relays idled immediately");
         }
         
         // Forward data from host (Serial1) to modem (ModemSerial)
@@ -3942,23 +4904,19 @@ void setup() {
     preferences.end();
     
     // =====================================================================
-    // CRITICAL: Pre-initialize MCP state to SAFE values before task starts
-    // This prevents any race conditions if I2C is queried early
-    // Real MCP23017: pin HIGH (0x01) = normal, pin LOW (0x00) = alarm
+    // Pre-initialize relay and overfill state to SAFE values
     // =====================================================================
-    gpioB_value = 0x01;                    // HIGH = no overfill alarm (matches real hardware)
-    overfillAlarmActive = false;           // Alarm flag OFF
-    overfillValidationComplete = false;    // Force 15-second lockout period
+    overfillAlarmActive = false;
+    overfillValidationComplete = false;
     overfillStartupTime = 0;
     overfillLowCount = 0;
     overfillHighCount = 0;
     overfillCheckTimer = 0;
-    gpioA_value = 0x10;                    // V6/DISP_SHUTDN ON
-    dispShutdownProtectionActive = true;   // Force 20-second lockout period
-    dispShutdownStartupTime = 0;
+    dispShutdownActive = true;             // DISP_SHUTDN starts HIGH (ON)
+    currentRelayMode = 0;                  // Idle mode
     
     // =====================================================================
-    // CRITICAL: Create mutex and start MCP emulator EARLY
+    // Create mutex and start ADS1015 reader task on Core 0
     // =====================================================================
     relayMutex = xSemaphoreCreateMutex();
     if (relayMutex == NULL) {
@@ -3967,25 +4925,31 @@ void setup() {
     }
     Serial.println("✓ Mutex created for thread-safe relay control");
     
-    // Start MCP emulator as FreeRTOS task on Core 0 (HIGH PRIORITY)
+    // Start ADC reader as FreeRTOS task on Core 0 (replaces MCP emulator)
     xTaskCreatePinnedToCore(
-        mcpEmulatorTask,
-        "MCP_Emulator",
+        adcReaderTask,
+        "ADC_Reader",
         8192,
         NULL,
         1,
         NULL,
         0
     );
-    Serial.println("✓ MCP23017 emulator started on Core 0 (EARLY START)");
+    Serial.println("✓ ADS1015 ADC reader started on Core 0 (60Hz polling)");
     
     // Now continue with rest of setup
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 9.4e                 ║");
-    Serial.println("║  MCP23017 Emulation + Diagnostic Dashboard           ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.0                 ║");
+    Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
+    
+    // Load active profile from EEPROM
+    profileManager.loadActiveProfile();
+    
+    // Allocate CBOR passthrough buffer
+    allocateCborPassthroughBuffer();
     
     // Initialize watchdog pin
     pinMode(ESP_WATCHDOG_PIN, OUTPUT);
@@ -4157,15 +5121,18 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 9.4e initialization complete!");
-    Serial.println("✅ MCP I2C slave running on Core 0 (address 0x20)");
-    Serial.println("✅ AJAX web interface active (no refresh flashing)");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.0 initialization complete!");
+    Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
+    Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
+    Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
     Serial.println("✅ Serial watchdog ready");
+    Serial.println("✅ Failsafe relay control standby (activates after 2 restart attempts)");
     if (blueCherryConnected) {
         Serial.println("✅ BlueCherry OTA platform connected");
     } else {
         Serial.println("⚠️ BlueCherry OTA offline - will retry hourly, weekly restart scheduled");
     }
+    Serial.printf("✅ CBOR buffer: %d samples (%d min capacity)\r\n", CBOR_BUFFER_MAX_SAMPLES, CBOR_BUFFER_MAX_SAMPLES * 15 / 60);
     Serial.println("✅ System ready!\n");
 }
 
@@ -4185,14 +5152,19 @@ void loop() {
     // =====================================================================
     // PASSTHROUGH MODE - Bridge Serial1 (RS-232) to modem
     // When active, normal firmware operations are suspended (INCLUDING LTE check)
-    // I2C emulator continues running on Core 0
+    // ADC reader continues running on Core 0
     // Web server continues running (handled by AsyncWebServer)
     // MUST be checked FIRST - before any modem operations
     // =====================================================================
     if (passthroughMode) {
+        // Buffer CBOR data during passthrough
+        if (cborBufferingActive && millis() - lastCborBufferTime >= 15000) {
+            addSampleToCborBuffer();
+            lastCborBufferTime = millis();
+        }
         runPassthroughLoop();
-        delay(1);  // Small delay to prevent tight loop
-        return;    // Skip ALL normal operations including LTE check
+        delay(1);
+        return;
     }
     
     // LTE connection check - only runs in normal mode (not passthrough)
@@ -4309,6 +5281,18 @@ void loop() {
     
     // Send status JSON to Python device every 15 seconds via RS-232
     checkAndSendStatusToSerial();
+    
+    // =====================================================================
+    // FAILSAFE MODE CHECK (Rev 10)
+    // After 2 watchdog restart attempts with no serial response, ESP32
+    // takes over relay control autonomously using ADC sensor data.
+    // =====================================================================
+    if (shouldEnterFailsafeMode()) {
+        enterFailsafeMode();
+    }
+    
+    // Run failsafe cycle logic (only executes when failsafeMode is true)
+    runFailsafeCycleLogic();
     
     // Update WS2812B status LED color based on current operating mode
     // Blue breathing=Idle, Green=Run, Orange=Purge, Yellow=Burp
