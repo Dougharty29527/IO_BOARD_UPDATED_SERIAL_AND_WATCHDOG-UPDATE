@@ -3698,6 +3698,12 @@ void sendFastSensorPacket() {
              adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
              isSDCardOK() ? "OK" : "FAULT", currentRelayMode);
     Serial1.println(buf);
+    
+    // Debug log to USB Serial Monitor — shows timestamp (ms) so you can verify 5Hz rate
+    // Expect ~200ms between each line. Look for consistent spacing in the millis() values.
+    Serial.printf("[FAST-TX @%lums] P=%.2f C=%.2f OV=%d SD=%s M=%d\r\n",
+                  millis(), adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
+                  isSDCardOK() ? "OK" : "FAULT", currentRelayMode);
 }
 
 /**
