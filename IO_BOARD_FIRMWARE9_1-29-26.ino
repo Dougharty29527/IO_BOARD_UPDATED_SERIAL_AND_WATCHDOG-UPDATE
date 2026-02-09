@@ -4023,6 +4023,12 @@ void readSerialData() {
                     }
                     else if (cmdType == "stop_cycle") {
                         stopFailsafeCycle("Serial command");
+                        // REV 10.5: Clear web test state so serial mode control resumes
+                        if (testRunning) {
+                            testRunning = false;
+                            activeTestType = "";
+                            Serial.println("[Serial] Test cleared by stop_cycle from Linux");
+                        }
                         jsonBuffer = "";
                         return;
                     }
@@ -4161,8 +4167,33 @@ void parsedSerialData() {
     
     // Rev 10: Set relay outputs based on mode field from Linux
     // This replaces the old I2C register write approach
+    //
+    // REV 10.5 FIX: When a web portal test is running, protect it from
+    // being overridden by non-zero serial mode commands (e.g. periodic
+    // Linux payload sending "mode":1 during a leak test).
+    //
+    // EXCEPTION: Mode 0 (rest/idle) ALWAYS passes through — it is the
+    // universal "stop everything" signal. Without this exception, the
+    // testRunning flag could get permanently stuck: serial mode commands
+    // are blocked, so setRelaysForMode(0) never fires, so the auto-clear
+    // inside setRelaysForMode() never runs. Mode 0 from Linux means
+    // "go to rest" — if Linux says stop, we stop.
     if (modeStr.length() > 0 && !failsafeMode) {
-        setRelaysForMode((uint8_t)mode);
+        if (testRunning && mode != 0) {
+            // Web portal test in progress and Linux sent a non-zero mode
+            // — do NOT let serial mode override the active test
+            Serial.printf("[Serial] Mode %d from Linux IGNORED — web test '%s' in progress\r\n",
+                          mode, activeTestType.c_str());
+        } else {
+            // Normal mode apply — either no test running, or mode is 0 (rest)
+            if (testRunning && mode == 0) {
+                Serial.printf("[Serial] Mode 0 from Linux — clearing web test '%s'\r\n",
+                              activeTestType.c_str());
+                testRunning = false;
+                activeTestType = "";
+            }
+            setRelaysForMode((uint8_t)mode);
+        }
     }
     
     // Update device name if provided and different
@@ -5470,7 +5501,9 @@ void loop() {
     // This updates modemRSRP, modemRSRQ, modemBand, modemNetName globals
     if (currentTime - lastSDCheck >= 60000) {
         refreshCellSignalInfo();
-        
+        Serial.print("@@@@@@  Free heap: ");
+        Serial.println(ESP.getFreeHeap());
+        Serial.println("@@@@@@");
         if (!SD.cardType()) {
             Serial.println("SD card not mounted, attempting to remount");
             int attempts = 0;
