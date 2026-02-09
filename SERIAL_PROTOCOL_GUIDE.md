@@ -251,7 +251,7 @@ Command messages use `"type":"cmd"` to distinguish them from data packets. The E
 {"type":"cmd","cmd":"cal"}
 ```
 
-This command tells the ESP32 to recalibrate the pressure sensor zero point. The sensor **must be at atmospheric pressure (0.0 IWC)** when this command is issued.
+This command tells the ESP32 to recalibrate the pressure sensor zero point. The sensor should be **open to ambient air (no vacuum applied)** when this command is issued. Whatever the sensor is currently reading becomes the new 0.0 IWC reference. For example, if the sensor reads -0.5 IWC due to altitude, after calibration it will read 0.0 IWC.
 
 **Calibration process (mirrors Python `pressure_sensor.py` `calibrate()`):**
 1. Collects 60 raw ADC samples from channel 0 (~1 second at 60Hz)

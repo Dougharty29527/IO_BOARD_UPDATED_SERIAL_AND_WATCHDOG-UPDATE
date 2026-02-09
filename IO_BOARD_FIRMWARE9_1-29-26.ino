@@ -1506,7 +1506,7 @@ float addCurrentSample(float sample) {
 // PRESSURE SENSOR CALIBRATION (EEPROM-backed zero point)
 // =====================================================================
 // Mirrors Python pressure_sensor.py calibrate() and get_adc_zero().
-// The zero point is the raw ADC reading at atmospheric pressure (0.0 IWC).
+// The zero point is the raw ADC reading that should correspond to 0.0 IWC.
 // Stored in EEPROM (Preferences) under key "adcZero" in namespace "RMS".
 // Loaded at boot via loadPressureCalibrationFromEeprom().
 // Triggered via {"cal":1} serial command from Linux or web portal.
@@ -1551,7 +1551,12 @@ void savePressureCalibrationToEeprom() {
 
 /**
  * Calibrate the pressure sensor zero point.
- * Assumes the sensor is currently at atmospheric pressure (0.0 IWC).
+ * 
+ * Sets the current sensor reading as the new 0.0 IWC reference point.
+ * The sensor should be open to ambient/atmospheric air (no vacuum applied)
+ * when calibration is triggered. Works correctly at any altitude — the
+ * current ambient pressure becomes the new zero, so a sensor reading
+ * -0.5 IWC before calibration will read 0.0 IWC afterward.
  * 
  * Collects 60 raw ADC samples (~1 second at 60Hz), sorts them, removes
  * the 5 highest and 5 lowest outliers, and averages the remaining 50
@@ -1564,11 +1569,11 @@ void savePressureCalibrationToEeprom() {
  * falls back to the factory default (964.0) and saves that instead.
  *
  * Usage example:
- *   calibratePressureSensorZeroPoint();  // Triggered by {"cal":1}
+ *   calibratePressureSensorZeroPoint();  // Triggered by {"type":"cmd","cmd":"cal"}
  */
 void calibratePressureSensorZeroPoint() {
     Serial.println("[CAL] Starting pressure sensor zero-point calibration...");
-    Serial.println("[CAL] Sensor must be at atmospheric pressure (0.0 IWC) during calibration!");
+    Serial.println("[CAL] Current reading will become 0.0 IWC — ensure sensor is open to ambient air!");
     
     if (!adcInitialized) {
         Serial.println("[CAL] ERROR: ADS1015 not initialized — cannot calibrate");
@@ -1626,9 +1631,13 @@ void calibratePressureSensorZeroPoint() {
         adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
     } else {
         float oldZero = adcZeroPressure;
+        // Show what pressure was reading BEFORE calibration (so user sees the offset we corrected)
+        float oldPressure = (newZero - oldZero) / pressureSlope12bit;
         adcZeroPressure = newZero;
-        Serial.printf("[CAL] Calibration complete: %.2f → %.2f (delta: %+.2f ADC counts)\r\n",
+        Serial.printf("[CAL] Calibration complete!\r\n");
+        Serial.printf("[CAL]   Old zero: %.2f → New zero: %.2f (delta: %+.2f ADC counts)\r\n",
                       oldZero, newZero, newZero - oldZero);
+        Serial.printf("[CAL]   Pressure was reading %.2f IWC — now calibrated to 0.0 IWC\r\n", oldPressure);
     }
     
     // Clear the pressure averaging buffer so old readings don't linger
@@ -1639,7 +1648,7 @@ void calibratePressureSensorZeroPoint() {
     // Save to EEPROM so calibration persists across reboots
     savePressureCalibrationToEeprom();
     
-    Serial.printf("[CAL] Active zero point: %.2f — pressure will now read 0.0 IWC at current sensor state\r\n", adcZeroPressure);
+    Serial.printf("[CAL] Active zero point: %.2f — pressure now reads 0.0 IWC at current ambient\r\n", adcZeroPressure);
 }
 
 // =====================================================================
@@ -2662,7 +2671,7 @@ const char* control_html = R"rawliteral(
         // Sends calibrate_pressure command to ESP32. Takes ~1 second (60 samples).
         // Shows result (new zero point) on the Maintenance screen.
         window.calibratePressure=function(){
-            if(!confirm('Calibrate pressure sensor?\\nSensor must be at atmospheric pressure (0.0 IWC).\\nThis takes about 1 second.')) return;
+            if(!confirm('Calibrate pressure sensor?\\nCurrent reading will become 0.0 IWC.\\nEnsure sensor is open to ambient air (no vacuum).\\nThis takes about 1 second.')) return;
             var el=document.getElementById('calResult');
             if(el) el.textContent='Calibrating...';
             var x=new XMLHttpRequest();
@@ -3555,7 +3564,7 @@ void startConfigAP() {
         // CALIBRATE PRESSURE — Zero the pressure sensor at current reading.
         // Triggered from web portal Maintenance screen or serial {"cal":1}.
         // Body: {"command":"calibrate_pressure"}
-        // Assumes sensor is at atmospheric pressure (0.0 IWC) when issued.
+        // Sets the current reading as 0.0 IWC. Sensor should be open to ambient air.
         // Collects 60 samples, trimmed mean, saves zero point to EEPROM.
         // =========================================================
         else if (cmd == "calibrate_pressure") {
@@ -4383,7 +4392,7 @@ void parsedSerialData() {
         Serial.printf("[SERIAL CMD] Received command: %s\r\n", cmdStr.c_str());
         
         // {"type":"cmd","cmd":"cal"} — Calibrate pressure sensor zero point.
-        // Assumes sensor is at atmospheric pressure (0.0 IWC) when issued.
+        // Sets the current reading as 0.0 IWC. Sensor should be open to ambient air.
         // Collects 60 raw ADC samples, computes trimmed mean, saves to EEPROM.
         // Mirrors Python pressure_sensor.py calibrate() behavior.
         if (cmdStr == "cal") {
