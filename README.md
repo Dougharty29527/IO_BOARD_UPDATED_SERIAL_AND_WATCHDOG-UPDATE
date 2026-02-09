@@ -1,6 +1,6 @@
 # Walter IO Board Firmware
 
-**Version:** Rev 10.5  
+**Version:** Rev 10.7  
 **Date:** February 9, 2026  
 **Authors:** Todd Adams & Doug Harty
 
@@ -284,7 +284,9 @@ These codes are **added** to any existing fault codes from the Linux device.
 
 | Version | Date | Description |
 |---------|------|-------------|
-| **Rev 10.5** | **2/9/2026** | **Sensor data now sent at 5Hz (was 1Hz). Cellular/datetime sent only on fresh modem data (was every 15s).** |
+| **Rev 10.7** | **2/9/2026** | **Pressure sensor calibration via serial or web portal. Instant non-blocking zero point adjustment using existing 60-sample rolling average. EEPROM persistence. ESP32 sends ps_cal result to Linux for database save. New "type":"cmd" message type.** |
+| Rev 10.6 | 2/9/2026 | Fixed pressure sign (vacuum now negative). Fixed current stuck at 0A (hardware differential mode). Added `{"mode":"normal"}` to clear 72-hour shutdown without reboot. |
+| Rev 10.5 | 2/9/2026 | Sensor data now sent at 5Hz (was 1Hz). Cellular/datetime sent only on fresh modem data (was every 15s). |
 | Rev 10.4 | 2/9/2026 | Fixed web portal tests/cycles not starting (Python screen guard bypass). Full button audit. |
 | Rev 10.3 | 2/9/2026 | Faster pressure updates (200→60 sample rolling average = 1 second window). |
 | Rev 10.2 | 2/8/2026 | Fixed stale CBOR pressure. ESP32 CBOR now uses own ADC, not round-tripped Python values. Web test handlers added. |
@@ -314,6 +316,7 @@ These codes are **added** to any existing fault codes from the Linux device.
 | `BlueCherryZTP_CBOR.cpp/h` | CBOR encoding for BlueCherry |
 | `ESP_AsyncDNSServer/` | Captive portal DNS library |
 | `README.md` | This file |
+| `SERIAL_PROTOCOL_GUIDE.md` | Complete serial JSON protocol reference (Rev 10+) |
 | `MCP23017_COMPATIBILITY.md` | Historical reference (Rev 9.x emulation — deprecated) |
 | `Serial Communication Messages structure outline.md` | Serial JSON message format reference |
 | `WATCHDOG_FEATURE_SUMMARY.md` | Serial watchdog implementation details |
