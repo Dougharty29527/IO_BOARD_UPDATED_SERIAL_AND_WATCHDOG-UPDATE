@@ -1,7 +1,7 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.1
- *  Date: 2/8/2026
+ *  Walter IO Board Firmware - Rev 10.3
+ *  Date: 2/9/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -190,6 +190,28 @@
  *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
+ *  Rev 10.3 (2/9/2026) - Faster Pressure Updates for Real-Time Controller Response
+ *  - IMPROVED: Pressure rolling average reduced from 200 samples to 60 samples
+ *    * Was: 200 samples at 60Hz = 3.3-second averaging window
+ *    * Now: 60 samples at 60Hz = 1.0-second averaging window
+ *    * Pressure values now reflect sensor changes within 1 second
+ *    * Still provides noise filtering — just responds faster to real changes
+ *  - WHY: The Linux controller relies on real-time pressure from the ESP32 to make
+ *    critical operating decisions (start/stop cycles, detect alarms, trigger safety
+ *    shutdowns). A 3.3-second lag meant the controller was always reacting to
+ *    conditions that were already 3+ seconds old. This was especially noticeable
+ *    when rapidly applying or releasing vacuum during maintenance and testing.
+ *  - ARCHITECTURE NOTE: The ESP32 sends two types of serial messages to Linux:
+ *    * Fast sensor packet (every 1 second): Pressure, current, overfill, relay mode
+ *      → This is CRITICAL — the Linux controller uses these for all real-time decisions
+ *    * Full status packet (every 15 seconds): Adds datetime, SD, LTE, cell info
+ *      → Supplementary information, not time-sensitive
+ *  - The Linux program sends data BACK to the ESP32 every 15 seconds. That data is
+ *    ONLY used for building CBOR payloads for cellular transmission. The CBOR builder
+ *    uses the ESP32's own ADC readings for pressure and current (not the Linux values),
+ *    so cellular data is always real-time regardless of the 15-second Linux send rate.
+ *  
+ *  =====================================================================
  *  Rev 10.1 (2/8/2026) - Performance & Security: Faster Relay Response, Portal Passwords
  *  - PERFORMANCE: Serial read interval reduced from 5s to 100ms
  *    * Relay commands from Linux now apply within ~100ms (was up to 5 seconds)
@@ -206,7 +228,7 @@
  *  Rev 10.0 (2/8/2026) - MAJOR REWRITE: MCP Emulation Removed, Serial Relay Control
  *  - REMOVED: MCP23017 I2C slave emulation (all 22 registers, handlers, task)
  *  - NEW: ESP32 is now I2C MASTER reading ADS1015 ADC at 0x48
- *    * Channel 0: Pressure sensor (single-ended, 200-sample rolling average)
+ *    * Channel 0: Pressure sensor (single-ended, 60-sample rolling average)
  *    * Channels 2&3: Current monitoring (abs differential, 20-sample rolling avg)
  *    * 60Hz polling on Core 0 FreeRTOS task with error recovery
  *  - NEW: Relay control via serial JSON mode field (replaces I2C register writes)
@@ -257,7 +279,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.1"
+#define VERSION "Rev 10.3"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -346,7 +368,7 @@ String mode_names[] = {"Idle", "Run", "Purge", "Burp"};
 // ADS1015 ADC GLOBALS (Rev 10 - replaces MCP register globals)
 // =====================================================================
 // ADC readings updated by Core 0 task at 60Hz, read by Core 1 (main loop/web)
-volatile float adcPressure = 0.0;       // Pressure in IWC (200-sample rolling average)
+volatile float adcPressure = 0.0;       // Pressure in IWC (60-sample rolling average, ~1 sec window)
 volatile float adcCurrent = 0.0;        // Abs current in Amps (20-sample rolling average)
 volatile float adcPeakCurrent = 0.0;    // Peak current reading (for high-current detection)
 volatile int16_t adcRawPressure = 0;    // Raw ADC value for channel 0 (diagnostics)
@@ -371,7 +393,10 @@ float currentRangeLow = 2.1;      // Amps at zero ADC
 float currentRangeHigh = 8.0;     // Amps at full ADC
 
 // Rolling average buffers
-#define PRESSURE_AVG_SAMPLES 200
+// SPEED FIX: Pressure was 200 samples (3.3 seconds at 60Hz) — too slow for
+// 1-second display updates. Reduced to 60 samples (1 second) for responsive
+// readings that still smooth out ADC noise. Current kept at 20 (0.33 seconds).
+#define PRESSURE_AVG_SAMPLES 60
 #define CURRENT_AVG_SAMPLES 20
 float pressureBuffer[PRESSURE_AVG_SAMPLES] = {0};
 float currentBuffer[CURRENT_AVG_SAMPLES] = {0};
