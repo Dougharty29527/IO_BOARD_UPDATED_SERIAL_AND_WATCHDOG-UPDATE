@@ -79,8 +79,8 @@ This is the critical real-time data path. The Linux device uses these values for
 
 | Field | Type | Range | Description |
 |-------|------|-------|-------------|
-| `pressure` | float | Typically -20.0 to +5.0 | Vacuum pressure in inches of water column (IWC). Read from ADS1015 ADC channel 0 at 60Hz with 1-second rolling average. Negative = vacuum. |
-| `current` | float | 0.0 to ~15.0 | Motor current in amps. Read from ADS1015 ADC channels 2-3 (differential) at 60Hz with rolling average. 0.0 when motor is off. |
+| `pressure` | float | Typically -20.0 to +5.0 | Vacuum pressure in inches of water column (IWC). Read from ADS1015 ADC channel 0 at 60Hz with 1-second rolling average. **Negative = vacuum** (normal operation), 0.0 = atmospheric, positive = above atmospheric. Uses Python `pressure_sensor.py` two-point linear formula: `(raw - adcZero) / slope`. |
+| `current` | float | 0.0 to ~15.0 | Motor current in amps. Read from ADS1015 ADC channels 2-3 using **hardware differential** (`readADC_Differential_2_3()`) at GAIN_TWO (1mV/count) for full 12-bit precision on the difference. Reports **windowed peak** (max after removing highest outlier, 60-sample window) to match Python's approach. 0.0 when motor is off. Pin 1 (AIN1) is unused. |
 | `overfill` | int | 0 or 1 | Overfill alarm state. 0 = normal, 1 = alarm active. Read from GPIO38 with 8-of-5 hysteresis (must read LOW 8 out of last 5 checks to trigger). Has internal pull-up. |
 | `sdcard` | string | `"OK"` or `"FAULT"` | SD card status. Reads cached card type, no disk I/O. |
 | `relayMode` | int | 0-9 | Current relay mode the ESP32 has applied. Useful for confirming the relay state matches what Linux requested. |
@@ -188,7 +188,7 @@ This is the primary data feed for the ESP32's CBOR encoder and SD card logger.
 | `type` | string | **Yes** | Must be `"data"`. Any other value is rejected. |
 | `gmid` | string | No | Device name/ID (e.g., `"CSX-1234"`). If changed, ESP32 updates EEPROM and WiFi AP name. |
 | `press` | float | No | Pressure from Linux (informational). **ESP32 uses its own ADC for CBOR/SD, not this value.** Included for consistency and debugging. |
-| `mode` | int or `"shutdown"` | No | Relay mode number (0-9) or the string `"shutdown"`. See Mode Numbers below. |
+| `mode` | int, `"shutdown"`, or `"normal"` | No | Relay mode number (0-9), `"shutdown"` (GPIO13 LOW), or `"normal"` (GPIO13 HIGH — clears 72-hour alarm). See below. |
 | `current` | float | No | Current from Linux (informational). **ESP32 uses its own ADC for CBOR/SD.** |
 | `fault` | int | No | Active alarm bitmask from Linux. Stored and included in CBOR transmissions. |
 | `cycles` | int | No | Run cycle count from Linux. Stored and included in CBOR transmissions. |
@@ -224,13 +224,19 @@ Modes 4-7 are undefined and map to all-off (safe state).
 
 ---
 
-### 3. Shutdown Command
+### 3. Shutdown / Normal Commands
 
+**Activate 72-hour shutdown (GPIO13 LOW):**
 ```json
 {"type":"data","mode":"shutdown"}
 ```
 
-This is the **only** way to activate the DISP_SHUTDN output (GPIO13 LOW). The `mode` field is the **string** `"shutdown"` (not a number). GPIO13 starts HIGH on every ESP32 boot and stays HIGH until this command is received. There is no "un-shutdown" command — the ESP32 must be restarted.
+**Clear 72-hour shutdown (GPIO13 HIGH — restore site):**
+```json
+{"type":"data","mode":"normal"}
+```
+
+`"shutdown"` is the **only** way to pull DISP_SHUTDN (GPIO13) LOW. GPIO13 starts HIGH on every ESP32 boot and stays HIGH until the shutdown command is received. When the 72-hour alarm clears, the Linux device sends `"normal"` to restore GPIO13 HIGH without requiring an ESP32 reboot.
 
 ---
 

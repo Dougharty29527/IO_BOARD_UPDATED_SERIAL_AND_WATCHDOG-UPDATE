@@ -417,33 +417,45 @@ volatile uint32_t adcErrorCount = 0;    // Consecutive read errors (resets on su
 volatile uint32_t adcTotalErrors = 0;   // Total lifetime read errors (diagnostics)
 volatile bool adcInitialized = false;   // True once ADS1015 responds successfully
 
-// ADC calibration constants (from Python control.py)
-// Pressure: mapit(adc_value, adc_zero, 22864, 0.0, 20.8)
-// Note: ADS1015 is 12-bit (0-2047) vs ADS1115 16-bit (0-32767)
-// Scale factor: 12-bit values are ~16x smaller than 16-bit
-float adcZeroPressure = 964.0;    // 15422/16 ≈ 964 (12-bit equivalent of 15422)
-float adcFullPressure = 1429.0;   // 22864/16 ≈ 1429 (12-bit equivalent of 22864)
-float pressureRangeIWC = 20.8;    // Full scale pressure in IWC
+// ADC calibration constants (matched to Python pressure_sensor.py two-point formula)
+// Calibration data: ADC 4080 = -31.35 IWC, ADC 26496 = +30.0 IWC (16-bit ADS1115)
+// Slope m = (26496 - 4080) / (30.0 - (-31.35)) = 365.44 ADC(16-bit) per IWC
+// 12-bit ADS1015 equivalent: 365.44 / 16 = 22.84 ADC(12-bit) per IWC
+// Formula: pressure_IWC = (raw_adc - adcZeroPressure) / pressureSlope12bit
+//   - Vacuum (raw < zero): NEGATIVE IWC  (normal operating range)
+//   - Atmospheric (raw = zero): 0.0 IWC
+//   - Above atmospheric (raw > zero): POSITIVE IWC
+float adcZeroPressure = 964.0;        // 15422/16 (factory default zero point, atmospheric)
+float pressureSlope12bit = 22.84;     // 365.44/16 — ADC counts (12-bit) per IWC
 
-// Current: mapit(adc_rms, 1248, 4640, 2.1, 8.0) for 16-bit
-// 12-bit equivalents: 1248/16=78, 4640/16=290
-float adcZeroCurrent = 78.0;      // 12-bit equivalent
-float adcFullCurrent = 290.0;     // 12-bit equivalent
+// Current: Python uses mapit(abs(ch2-ch3), 1248, 4640, 2.1, 8.0) on ADS1115 (16-bit)
+// Those 16-bit single-ended differences correspond to physical voltages:
+//   1248 × 125µV = 156mV differential → 2.1A
+//   4640 × 125µV = 580mV differential → 8.0A
+//
+// On ADS1015 we use readADC_Differential_2_3() at GAIN_TWO (±2.048V, 1mV/count)
+// which reads the hardware differential directly with full 12-bit precision.
+//   156mV / 1mV = 156 counts → 2.1A
+//   580mV / 1mV = 580 counts → 8.0A
+float adcZeroCurrent = 156.0;     // Differential counts at 2.1A (GAIN_TWO, 1mV/count)
+float adcFullCurrent = 580.0;     // Differential counts at 8.0A (GAIN_TWO, 1mV/count)
 float currentRangeLow = 2.1;      // Amps at zero ADC
 float currentRangeHigh = 8.0;     // Amps at full ADC
 
-// Rolling average buffers
-// SPEED FIX: Pressure was 200 samples (3.3 seconds at 60Hz) — too slow for
-// 1-second display updates. Reduced to 60 samples (1 second) for responsive
-// readings that still smooth out ADC noise. Current kept at 20 (0.33 seconds).
+// Rolling average buffer for pressure (60 samples = 1 second at 60Hz)
 #define PRESSURE_AVG_SAMPLES 60
-#define CURRENT_AVG_SAMPLES 20
 float pressureBuffer[PRESSURE_AVG_SAMPLES] = {0};
-float currentBuffer[CURRENT_AVG_SAMPLES] = {0};
 int pressureBufferIdx = 0;
-int currentBufferIdx = 0;
 int pressureSampleCount = 0;       // Tracks how many samples collected (for initial fill)
-int currentSampleCount = 0;
+
+// Windowed peak buffer for current (60 samples = 1 second at 60Hz)
+// Matches Python's approach: collect 60 readings, remove min/max outliers,
+// then return the MAXIMUM of the trimmed set (peak detection, not average).
+// This correctly captures motor current peaks for alarm threshold comparison.
+#define CURRENT_PEAK_SAMPLES 60
+float currentPeakBuffer[CURRENT_PEAK_SAMPLES] = {0};
+int currentPeakIdx = 0;
+int currentPeakCount = 0;
 
 // =====================================================================
 // RELAY CONTROL GLOBALS (Rev 10 - controlled via serial, not I2C)
@@ -1405,10 +1417,12 @@ ProfileManager profileManager;
 
 /**
  * Map a value from one range to another (floating point version).
- * Ported from Python control.py mapit() function.
+ * Ported from Python control.py map_value() function.
+ * 
+ * Note: Pressure now uses a direct linear formula (see adcReaderTask).
+ * This function is still used for current ADC-to-amps conversion.
  * 
  * Usage example:
- *   float pressure = mapFloat(adcValue, 964.0, 1429.0, 0.0, 20.8);
  *   float current = mapFloat(adcRms, 78.0, 290.0, 2.1, 8.0);
  */
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
@@ -1437,23 +1451,48 @@ float addPressureSample(float sample) {
 }
 
 /**
- * Add a sample to the current rolling average buffer.
- * Returns the current rolling average.
+ * Add a sample to the current windowed peak buffer.
+ * Returns the peak current (maximum after removing single highest outlier).
+ * 
+ * Matches Python's approach: collect 60 samples (~1 second at 60Hz),
+ * remove min and max outliers, return the maximum of the trimmed set.
+ * This captures the true peak motor current for accurate alarm comparison.
  * 
  * Usage: Called from ADS1015 task at 60Hz.
+ * 
+ * Example:
+ *   float peakCurrent = addCurrentSample(3.5);  // Returns windowed peak amps
  */
 float addCurrentSample(float sample) {
-    currentBuffer[currentBufferIdx] = sample;
-    currentBufferIdx = (currentBufferIdx + 1) % CURRENT_AVG_SAMPLES;
-    if (currentSampleCount < CURRENT_AVG_SAMPLES) currentSampleCount++;
+    currentPeakBuffer[currentPeakIdx] = sample;
+    currentPeakIdx = (currentPeakIdx + 1) % CURRENT_PEAK_SAMPLES;
+    if (currentPeakCount < CURRENT_PEAK_SAMPLES) currentPeakCount++;
     
-    // Calculate average over available samples
-    float sum = 0;
-    int count = min(currentSampleCount, CURRENT_AVG_SAMPLES);
-    for (int i = 0; i < count; i++) {
-        sum += currentBuffer[i];
+    int count = min(currentPeakCount, (int)CURRENT_PEAK_SAMPLES);
+    if (count <= 2) {
+        // Not enough samples for outlier trimming — return simple max
+        float mx = 0;
+        for (int i = 0; i < count; i++) {
+            if (currentPeakBuffer[i] > mx) mx = currentPeakBuffer[i];
+        }
+        return mx;
     }
-    return sum / count;
+    
+    // Find the highest and second-highest values in the buffer.
+    // We discard the single highest (outlier) and return the second-highest (trimmed peak).
+    // This matches Python's sorted→trimmed→max approach without a full sort.
+    float maxVal = -1e9;
+    float secondMax = -1e9;
+    for (int i = 0; i < count; i++) {
+        float v = currentPeakBuffer[i];
+        if (v > maxVal) {
+            secondMax = maxVal;
+            maxVal = v;
+        } else if (v > secondMax) {
+            secondMax = v;
+        }
+    }
+    return secondMax;  // Peak after removing single highest outlier
 }
 
 // =====================================================================
@@ -1535,7 +1574,15 @@ void i2cBusRecovery() {
  * 
  * Polls ADS1015 at ~60Hz (16ms interval):
  *   - Channel 0: Pressure sensor (single-ended)
- *   - Channels 2 & 3: Current monitoring (abs differential)
+ *     Formula: pressure_IWC = (raw - adcZeroPressure) / pressureSlope12bit
+ *     Matches Python pressure_sensor.py two-point calibration.
+ *     Vacuum = NEGATIVE IWC, atmospheric = 0, above atmospheric = POSITIVE.
+ *     Output is 60-sample rolling average (~1 second window).
+ *   - Channels 2 & 3: Current monitoring (hardware differential via readADC_Differential_2_3)
+ *     Uses GAIN_TWO (±2.048V, 1mV/count) for 2x resolution on the current signal.
+ *     Formula: current_A = mapFloat(abs(diff), 156, 580, 2.1, 8.0)
+ *     Output is windowed peak (max after removing highest outlier, 60-sample window).
+ *     Matches Python's max-after-trim approach for accurate alarm comparison.
  * 
  * Also reads GPIO38 overfill sensor every ~1 second.
  * 
@@ -1595,36 +1642,41 @@ void adcReaderTask(void *parameter) {
                 int16_t rawPressure = ads.readADC_SingleEnded(0);
                 
                 if (rawPressure >= 0) {
-                    // Success - convert to pressure IWC using rolling average
+                    // Success - convert to pressure IWC using Python-compatible linear formula
+                    // pressure = (raw - adc_zero) / slope
+                    // Vacuum (raw < adc_zero) → negative IWC (normal operating range)
+                    // Above atmospheric (raw > adc_zero) → positive IWC
                     adcRawPressure = rawPressure;
-                    float pressureIWC = mapFloat((float)rawPressure, adcZeroPressure, adcFullPressure, 0.0, pressureRangeIWC);
-                    // Negate because negative IWC is the normal operating range
-                    adcPressure = addPressureSample(-pressureIWC);
+                    float pressureIWC = ((float)rawPressure - adcZeroPressure) / pressureSlope12bit;
+                    adcPressure = addPressureSample(pressureIWC);
                     adcErrorCount = 0;  // Reset consecutive error count
                 } else {
                     adcErrorCount++;
                     adcTotalErrors++;
                 }
                 
-                // Read Channels 2 & 3: Current monitoring (abs differential)
-                int16_t rawCh2 = ads.readADC_SingleEnded(2);
-                int16_t rawCh3 = ads.readADC_SingleEnded(3);
+                // Read Channels 2 & 3: Current monitoring (hardware differential)
+                // FIX: Previous code read ch2 and ch3 as two separate single-ended values
+                // then subtracted them in software. On the 12-bit ADS1015 (2mV/count),
+                // both channels returned nearly identical absolute values, making the
+                // computed difference ≈ 0 and current always read 0.0A.
+                //
+                // Now: use the ADS1015's built-in differential mode at GAIN_TWO (1mV/count)
+                // which measures the actual voltage difference (AIN2 - AIN3) in a single
+                // conversion with full 12-bit precision on the difference itself.
+                ads.setGain(GAIN_TWO);   // ±2.048V range, 1mV/count — max expected ~580mV
+                int16_t rawDiff = ads.readADC_Differential_2_3();
+                ads.setGain(GAIN_ONE);   // Restore to ±4.096V for next pressure read
                 
-                if (rawCh2 >= 0 && rawCh3 >= 0) {
-                    // Calculate absolute differential current
-                    int16_t rawDiff = abs(rawCh2 - rawCh3);
-                    adcRawCurrent = rawDiff;
-                    float currentAmps = mapFloat((float)rawDiff, adcZeroCurrent, adcFullCurrent, currentRangeLow, currentRangeHigh);
-                    if (currentAmps < 0) currentAmps = 0;  // Clamp negative values
-                    adcCurrent = addCurrentSample(currentAmps);
-                    
-                    // Track peak current for high-current detection
-                    if (currentAmps > adcPeakCurrent) {
-                        adcPeakCurrent = currentAmps;
-                    }
-                } else {
-                    adcErrorCount++;
-                    adcTotalErrors++;
+                int16_t absDiff = abs(rawDiff);
+                adcRawCurrent = absDiff;
+                float currentAmps = mapFloat((float)absDiff, adcZeroCurrent, adcFullCurrent, currentRangeLow, currentRangeHigh);
+                if (currentAmps < 0) currentAmps = 0;  // Clamp below-threshold to 0
+                adcCurrent = addCurrentSample(currentAmps);
+                
+                // Track peak current for high-current detection
+                if (currentAmps > adcPeakCurrent) {
+                    adcPeakCurrent = currentAmps;
                 }
                 
                 // Error recovery: After 10 consecutive errors, attempt reinit
@@ -4146,10 +4198,15 @@ void parsedSerialData() {
     String faultStr = getJsonValue(dataBuffer, "fault");
     String cyclesStr = getJsonValue(dataBuffer, "cycles");
     
-    // Check for shutdown command: {"mode":"shutdown"} (string value, not integer)
-    // This is the ONLY way to trigger DISP_SHUTDN LOW in Rev 10
+    // Check for shutdown/normal commands: string mode values (not integers)
+    // {"mode":"shutdown"} — DISP_SHUTDN LOW (site shutdown, 72-hour alarm)
+    // {"mode":"normal"}  — DISP_SHUTDN HIGH (clear 72-hour alarm, restore site)
     if (modeStr == "shutdown") {
         activateDispShutdown();
+        return;  // Don't process as normal data packet
+    }
+    if (modeStr == "normal") {
+        deactivateDispShutdown();
         return;  // Don't process as normal data packet
     }
     
