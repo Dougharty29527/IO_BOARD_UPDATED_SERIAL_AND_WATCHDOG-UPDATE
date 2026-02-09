@@ -1,8 +1,10 @@
 # MCP23017 Software Emulation Compatibility Guide
 
-## Overview
+> **DEPRECATED (Rev 10.0 — February 2026):** The MCP23017 I2C slave emulation was **completely removed** in Rev 10.0. The ESP32 is now the I2C master (reading its own ADS1015 ADC) and all relay control is handled via serial JSON commands from the Linux device. This document is preserved for historical reference only. It does NOT apply to Rev 10.0 or later firmware.
 
-The Walter IO Board Firmware (Rev 9.1) includes a software emulation of the Microchip MCP23017 16-bit I/O Expander. This document describes the emulation's compatibility with the physical chip, limitations, and recommendations for client software.
+## Overview (Historical — Rev 9.x Only)
+
+The Walter IO Board Firmware (Rev 9.1 through 9.4f) included a software emulation of the Microchip MCP23017 16-bit I/O Expander. This document describes the emulation's compatibility with the physical chip, limitations, and recommendations for client software.
 
 **Reference:** [Microchip MCP23017 Datasheet (DS20001952C)](https://ww1.microchip.com/downloads/en/devicedoc/20001952c.pdf)
 

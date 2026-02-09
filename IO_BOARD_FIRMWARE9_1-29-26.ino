@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.3
+ *  Walter IO Board Firmware - Rev 10.4
  *  Date: 2/9/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -190,6 +190,25 @@
  *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
+ *  Rev 10.4 (2/9/2026) - Web Portal Test/Cycle Fix + Full Button Audit
+ *  - FIXED: Web portal Leak Test, Functionality Test, Efficiency Test, Clean Canister,
+ *    Start Cycle, and Manual Purge buttons did nothing when pressed.
+ *    * Root cause: Python IOManager functions had "screen guards" that only allowed
+ *      execution when the Kivy touchscreen was on the matching screen (e.g., leak_test()
+ *      only ran if touchscreen was on "LeakTest" screen). When commands came from the
+ *      web portal, the touchscreen was typically on "Main", so all commands were silently
+ *      blocked.
+ *    * Fix: Added from_web parameter to all affected Python functions. Web portal
+ *      commands now bypass the Kivy screen guard (web portal has its own PW protection).
+ *  - AUDITED: All 25+ web portal buttons verified against their ESP32 and Python handlers
+ *    * Every button confirmed to reach the correct handler with correct parameters
+ *    * All navigation links verified to target existing screen IDs
+ *    * All password-protected actions verified (Maintenance PW, Profile PW, Config PW)
+ *  - NOTE: This fix is in the Python code, not the ESP32 firmware. The ESP32 command
+ *    forwarding was already correct — it properly sent the commands to Linux via Serial1.
+ *    The Python side was discarding them due to the screen guard.
+ *  
+ *  =====================================================================
  *  Rev 10.3 (2/9/2026) - Faster Pressure Updates for Real-Time Controller Response
  *  - IMPROVED: Pressure rolling average reduced from 200 samples to 60 samples
  *    * Was: 200 samples at 60Hz = 3.3-second averaging window
@@ -279,7 +298,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.3"
+#define VERSION "Rev 10.4"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
