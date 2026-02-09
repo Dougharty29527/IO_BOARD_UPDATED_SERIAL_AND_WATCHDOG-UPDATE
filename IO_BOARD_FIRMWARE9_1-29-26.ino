@@ -619,6 +619,16 @@ char apSSID[32] = "GM IO Board";  // Will be updated with suffix
 String apSuffix = "";             // Stores the current suffix (random or device ID)
 bool apNameFromSerial = false;    // True if AP name was set from serial device ID
 
+// =====================================================================
+// WEB PORTAL TEST STATE TRACKING
+// =====================================================================
+// Tracks which test (if any) is running so the web UI can display
+// elapsed time and status. Set by start_test/stop_test web commands.
+// Auto-cleared when relay mode returns to 0 (idle = test finished).
+String  activeTestType = "";          // "leak", "func", "eff", "" (empty = no test)
+unsigned long testStartTime = 0;      // millis() when test started
+bool    testRunning = false;          // True while a test is in progress
+
 // Status JSON output to Python device (via Serial1/RS-232)
 // FULL status (datetime, SD, LTE, cell info) sent every 15 seconds
 // FAST sensor packet (pressure, current, overfill, mode) sent every 1 second
@@ -1023,6 +1033,12 @@ void setRelaysForMode(uint8_t modeNum) {
                 break;
         }
         currentRelayMode = modeNum;
+        // Auto-clear test state when relays return to idle (test finished)
+        if (modeNum == 0 && testRunning) {
+            testRunning = false;
+            activeTestType = "";
+            Serial.println("[TEST] Auto-cleared — relays returned to idle");
+        }
         // Update current_mode enum for LED color display
         if (modeNum <= 3) {
             current_mode = (RunMode)modeNum;
@@ -2508,8 +2524,30 @@ const char* control_html = R"rawliteral(
                         // Manual mode
                         upd('manPressure',d.pressure);upd('manCurrent',d.current);
                         upd('manCycles',d.cycles);upd('manMode',modeNames[d.mode]||d.mode);
-                        // Tests
+                        // Tests — update timer displays from server test state
                         upd('testPressure',d.pressure);
+                        // Known test durations in seconds (matches Python IOManager)
+                        var testDurations={leak:1800,func:1200,eff:120,clean:7200};
+                        if(d.testRunning){
+                            var el=d.testElapsed||0;
+                            var dur=testDurations[d.testType]||0;
+                            var remain=Math.max(0,dur-el);
+                            var mm=Math.floor(remain/60);
+                            var ss=remain%60;
+                            var tmr=(mm<10?'0':'')+mm+':'+(ss<10?'0':'')+ss;
+                            var stat='Running ('+d.testType+')';
+                            // Update the correct screen's timer based on test type
+                            if(d.testType==='leak'){upd('leakTimer',tmr);upd('leakStatus',stat);}
+                            else if(d.testType==='func'){upd('funcTimer',tmr);upd('funcStatus',stat);}
+                            else if(d.testType==='eff'){upd('effTime',tmr);upd('effStep','Running');upd('effMode',modeNames[d.mode]||d.mode);}
+                            else if(d.testType==='clean'){upd('cleanTimer',tmr);upd('cleanStatus',stat);}
+                        } else {
+                            // No test running — only reset to defaults if they were showing active
+                            var lt=$('leakStatus');if(lt&&lt.textContent.indexOf('Running')>=0){upd('leakTimer','--:--');upd('leakStatus','Ready');}
+                            var ft=$('funcStatus');if(ft&&ft.textContent.indexOf('Running')>=0){upd('funcTimer','--');upd('funcStatus','Ready');}
+                            var es=$('effStep');if(es&&es.textContent.indexOf('Running')>=0){upd('effTime','--');upd('effStep','--');upd('effMode','--');}
+                            var cs=$('cleanStatus');if(cs&&cs.textContent.indexOf('Running')>=0){upd('cleanTimer','15:00');upd('cleanStatus','Ready');}
+                        }
                         // Profiles
                         upd('profCurrent',d.profile);
                         var btns=document.querySelectorAll('.profile-btn');
@@ -3072,6 +3110,14 @@ void startConfigAP() {
         json += "\"alarmHighCurrent\":" + String((adcCurrent > HIGH_CURRENT_THRESHOLD) ? "true" : "false") + ",";
         json += "\"watchdogTriggered\":" + String(watchdogTriggered ? "true" : "false") + ",";
         json += "\"watchdogEnabled\":" + String(watchdogEnabled ? "true" : "false") + ",";
+        // Test state for web portal timer display
+        json += "\"testRunning\":" + String(testRunning ? "true" : "false") + ",";
+        json += "\"testType\":\"" + activeTestType + "\",";
+        if (testRunning) {
+            json += "\"testElapsed\":" + String((millis() - testStartTime) / 1000) + ",";
+        } else {
+            json += "\"testElapsed\":0,";
+        }
         // Datetime
         json += "\"datetime\":\"" + getDateTimeString() + "\",";
         json += "\"uptime\":\"" + String(uptimeStr) + "\",";
@@ -3131,6 +3177,44 @@ void startConfigAP() {
                 Serial1.println("{\"command\":\"stop_cycle\"}");
                 Serial.println("[WEB CMD] Forwarded stop_cycle to Linux");
             }
+            // Clear test state if a test was running (stop_cycle stops tests too)
+            if (testRunning) {
+                testRunning = false;
+                activeTestType = "";
+                Serial.println("[WEB CMD] Test cleared by stop_cycle");
+            }
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        // =========================================================
+        // START TEST — Forwards test commands to Linux via Serial1
+        // Tests: "leak" (30 min), "func" (20 min), "eff" (varies)
+        // ESP32 tracks state for timer display; Linux runs the actual test.
+        // =========================================================
+        else if (cmd == "start_test") {
+            if (!failsafeMode) {
+                // Forward to Linux — Python IOManager has the test functions
+                char cmdBuf[128];
+                snprintf(cmdBuf, sizeof(cmdBuf),
+                         "{\"command\":\"start_test\",\"type\":\"%s\"}", val.c_str());
+                Serial1.println(cmdBuf);
+                Serial.printf("[WEB CMD] Forwarded test to Linux: %s\r\n", cmdBuf);
+                // Track test state for web UI timer display
+                activeTestType = val;
+                testStartTime = millis();
+                testRunning = true;
+            } else {
+                Serial.println("[WEB CMD] start_test ignored — failsafe mode active");
+            }
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        // STOP TEST — same as stop_cycle (Python stop_cycle() stops all processes)
+        else if (cmd == "stop_test") {
+            if (!failsafeMode) {
+                Serial1.println("{\"command\":\"stop_cycle\"}");
+                Serial.println("[WEB CMD] Forwarded stop_test as stop_cycle to Linux");
+            }
+            testRunning = false;
+            activeTestType = "";
             request->send(200, "application/json", "{\"ok\":true}");
         }
         // =========================================================
@@ -4000,16 +4084,22 @@ void parsedSerialData() {
         Serial.println("[Serial] WiFi AP name updated to: " + String(apSSID));
     }
     
-    // Log received data
-    Serial.println("✓ JSON parsed - Press:" + String(pressure) + " Cycles:" + String(cycles) + 
-                   " Mode:" + String(mode) + " Current:" + String(current) + " GMID:" + gmidStr);
+    // Log received data from Linux (cycles, faults, GMID are used; pressure/current are informational only)
+    // NOTE: ESP32 uses its own ADC for pressure/current (adcPressure/adcCurrent) not these values
+    Serial.println("✓ JSON from Linux - Cycles:" + String(cycles) + " Faults:" + String(faults) +
+                   " GMID:" + gmidStr + " (ADC press:" + String(adcPressure, 2) + " curr:" + String(adcCurrent, 2) + ")");
     
     // Save to SD if we have valid data
     if (noSerialCount <= 5) {
-        pres_scaled = static_cast<int>(round(pressure * 100.0));
+        // REV 10 FIX: Use adcPressure (ESP32's own ADC reading at 60Hz) instead of
+        // the round-tripped 'pressure' variable from Python. Previously, pressure had
+        // to travel: ESP32 ADC → serial → Python → serial back → parsedSerialData()
+        // which added 15+ seconds of staleness. adcPressure is updated 60 times/sec.
+        pres_scaled = static_cast<int>(round(adcPressure * 100.0));
         seq++;
         Serial.println("Saving to SD");
-        SaveToSD(deviceName, seq - 1, pres_scaled, cycles, faults, mode, temp_scaled, current);
+        // REV 10: Use ESP32's own adcCurrent and currentRelayMode (no Python round-trip)
+        SaveToSD(deviceName, seq - 1, pres_scaled, cycles, faults, currentRelayMode, temp_scaled, adcCurrent);
     } else {
         NoSerial = 1;
     }
@@ -4074,24 +4164,31 @@ void buildSendDataArray(){
         Serial.println(" (all other values zeroed)");
         
     } else {
-        // Normal operation - use live data from serial
+        // Normal operation — use ESP32's own sensor data (no Python round-trip)
         
         // Read ESP32's own temperature sensor
         float celsius = temperatureRead();
         float fahrenheit = (celsius * 9.0 / 5.0) + 32;
         temp_scaled = static_cast<int>(round(fahrenheit * 100.0));
         
-        // Scale current from Python JSON
-        int current_scaled = static_cast<int>(round(current * 100.0));
+        // REV 10 FIX: Use adcPressure and adcCurrent directly from ESP32's own
+        // ADS1015 ADC (updated at 60Hz) instead of the round-tripped values from
+        // Python. The old 'pressure' and 'current' variables required a 15-second
+        // round trip through Python and back, making CBOR data stale.
+        // Now: ESP32 ADC → CBOR (direct, real-time, no delay)
+        pres_scaled = static_cast<int>(round(adcPressure * 100.0));
+        int current_scaled = static_cast<int>(round(adcCurrent * 100.0));
         
         Serial.print("Data summary - Temp(ESP32): ");
         Serial.print(fahrenheit);
-        Serial.print("°F, Press(Python): ");
-        Serial.print(pres_scaled / 100.0);
-        Serial.print(", Cycles(Python): ");
+        Serial.print("°F, Press(ADC): ");
+        Serial.print(adcPressure);
+        Serial.print(", Current(ADC): ");
+        Serial.print(adcCurrent);
+        Serial.print(", Cycles(Linux): ");
         Serial.print(cycles);
-        Serial.print(", Current(Python): ");
-        Serial.println(current);
+        Serial.print(", Mode: ");
+        Serial.println(currentRelayMode);
         
         // Add BlueCherry fault code (4096) to existing faults if BC is offline
         int totalFaults = faults + getBlueCherryFaultCode();
@@ -4101,7 +4198,7 @@ void buildSendDataArray(){
         readings[readingCount-1][2] = pres_scaled;
         readings[readingCount-1][3] = cycles;
         readings[readingCount-1][4] = totalFaults;  // Device faults + 4096 if BC offline
-        readings[readingCount-1][5] = mode;
+        readings[readingCount-1][5] = currentRelayMode;  // Use ESP32's own mode, not round-tripped
         readings[readingCount-1][6] = temp_scaled;
         readings[readingCount-1][7] = current_scaled;
         
