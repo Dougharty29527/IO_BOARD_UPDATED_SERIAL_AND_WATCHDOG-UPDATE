@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.4
+ *  Walter IO Board Firmware - Rev 10.5
  *  Date: 2/9/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -190,6 +190,27 @@
  *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
+ *  Rev 10.5 (2/9/2026) - Optimized Serial Update Rates: 5Hz Sensors, Fresh-Only Cellular
+ *  - IMPROVED: Fast sensor packet rate increased from 1Hz to 5Hz (200ms interval)
+ *    * Pressure, current, overfill, and SD card status now sent 5 times per second
+ *    * Gives the Linux controller much faster visibility into real-time sensor changes
+ *    * SD card status added to fast packet (cheap SD.cardType() check, no disk I/O)
+ *  - CHANGED: Cellular/datetime fields now sent ONLY when modem returns fresh data
+ *    * Previously: datetime, lte, rsrp, rsrq, passthrough sent every 15 seconds on timer
+ *    * Problem: Values repeated unchanged between modem queries, wasting bandwidth.
+ *      datetime appeared to "freeze then jump" because interpolated value was stale.
+ *    * Now: modemDataFresh flag set by refreshCellSignalInfo() (~every 60s) and
+ *      lteConnect(). modemTimeFresh flag set by initModemTime(). sendStatusToSerial()
+ *      only fires when one of these flags is true, then clears both flags.
+ *    * Result: Cellular fields appear only when genuinely new — no stale repeats.
+ *  - REMOVED: STATUS_SEND_INTERVAL (15-second timer) and lastStatusSendTime
+ *    * Full status is now event-driven (fresh modem data), not time-driven
+ *  - ARCHITECTURE: Two distinct serial packet types to Linux:
+ *    * Fast (5Hz): {"pressure":X,"current":X,"overfill":X,"sdcard":"OK","relayMode":X}
+ *    * Fresh cellular: {"datetime":"...","lte":X,"rsrp":"...","rsrq":"...", ... }
+ *    * Python modem.py parser handles both — same JSON field extraction logic
+ *  
+ *  =====================================================================
  *  Rev 10.4 (2/9/2026) - Web Portal Test/Cycle Fix + Full Button Audit
  *  - FIXED: Web portal Leak Test, Functionality Test, Efficiency Test, Clean Canister,
  *    Start Cycle, and Manual Purge buttons did nothing when pressed.
@@ -298,7 +319,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.4"
+#define VERSION "Rev 10.5"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -627,6 +648,15 @@ uint16_t modemCC = 0;             // Country Code (e.g. 310 for US)
 uint16_t modemNC = 0;             // Network Code (e.g. 260 for T-Mobile US)
 uint32_t modemCID = 0;
 uint32_t modemTAC = 0;            // Cell ID - unique identifier of the serving cell tower
+
+// REV 10.5 — Freshness tracking for modem/cellular data
+// These flags are set TRUE when fresh data arrives from the modem library
+// (refreshCellSignalInfo, lteConnect, initModemTime). They are cleared after
+// the data is sent to the Linux device via sendStatusToSerial().
+// This prevents sending stale/repeated datetime, rsrp, rsrq, lte, passthrough
+// values in every packet — those fields are only included when genuinely new.
+bool modemDataFresh = false;      // Set true when refreshCellSignalInfo() gets new cell data
+bool modemTimeFresh = false;      // Set true when modem clock is freshly queried
 String imei = "";
 String macStr = "";
 int64_t currentTimestamp = 0;
@@ -673,13 +703,16 @@ String  activeTestType = "";          // "leak", "func", "eff", "" (empty = no t
 unsigned long testStartTime = 0;      // millis() when test started
 bool    testRunning = false;          // True while a test is in progress
 
-// Status JSON output to Python device (via Serial1/RS-232)
-// FULL status (datetime, SD, LTE, cell info) sent every 15 seconds
-// FAST sensor packet (pressure, current, overfill, mode) sent every 1 second
-unsigned long lastStatusSendTime = 0;
-const unsigned long STATUS_SEND_INTERVAL = 15000;  // 15 seconds - full status
+// REV 10.5: Serial JSON output to Python device (via Serial1/RS-232)
+// Two sending mechanisms:
+//   FAST sensor packet: pressure, current, overfill, sdcard, relayMode — every 200ms (5Hz)
+//   FRESH cellular status: datetime, lte, rsrp, rsrq, operator, etc. — ONLY on fresh modem data
+// The 15-second fixed timer for cellular data is REMOVED. Cellular fields are sent
+// only when refreshCellSignalInfo() or initModemTime() retrieves new data from modem.
 unsigned long lastSensorSendTime = 0;
-const unsigned long SENSOR_SEND_INTERVAL = 1000;   // 1 second - fast sensor updates
+const unsigned long SENSOR_SEND_INTERVAL = 200;    // 200ms = 5Hz - fast sensor updates (pressure, current, overfill, sdcard)
+// NOTE: lastStatusSendTime and STATUS_SEND_INTERVAL removed in Rev 10.5
+// Full status is now triggered by modemDataFresh/modemTimeFresh flags, not a timer
 
 // Passthrough mode - allows IO Board to act as a serial bridge to the modem
 // When enabled, Serial1 (RS-232) data is forwarded directly to/from the modem
@@ -3462,6 +3495,7 @@ bool initModemTime() {
         if (rsp.result == WALTER_MODEM_STATE_OK) {
             currentTimestamp = rsp.data.clock.epochTime;
             lastMillis = millis();
+            modemTimeFresh = true;  // REV 10.5: Mark time as fresh from modem
             Serial.print("Raw modem timestamp (UTC): ");
             Serial.println(rsp.data.clock.epochTime);
             return true;
@@ -3572,52 +3606,50 @@ bool isSDCardOK() {
 }
 
 /**
- * Send status JSON to Python device via Serial1 (RS-232)
- * Called every 15 seconds from main loop
+ * Send FRESH modem/cellular status JSON to the Python device via Serial1 (RS-232).
  * 
- * JSON Format:
- *   {"datetime":"2026-01-30 12:34:56","sdcard":"OK","passthrough":0,"lte":1,"rsrp":"-85.5","rsrq":"-10.2"}
+ * REV 10.5: This function is now ONLY called when fresh data was retrieved from
+ * the modem library (refreshCellSignalInfo or initModemTime succeeded). It is NOT
+ * called on a fixed timer. This prevents sending stale/repeated datetime, RSRP,
+ * RSRQ, LTE, and passthrough values in every packet.
  * 
- * Fields:
- *   - datetime: Current date/time from modem (UTC)
- *   - sdcard: "OK" or "FAULT" based on SD card status
- *   - passthrough: 0 or 1 (passthrough mode status)
- *   - lte: 1 if connected to LTE, 0 if not
- *   - rsrp: Signal strength in dBm (typical: -80 excellent, -100 poor)
- *   - rsrq: Signal quality in dB (typical: -10 good, -20 poor)
+ * The fast sensor data (pressure, current, overfill, sdcard) is handled by
+ * sendFastSensorPacket() at 5Hz — this function only sends the slow-changing
+ * cellular and system fields that the Python program caches.
+ * 
+ * JSON Format (only sent when modem data is fresh):
+ *   {"datetime":"2026-02-09 14:30:00","passthrough":0,"lte":1,"rsrp":"-85.5",
+ *    "rsrq":"-10.2","operator":"T-Mobile","band":"12","mcc":310,"mnc":260,
+ *    "cellId":12345,"tac":678,"profile":"CS2","failsafe":0}
  * 
  * Usage example:
- *   sendStatusToSerial();  // Call every 15 seconds
+ *   sendStatusToSerial();  // Called only when modemDataFresh or modemTimeFresh is true
  */
 void sendStatusToSerial() {
-    // Get current timestamp from modem
+    // Get current timestamp from modem (only meaningful when freshly queried)
     String dateTimeStr = formatTimestamp(currentTimestamp);
-    
-    // Check SD card status
-    String sdStatus = isSDCardOK() ? "OK" : "FAULT";
     
     // Check LTE connection status
     int lteStatus = lteConnected() ? 1 : 0;
     
-    // Get signal quality - use stored values (updated by refreshCellSignalInfo every 60s)
+    // Get signal quality — these are FRESH because this function is only called
+    // after refreshCellSignalInfo() or lteConnect() successfully updated them
     String rsrpStr = modemRSRP.length() > 0 ? modemRSRP : "--";
     String rsrqStr = modemRSRQ.length() > 0 ? modemRSRQ : "--";
     String operatorStr = modemNetName.length() > 0 ? modemNetName : "--";
     String bandStr = modemBand.length() > 0 ? modemBand : "--";
     
-    // Build JSON string with all status info (Rev 10 - includes pressure, current, overfill, profile)
-    // Sent every 15 seconds to modem.py on Linux device via Serial1 (RS-232)
-    // New Rev 10 fields: pressure, current (from ADS1015), overfill (GPIO38), profile, failsafe
+    // REV 10.5: Cellular-only JSON — no pressure/current/overfill/sdcard here.
+    // Those fast-changing values are sent at 5Hz by sendFastSensorPacket().
+    // This packet contains ONLY the slow-changing modem/system fields.
     char jsonBuffer[512];
     snprintf(jsonBuffer, sizeof(jsonBuffer),
-             "{\"datetime\":\"%s\",\"sdcard\":\"%s\",\"passthrough\":%d,"
+             "{\"datetime\":\"%s\",\"passthrough\":%d,"
              "\"lte\":%d,\"rsrp\":\"%s\",\"rsrq\":\"%s\","
              "\"operator\":\"%s\",\"band\":\"%s\","
              "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u,\"tac\":%u,"
-             "\"pressure\":%.2f,\"current\":%.2f,\"overfill\":%d,"
              "\"profile\":\"%s\",\"failsafe\":%d}",
              dateTimeStr.c_str(),
-             sdStatus.c_str(),
              passthroughValue,
              lteStatus,
              rsrpStr.c_str(),
@@ -3625,38 +3657,46 @@ void sendStatusToSerial() {
              operatorStr.c_str(),
              bandStr.c_str(),
              modemCC, modemNC, modemCID, modemTAC,
-             adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
              profileManager.getActiveProfileName().c_str(),
              failsafeMode ? 1 : 0);
     
     // Send to Python device via Serial1 (RS-232)
     Serial1.println(jsonBuffer);
     
+    // Clear freshness flags — won't send again until modem provides new data
+    modemDataFresh = false;
+    modemTimeFresh = false;
+    
     // Debug output to Serial Monitor
-    Serial.print("[RS232-TX] ");
+    Serial.print("[RS232-TX FRESH] ");
     Serial.println(jsonBuffer);
 }
 
 /**
- * Send a lightweight sensor-only packet to Python every 1 second.
- * Contains ONLY the fast-changing values that the UI needs in real-time:
- *   pressure (IWC), current (amps), overfill state, relay mode
+ * Send a lightweight sensor-only packet to Python at 5Hz (every 200ms).
  * 
- * This is much smaller (~60 bytes) than the full status (~500 bytes)
- * and avoids expensive modem/SD card queries.
+ * REV 10.5: Increased from 1Hz to 5Hz. Added sdcard field.
+ * 
+ * Contains the fast-changing values that the Linux controller needs in real-time:
+ *   pressure (IWC), current (amps), overfill state, sdcard status, relay mode
+ * 
+ * This is much smaller (~80 bytes) than the full status (~500 bytes)
+ * and avoids expensive modem queries. isSDCardOK() is a cheap SD.cardType() check.
  * 
  * Python modem.py parses "pressure", "current", "overfill" fields from
  * ANY incoming JSON — same parser handles both fast and full packets.
  * 
  * Usage example:
- *   sendFastSensorPacket();  // Call every 1 second from main loop
+ *   sendFastSensorPacket();  // Called 5x/second from checkAndSendStatusToSerial()
  */
 void sendFastSensorPacket() {
-    // Lightweight JSON — only real-time sensor data, no modem/SD/cell queries
+    // Lightweight JSON — real-time sensor data + SD status, no modem/cell queries
+    // SD card check (SD.cardType()) is fast — just reads cached card type, no I/O
     char buf[128];
     snprintf(buf, sizeof(buf),
-             "{\"pressure\":%.2f,\"current\":%.2f,\"overfill\":%d,\"relayMode\":%d}",
-             adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0, currentRelayMode);
+             "{\"pressure\":%.2f,\"current\":%.2f,\"overfill\":%d,\"sdcard\":\"%s\",\"relayMode\":%d}",
+             adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
+             isSDCardOK() ? "OK" : "FAULT", currentRelayMode);
     Serial1.println(buf);
 }
 
@@ -3664,14 +3704,19 @@ void sendFastSensorPacket() {
  * Check if it's time to send status/sensor data to Python and send if due.
  * Called from main loop - handles timing internally.
  * 
- * Two send rates:
- *   - Every 1 second:  Fast sensor packet (pressure, current, overfill, mode)
- *   - Every 15 seconds: Full status (datetime, SD, LTE, cell info, profile, etc.)
+ * REV 10.5: Two send mechanisms:
+ *   - Every 200ms (5Hz): Fast sensor packet (pressure, current, overfill, sdcard, mode)
+ *     Always sent on schedule — these values change rapidly and the Linux controller
+ *     needs them in real-time for operating decisions.
+ *   - On fresh data ONLY: Cellular status (datetime, LTE, rsrp, rsrq, operator, etc.)
+ *     Only sent when refreshCellSignalInfo() or initModemTime() retrieves NEW data
+ *     from the modem library. This prevents repeating stale datetime and signal values.
+ *     Typically fires every ~60 seconds (when cell info refresh succeeds).
  * 
- * IMPORTANT: Skips sending during passthrough mode to avoid interfering
+ * IMPORTANT: Skips ALL sending during passthrough mode to avoid interfering
  * with modem communication (PPP/AT commands)
  * 
- * Usage: Call in loop() - handles both intervals internally
+ * Usage: Call in loop() - handles timing and freshness checks internally
  */
 void checkAndSendStatusToSerial() {
     // Skip during passthrough mode - serial ports are dedicated to modem bridge
@@ -3681,16 +3726,22 @@ void checkAndSendStatusToSerial() {
     
     unsigned long currentTime = millis();
     
-    // Fast sensor packet every 1 second — pressure/current for UI updates
+    // Fast sensor packet every 200ms (5Hz) — pressure, current, overfill, sdcard
+    // These are the CRITICAL real-time values the Linux controller uses for decisions.
     if (currentTime - lastSensorSendTime >= SENSOR_SEND_INTERVAL) {
         sendFastSensorPacket();
         lastSensorSendTime = currentTime;
     }
     
-    // Full status packet every 15 seconds — includes cell info, SD, datetime
-    if (currentTime - lastStatusSendTime >= STATUS_SEND_INTERVAL) {
+    // REV 10.5: Cellular/datetime status — ONLY when fresh data from modem.
+    // modemDataFresh is set by refreshCellSignalInfo() (every 60s) and lteConnect().
+    // modemTimeFresh is set by initModemTime() when modem clock is queried.
+    // sendStatusToSerial() clears both flags after sending.
+    // This eliminates the "time repeats then updates" problem — datetime and cell
+    // signal values are only sent when the modem library returns genuinely new data.
+    if (modemDataFresh || modemTimeFresh) {
         sendStatusToSerial();
-        lastStatusSendTime = currentTime;
+        // Flags are cleared inside sendStatusToSerial()
     }
 }
 
@@ -4370,6 +4421,9 @@ bool lteConnect() {
         modemNC = rsp.data.cellInformation.nc;                    // Network Code (e.g. 260)
         modemCID = rsp.data.cellInformation.cid;                  // Cell Tower ID
         modemTAC = rsp.data.cellInformation.tac;
+        
+        // REV 10.5: Mark modem data as fresh for serial status output
+        modemDataFresh = true;
  
         Serial.printf("[CELL] Band=%s, Op=%s, RSRP=%s, RSRQ=%s, MCC=%u, MNC=%02u, CID=%u, TAC=%u\r\n",
                       modemBand.c_str(), modemNetName.c_str(), modemRSRP.c_str(), modemRSRQ.c_str(),
@@ -4596,6 +4650,12 @@ void refreshCellSignalInfo() {
         modemNC = rsp.data.cellInformation.nc;                    // Network Code (e.g. 260)
         modemCID = rsp.data.cellInformation.cid;                  // Cell Tower ID
         modemTAC = rsp.data.cellInformation.tac;                  // Tracking Area Code
+        
+        // REV 10.5: Mark modem data as FRESH — sendStatusToSerial() will include
+        // cellular fields (rsrp, rsrq, lte, operator, etc.) on the next send cycle.
+        // This prevents repeating stale cellular data in every serial packet.
+        modemDataFresh = true;
+        Serial.println("[CELL] Fresh cell info retrieved — will include in next serial status");
     }
     // On failure, keep previous values rather than overwriting with "Unknown"
     // This prevents dashboard from flickering between real data and "Unknown"
@@ -5437,7 +5497,9 @@ void loop() {
         lastSDCheck = currentTime;
     }
     
-    // Send status JSON to Python device every 15 seconds via RS-232
+    // REV 10.5: Send serial data to Python device via RS-232
+    // Fast sensors (pressure, current, overfill, sdcard) at 5Hz (every 200ms)
+    // Cellular status (datetime, lte, rsrp, rsrq) only when fresh from modem
     checkAndSendStatusToSerial();
     
     // =====================================================================

@@ -1,6 +1,6 @@
 # Walter IO Board Firmware
 
-**Version:** Rev 10.4  
+**Version:** Rev 10.5  
 **Date:** February 9, 2026  
 **Authors:** Todd Adams & Doug Harty
 
@@ -56,8 +56,8 @@ The ESP32 only takes autonomous control in **failsafe mode** — when the Linux 
 
 | Direction | Frequency | Purpose | Data |
 |-----------|-----------|---------|------|
-| ESP32 → Linux | Every 1 second | **CRITICAL** — Real-time sensor data for controller decisions | Pressure (IWC), Current (A), Overfill, Relay Mode |
-| ESP32 → Linux | Every 15 seconds | Supplementary status (not time-sensitive) | Datetime, SD health, LTE, cell signal, profile, failsafe |
+| ESP32 → Linux | **5Hz** (every 200ms) | **CRITICAL** — Real-time sensor data for controller decisions | Pressure (IWC), Current (A), Overfill, SD card, Relay Mode |
+| ESP32 → Linux | Fresh data only (~60s) | Supplementary status (only when modem returns new data) | Datetime, LTE, cell signal, profile, failsafe |
 | Linux → ESP32 | Every 15 seconds | CBOR payload data for cellular transmission | Device ID, pressure, current, mode, faults, cycles |
 | ESP32 → Linux | On demand | Web portal commands forwarded to Python | start_cycle, stop_cycle, start_test, set_profile |
 
@@ -130,26 +130,25 @@ The ESP32 reads an ADS1015 12-bit ADC at I2C address 0x48. A dedicated FreeRTOS 
 | Channel 0 | Pressure (single-ended) | 60 samples = 1.0 second | Every 16ms |
 | Channels 2 & 3 | Current (abs differential) | 20 samples = 0.33 second | Every 16ms |
 
-The rolling averages smooth out electrical noise while still reflecting real sensor changes within 1 second. These values (`adcPressure`, `adcCurrent`) are sent to the Linux device every 1 second in the fast sensor packet and used directly for CBOR cellular data.
+The rolling averages smooth out electrical noise while still reflecting real sensor changes within 1 second. These values (`adcPressure`, `adcCurrent`) are sent to the Linux device at 5Hz (every 200ms) in the fast sensor packet and used directly for CBOR cellular data.
 
 ---
 
 ## Serial Communication Protocol
 
-### Fast Sensor Packet (ESP32 → Linux, every 1 second)
+### Fast Sensor Packet (ESP32 → Linux, 5 times per second)
 
 ```json
-{"pressure":-14.22,"current":0.07,"overfill":0,"relayMode":1}
+{"pressure":-14.22,"current":0.07,"overfill":0,"sdcard":"OK","relayMode":1}
 ```
 
-This is the **critical** data path. The Linux controller uses these values to make real-time decisions about cycle starts, stops, alarms, and safety shutdowns.
+Sent at 5Hz (every 200ms). This is the **critical** data path. The Linux controller uses these values to make real-time decisions about cycle starts, stops, alarms, and safety shutdowns.
 
-### Full Status Packet (ESP32 → Linux, every 15 seconds)
+### Cellular Status Packet (ESP32 → Linux, only when fresh from modem)
 
 ```json
 {
   "datetime": "2026-02-09 14:30:00",
-  "sdcard": "OK",
   "passthrough": 0,
   "lte": 1,
   "rsrp": "-85.5",
@@ -157,13 +156,12 @@ This is the **critical** data path. The Linux controller uses these values to ma
   "operator": "T-Mobile",
   "band": "12",
   "mcc": 310, "mnc": 260, "cellId": 12345, "tac": 678,
-  "pressure": -14.22,
-  "current": 0.07,
-  "overfill": 0,
   "profile": "CS2",
   "failsafe": 0
 }
 ```
+
+**Not sent on a timer.** This packet is only sent when `refreshCellSignalInfo()` retrieves new data from the modem (~every 60 seconds). This prevents stale/repeated datetime and signal values from flooding the serial line.
 
 ### CBOR Data Payload (Linux → ESP32, every 15 seconds)
 
@@ -286,7 +284,8 @@ These codes are **added** to any existing fault codes from the Linux device.
 
 | Version | Date | Description |
 |---------|------|-------------|
-| **Rev 10.4** | **2/9/2026** | **Fixed web portal tests/cycles not starting (Python screen guard bypass). Full button audit.** |
+| **Rev 10.5** | **2/9/2026** | **Sensor data now sent at 5Hz (was 1Hz). Cellular/datetime sent only on fresh modem data (was every 15s).** |
+| Rev 10.4 | 2/9/2026 | Fixed web portal tests/cycles not starting (Python screen guard bypass). Full button audit. |
 | Rev 10.3 | 2/9/2026 | Faster pressure updates (200→60 sample rolling average = 1 second window). |
 | Rev 10.2 | 2/8/2026 | Fixed stale CBOR pressure. ESP32 CBOR now uses own ADC, not round-tripped Python values. Web test handlers added. |
 | Rev 10.1 | 2/8/2026 | Performance: serial read 5s→100ms. Password-protected web portal (Maintenance 878, Profile 1793). |
