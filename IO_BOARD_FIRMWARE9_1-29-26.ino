@@ -1550,95 +1550,65 @@ void savePressureCalibrationToEeprom() {
 }
 
 /**
- * Calibrate the pressure sensor zero point.
+ * Calibrate the pressure sensor zero point — INSTANT, NON-BLOCKING.
  * 
- * Sets the current sensor reading as the new 0.0 IWC reference point.
- * The sensor should be open to ambient/atmospheric air (no vacuum applied)
- * when calibration is triggered. Works correctly at any altitude — the
- * current ambient pressure becomes the new zero, so a sensor reading
- * -0.5 IWC before calibration will read 0.0 IWC afterward.
+ * One-shot command: adjusts the ADC zero point so the current reading
+ * becomes 0.0 IWC. Takes effect immediately — the very next sensor
+ * packet will reflect the new calibration. No delay, no sample loop.
  * 
- * Collects 60 raw ADC samples (~1 second at 60Hz), sorts them, removes
- * the 5 highest and 5 lowest outliers, and averages the remaining 50
- * to get a stable zero-point reading. Saves the result to EEPROM.
- * 
- * Mirrors Python pressure_sensor.py calibrate():
- *   - Collect samples, trimmed mean, save to database.
- * 
- * If the ADC is not initialized or no valid samples are collected,
- * falls back to the factory default (964.0) and saves that instead.
+ * How it works:
+ *   The ADC reader task (Core 0, 60Hz) already maintains a 60-sample
+ *   rolling average in adcPressure. This function uses that averaged
+ *   reading to compute the offset and shifts adcZeroPressure accordingly:
+ *
+ *     newZero = oldZero + (currentPressure_IWC × slope)
+ *
+ *   Example: sensor reads -0.5 IWC at altitude
+ *     newZero = 964.0 + (-0.5 × 22.84) = 952.58
+ *     Next reading: (rawADC - 952.58) / 22.84 = 0.0 IWC  ✓
+ *
+ * After adjusting:
+ *   1. Clears the rolling average buffer (immediate fresh start)
+ *   2. Saves the new zero to EEPROM (persists across reboots)
+ *   3. Sends {"type":"data","ps_cal":952.58} to Linux via Serial1
+ *      so the Python program can save it to its own database
+ *   4. Regular sensor data packets immediately reflect the new zero
+ *
+ * Triggered by:
+ *   - Serial: {"type":"cmd","cmd":"cal"}
+ *   - Web portal: POST /api/command {"command":"calibrate_pressure"}
  *
  * Usage example:
- *   calibratePressureSensorZeroPoint();  // Triggered by {"type":"cmd","cmd":"cal"}
+ *   calibratePressureSensorZeroPoint();  // Instant — returns in <1ms
  */
 void calibratePressureSensorZeroPoint() {
-    Serial.println("[CAL] Starting pressure sensor zero-point calibration...");
-    Serial.println("[CAL] Current reading will become 0.0 IWC — ensure sensor is open to ambient air!");
-    
     if (!adcInitialized) {
         Serial.println("[CAL] ERROR: ADS1015 not initialized — cannot calibrate");
         return;
     }
     
-    // Collect 60 raw ADC samples from channel 0 (pressure)
-    const int NUM_SAMPLES = 60;
-    const int TRIM_COUNT = 5;  // Remove 5 highest and 5 lowest outliers
-    float samples[NUM_SAMPLES];
-    int validCount = 0;
+    // Capture current state before adjusting
+    float oldZero = adcZeroPressure;
+    float oldPressure = adcPressure;  // 60-sample rolling average (already stable)
     
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        int16_t raw = ads.readADC_SingleEnded(0);
-        if (raw >= 0) {
-            samples[validCount++] = (float)raw;
-        }
-        delay(17);  // ~60Hz sampling rate
-    }
+    // Shift the zero point so the current pressure reading becomes 0.0 IWC
+    // Formula: pressure = (rawADC - zero) / slope
+    // To make pressure = 0: zero must equal rawADC at current reading
+    // Since rawADC = oldZero + (oldPressure × slope):
+    float newZero = oldZero + (oldPressure * pressureSlope12bit);
     
-    Serial.printf("[CAL] Collected %d/%d valid samples\r\n", validCount, NUM_SAMPLES);
-    
-    if (validCount < (TRIM_COUNT * 2 + 1)) {
-        // Not enough samples for trimming — fall back to factory default
-        Serial.println("[CAL] ERROR: Not enough valid samples — using factory default");
-        adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
-        savePressureCalibrationToEeprom();
+    // Sanity check: zero point should be a reasonable ADC value (200-1800 for 12-bit)
+    if (newZero < 200.0 || newZero > 1800.0) {
+        Serial.printf("[CAL] ERROR: Computed zero %.2f out of range (200-1800) — not applied\r\n", newZero);
         return;
     }
     
-    // Sort samples for trimmed mean calculation
-    // Simple insertion sort (fine for 60 elements)
-    for (int i = 1; i < validCount; i++) {
-        float key = samples[i];
-        int j = i - 1;
-        while (j >= 0 && samples[j] > key) {
-            samples[j + 1] = samples[j];
-            j--;
-        }
-        samples[j + 1] = key;
-    }
+    adcZeroPressure = newZero;
     
-    // Calculate trimmed mean: remove TRIM_COUNT highest and lowest
-    float sum = 0;
-    int trimmedCount = validCount - (TRIM_COUNT * 2);
-    for (int i = TRIM_COUNT; i < validCount - TRIM_COUNT; i++) {
-        sum += samples[i];
-    }
-    float newZero = sum / trimmedCount;
-    
-    // Sanity check: zero point should be a reasonable ADC value
-    // Factory default is 964 for 12-bit; valid range roughly 200-1800
-    if (newZero < 200.0 || newZero > 1800.0) {
-        Serial.printf("[CAL] ERROR: Computed zero %.2f out of valid range (200-1800) — using factory default\r\n", newZero);
-        adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
-    } else {
-        float oldZero = adcZeroPressure;
-        // Show what pressure was reading BEFORE calibration (so user sees the offset we corrected)
-        float oldPressure = (newZero - oldZero) / pressureSlope12bit;
-        adcZeroPressure = newZero;
-        Serial.printf("[CAL] Calibration complete!\r\n");
-        Serial.printf("[CAL]   Old zero: %.2f → New zero: %.2f (delta: %+.2f ADC counts)\r\n",
-                      oldZero, newZero, newZero - oldZero);
-        Serial.printf("[CAL]   Pressure was reading %.2f IWC — now calibrated to 0.0 IWC\r\n", oldPressure);
-    }
+    Serial.printf("[CAL] Calibration complete (instant)\r\n");
+    Serial.printf("[CAL]   Old zero: %.2f → New zero: %.2f (delta: %+.2f)\r\n",
+                  oldZero, newZero, newZero - oldZero);
+    Serial.printf("[CAL]   Was reading %.2f IWC — now calibrated to 0.0 IWC\r\n", oldPressure);
     
     // Clear the pressure averaging buffer so old readings don't linger
     pressureSampleCount = 0;
@@ -1648,16 +1618,13 @@ void calibratePressureSensorZeroPoint() {
     // Save to EEPROM so calibration persists across reboots
     savePressureCalibrationToEeprom();
     
-    Serial.printf("[CAL] Active zero point: %.2f — pressure now reads 0.0 IWC at current ambient\r\n", adcZeroPressure);
-    
     // Send calibration result back to Linux via Serial1.
-    // Linux Python program parses "ps_cal" field and saves to its database.
-    // Format: {"type":"data","ps_cal":964.50}
-    // This allows the Python program to keep a copy of the calibration value.
+    // Python modem.py parses "ps_cal" and saves to gm_db as 'adc_zero'.
+    // Regular sensor packets will immediately show pressure ≈ 0.0 IWC.
     char calMsg[64];
     snprintf(calMsg, sizeof(calMsg), "{\"type\":\"data\",\"ps_cal\":%.2f}", adcZeroPressure);
     Serial1.println(calMsg);
-    Serial.printf("[CAL] Sent calibration result to Linux: %s\r\n", calMsg);
+    Serial.printf("[CAL] Sent ps_cal to Linux: %s\r\n", calMsg);
 }
 
 // =====================================================================
