@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.5
+ *  Walter IO Board Firmware - Rev 10.7
  *  Date: 2/9/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -190,6 +190,33 @@
  *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
+ *  Rev 10.7 (2/9/2026) - Pressure Sensor Calibration + Instant Zero Point
+ *  - NEW: Pressure calibration via serial {"type":"cmd","cmd":"cal"} or web portal button
+ *    * Instant non-blocking: uses existing 60-sample rolling average (no delay loop)
+ *    * Shifts adcZeroPressure so current reading becomes 0.0 IWC (works at any altitude)
+ *    * Saved to EEPROM (Preferences key "adcZero") — persists across reboots
+ *    * Loaded from EEPROM at boot before ADC task starts
+ *    * Factory default 964.0 used if no EEPROM value exists
+ *  - NEW: "type":"cmd" message type for serial commands (separate from "type":"data")
+ *    * ESP32 routes on the "cmd" field: "cal" → calibratePressureSensorZeroPoint()
+ *    * Extensible for future commands
+ *  - NEW: ESP32 sends {"type":"data","ps_cal":964.50} back to Linux after calibration
+ *    * Python saves calibration factor to gm_db as 'adc_zero'
+ *  - NEW: Web portal "Calibrate Pressure" button on Maintenance screen
+ *  - NEW: "ADC Zero Point" field on Diagnostics screen and in /api/status JSON
+ *  - NEW: /api/command "calibrate_pressure" endpoint for web portal calibration
+ *
+ *  =====================================================================
+ *  Rev 10.6 (2/9/2026) - ADC Pressure Sign Fix, Current Differential, Normal Command
+ *  - FIXED: Pressure sign convention — removed incorrect negation, vacuum now negative
+ *  - FIXED: Current reading stuck at 0.0A — switched to hardware differential mode
+ *    * readADC_Differential_2_3() at GAIN_TWO (1mV/count) instead of two single-ended reads
+ *    * Recalculated calibration constants: (156, 580) counts → (2.1, 8.0) amps
+ *  - FIXED: Current uses windowed peak detection (not average) matching Python behavior
+ *  - NEW: {"mode":"normal"} serial command clears 72-hour shutdown (GPIO13 HIGH)
+ *    * Eliminates need for ESP32 reboot to exit shutdown state
+ *
+ *  =====================================================================
  *  Rev 10.5 (2/9/2026) - Optimized Serial Update Rates: 5Hz Sensors, Fresh-Only Cellular
  *  - IMPROVED: Fast sensor packet rate increased from 1Hz to 5Hz (200ms interval)
  *    * Pressure, current, overfill, and SD card status now sent 5 times per second
@@ -319,7 +346,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.5"
+#define VERSION "Rev 10.7"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -2221,7 +2248,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.0</title>
+    <title>Walter IO Board - Rev 10.7</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -2305,7 +2332,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.0</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.7</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -5452,7 +5479,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.0                 ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.7                 ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -5632,7 +5659,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.0 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.7 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
