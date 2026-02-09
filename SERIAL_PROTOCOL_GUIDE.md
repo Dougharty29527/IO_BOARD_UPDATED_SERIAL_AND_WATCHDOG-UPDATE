@@ -185,7 +185,7 @@ This is the primary data feed for the ESP32's CBOR encoder and SD card logger.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | string | **Yes** | Must be `"data"`. Any other value is rejected. |
+| `type` | string | **Yes** | `"data"` for status/relay packets, `"cmd"` for command messages (see Section 4). |
 | `gmid` | string | No | Device name/ID (e.g., `"CSX-1234"`). If changed, ESP32 updates EEPROM and WiFi AP name. |
 | `press` | float | No | Pressure from Linux (informational). **ESP32 uses its own ADC for CBOR/SD, not this value.** Included for consistency and debugging. |
 | `mode` | int, `"shutdown"`, or `"normal"` | No | Relay mode number (0-9), `"shutdown"` (GPIO13 LOW), or `"normal"` (GPIO13 HIGH — clears 72-hour alarm). See below. |
@@ -237,6 +237,37 @@ Modes 4-7 are undefined and map to all-off (safe state).
 ```
 
 `"shutdown"` is the **only** way to pull DISP_SHUTDN (GPIO13) LOW. GPIO13 starts HIGH on every ESP32 boot and stays HIGH until the shutdown command is received. When the 72-hour alarm clears, the Linux device sends `"normal"` to restore GPIO13 HIGH without requiring an ESP32 reboot.
+
+---
+
+### 4. Command Messages (`type: "cmd"`)
+
+Command messages use `"type":"cmd"` to distinguish them from data packets. The ESP32 routes on the `"cmd"` field.
+
+#### Pressure Sensor Calibration
+
+**Calibrate pressure sensor zero point:**
+```json
+{"type":"cmd","cmd":"cal"}
+```
+
+This command tells the ESP32 to recalibrate the pressure sensor zero point. The sensor **must be at atmospheric pressure (0.0 IWC)** when this command is issued.
+
+**Calibration process (mirrors Python `pressure_sensor.py` `calibrate()`):**
+1. Collects 60 raw ADC samples from channel 0 (~1 second at 60Hz)
+2. Sorts the samples and removes the 5 highest and 5 lowest outliers
+3. Averages the remaining 50 samples to compute the new zero point
+4. Validates the result is within a sane range (200-1800 ADC counts)
+5. Saves the new zero point to EEPROM (Preferences key: `"adcZero"` in namespace `"RMS"`)
+6. Clears the pressure averaging buffer so readings immediately reflect the new calibration
+
+**Persistence:** The calibration value is saved to EEPROM and loaded automatically on every ESP32 boot. If no calibration has been saved, the factory default (964.0) is used.
+
+**Factory default:** 964.0 (= 15422/16, the ADS1015 12-bit equivalent of the Python `pressure_sensor.py` default 15422.0 for the ADS1115 16-bit).
+
+**Also available from:** Web portal Maintenance screen → "Calibrate Pressure" button, which sends `POST /api/command {"command":"calibrate_pressure"}`.
+
+**Python helper:** `modem.send_calibration_command()` sends `{"type":"cmd","cmd":"cal"}` to the ESP32.
 
 ---
 

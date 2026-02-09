@@ -364,6 +364,9 @@ String getDateTimeString();
 String getJsonValue(const char* json, const char* key);
 void   parsedSerialData();
 void   sendFastSensorPacket();
+void   loadPressureCalibrationFromEeprom();
+void   savePressureCalibrationToEeprom();
+void   calibratePressureSensorZeroPoint();
 
 // =====================================================================
 // ADS1015 ADC CONFIGURATION (Rev 10 - replaces MCP23017 emulation)
@@ -425,8 +428,12 @@ volatile bool adcInitialized = false;   // True once ADS1015 responds successful
 //   - Vacuum (raw < zero): NEGATIVE IWC  (normal operating range)
 //   - Atmospheric (raw = zero): 0.0 IWC
 //   - Above atmospheric (raw > zero): POSITIVE IWC
-float adcZeroPressure = 964.0;        // 15422/16 (factory default zero point, atmospheric)
+// adcZeroPressure: Loaded from EEPROM at boot (loadPressureCalibrationFromEeprom).
+// Calibrated via {"cal":1} serial command (calibratePressureSensorZeroPoint).
+// Factory default: 964.0 (= 15422/16, atmospheric pressure on ADS1015 12-bit).
+float adcZeroPressure = 964.0;        // Overwritten by EEPROM value in setup()
 float pressureSlope12bit = 22.84;     // 365.44/16 — ADC counts (12-bit) per IWC
+const float ADC_ZERO_FACTORY_DEFAULT = 964.0;  // Factory default if EEPROM has no calibration
 
 // Current: Python uses mapit(abs(ch2-ch3), 1248, 4640, 2.1, 8.0) on ADS1115 (16-bit)
 // Those 16-bit single-ended differences correspond to physical voltages:
@@ -1496,6 +1503,146 @@ float addCurrentSample(float sample) {
 }
 
 // =====================================================================
+// PRESSURE SENSOR CALIBRATION (EEPROM-backed zero point)
+// =====================================================================
+// Mirrors Python pressure_sensor.py calibrate() and get_adc_zero().
+// The zero point is the raw ADC reading at atmospheric pressure (0.0 IWC).
+// Stored in EEPROM (Preferences) under key "adcZero" in namespace "RMS".
+// Loaded at boot via loadPressureCalibrationFromEeprom().
+// Triggered via {"cal":1} serial command from Linux or web portal.
+
+/**
+ * Load the pressure sensor zero-point calibration from EEPROM.
+ * Call once in setup() BEFORE starting the ADS1015 reader task.
+ * If no calibration has been saved, uses the factory default (964.0).
+ *
+ * Usage example:
+ *   loadPressureCalibrationFromEeprom();  // Call in setup()
+ */
+void loadPressureCalibrationFromEeprom() {
+    Preferences prefs;
+    prefs.begin("RMS", true);  // Read-only
+    float savedZero = prefs.getFloat("adcZero", -1.0);  // -1 = not set
+    prefs.end();
+    
+    if (savedZero > 0) {
+        adcZeroPressure = savedZero;
+        Serial.printf("[CAL] Loaded pressure zero from EEPROM: %.2f (12-bit ADC counts)\r\n", adcZeroPressure);
+    } else {
+        adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
+        Serial.printf("[CAL] No EEPROM calibration — using factory default: %.2f\r\n", adcZeroPressure);
+    }
+}
+
+/**
+ * Save the current pressure zero-point calibration to EEPROM.
+ * Called after a successful calibration.
+ *
+ * Usage example:
+ *   savePressureCalibrationToEeprom();  // After calibration completes
+ */
+void savePressureCalibrationToEeprom() {
+    Preferences prefs;
+    prefs.begin("RMS", false);  // Read-write
+    prefs.putFloat("adcZero", adcZeroPressure);
+    prefs.end();
+    Serial.printf("[CAL] Saved pressure zero to EEPROM: %.2f\r\n", adcZeroPressure);
+}
+
+/**
+ * Calibrate the pressure sensor zero point.
+ * Assumes the sensor is currently at atmospheric pressure (0.0 IWC).
+ * 
+ * Collects 60 raw ADC samples (~1 second at 60Hz), sorts them, removes
+ * the 5 highest and 5 lowest outliers, and averages the remaining 50
+ * to get a stable zero-point reading. Saves the result to EEPROM.
+ * 
+ * Mirrors Python pressure_sensor.py calibrate():
+ *   - Collect samples, trimmed mean, save to database.
+ * 
+ * If the ADC is not initialized or no valid samples are collected,
+ * falls back to the factory default (964.0) and saves that instead.
+ *
+ * Usage example:
+ *   calibratePressureSensorZeroPoint();  // Triggered by {"cal":1}
+ */
+void calibratePressureSensorZeroPoint() {
+    Serial.println("[CAL] Starting pressure sensor zero-point calibration...");
+    Serial.println("[CAL] Sensor must be at atmospheric pressure (0.0 IWC) during calibration!");
+    
+    if (!adcInitialized) {
+        Serial.println("[CAL] ERROR: ADS1015 not initialized — cannot calibrate");
+        return;
+    }
+    
+    // Collect 60 raw ADC samples from channel 0 (pressure)
+    const int NUM_SAMPLES = 60;
+    const int TRIM_COUNT = 5;  // Remove 5 highest and 5 lowest outliers
+    float samples[NUM_SAMPLES];
+    int validCount = 0;
+    
+    for (int i = 0; i < NUM_SAMPLES; i++) {
+        int16_t raw = ads.readADC_SingleEnded(0);
+        if (raw >= 0) {
+            samples[validCount++] = (float)raw;
+        }
+        delay(17);  // ~60Hz sampling rate
+    }
+    
+    Serial.printf("[CAL] Collected %d/%d valid samples\r\n", validCount, NUM_SAMPLES);
+    
+    if (validCount < (TRIM_COUNT * 2 + 1)) {
+        // Not enough samples for trimming — fall back to factory default
+        Serial.println("[CAL] ERROR: Not enough valid samples — using factory default");
+        adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
+        savePressureCalibrationToEeprom();
+        return;
+    }
+    
+    // Sort samples for trimmed mean calculation
+    // Simple insertion sort (fine for 60 elements)
+    for (int i = 1; i < validCount; i++) {
+        float key = samples[i];
+        int j = i - 1;
+        while (j >= 0 && samples[j] > key) {
+            samples[j + 1] = samples[j];
+            j--;
+        }
+        samples[j + 1] = key;
+    }
+    
+    // Calculate trimmed mean: remove TRIM_COUNT highest and lowest
+    float sum = 0;
+    int trimmedCount = validCount - (TRIM_COUNT * 2);
+    for (int i = TRIM_COUNT; i < validCount - TRIM_COUNT; i++) {
+        sum += samples[i];
+    }
+    float newZero = sum / trimmedCount;
+    
+    // Sanity check: zero point should be a reasonable ADC value
+    // Factory default is 964 for 12-bit; valid range roughly 200-1800
+    if (newZero < 200.0 || newZero > 1800.0) {
+        Serial.printf("[CAL] ERROR: Computed zero %.2f out of valid range (200-1800) — using factory default\r\n", newZero);
+        adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
+    } else {
+        float oldZero = adcZeroPressure;
+        adcZeroPressure = newZero;
+        Serial.printf("[CAL] Calibration complete: %.2f → %.2f (delta: %+.2f ADC counts)\r\n",
+                      oldZero, newZero, newZero - oldZero);
+    }
+    
+    // Clear the pressure averaging buffer so old readings don't linger
+    pressureSampleCount = 0;
+    pressureBufferIdx = 0;
+    for (int i = 0; i < PRESSURE_AVG_SAMPLES; i++) pressureBuffer[i] = 0;
+    
+    // Save to EEPROM so calibration persists across reboots
+    savePressureCalibrationToEeprom();
+    
+    Serial.printf("[CAL] Active zero point: %.2f — pressure will now read 0.0 IWC at current sensor state\r\n", adcZeroPressure);
+}
+
+// =====================================================================
 // ADS1015 ADC + OVERFILL FREERTOS TASK (Core 0)
 // =====================================================================
 // Replaces the MCP23017 emulator task. Runs on Core 0 at 60Hz.
@@ -2241,7 +2388,9 @@ const char* control_html = R"rawliteral(
                 <button class="menu-btn" onclick="nav('diagnostics')">Diagnostics</button>
                 <button class="menu-btn" onclick="nav('clean')">Clean Canister</button>
                 <button class="menu-btn" onclick="showPtModal()">Passthrough</button>
+                <button class="menu-btn" onclick="calibratePressure()" style="background:#00695c;color:#fff">Calibrate Pressure</button>
             </div>
+            <p id="calResult" style="text-align:center;font-size:0.85em;color:#00695c;margin-top:8px"></p>
         </div>
     </div><!-- end scr-maint -->
 
@@ -2427,6 +2576,7 @@ const char* control_html = R"rawliteral(
         <div class="card"><div class="card-title bg-green">ADC Readings</div><div class="card-body">
             <div class="row"><span class="lbl">ADC Pressure (raw)</span><span class="val" id="adcRawP">--</span></div>
             <div class="row"><span class="lbl">ADC Current (raw)</span><span class="val" id="adcRawC">--</span></div>
+            <div class="row"><span class="lbl">ADC Zero Point</span><span class="val" id="adcZeroP">--</span></div>
             <div class="row"><span class="lbl">ADC Initialized</span><span class="val" id="adcInit">--</span></div>
             <div class="row"><span class="lbl">ADC Errors</span><span class="val" id="adcErrors">0</span></div>
         </div></div>
@@ -2506,6 +2656,28 @@ const char* control_html = R"rawliteral(
             x.setRequestHeader('Content-Type','application/json');
             var body=JSON.stringify({command:cmd,value:val||''});
             x.send(body);
+        };
+
+        // ---- CALIBRATE PRESSURE SENSOR ZERO POINT ----
+        // Sends calibrate_pressure command to ESP32. Takes ~1 second (60 samples).
+        // Shows result (new zero point) on the Maintenance screen.
+        window.calibratePressure=function(){
+            if(!confirm('Calibrate pressure sensor?\\nSensor must be at atmospheric pressure (0.0 IWC).\\nThis takes about 1 second.')) return;
+            var el=document.getElementById('calResult');
+            if(el) el.textContent='Calibrating...';
+            var x=new XMLHttpRequest();
+            x.open('POST','http://'+IP+'/api/command',true);
+            x.setRequestHeader('Content-Type','application/json');
+            x.onload=function(){
+                if(x.status===200){
+                    try{
+                        var r=JSON.parse(x.responseText);
+                        if(el) el.textContent='Calibrated! ADC Zero: '+r.adcZero.toFixed(2);
+                    }catch(e){if(el) el.textContent='Calibration complete';}
+                }else{if(el) el.textContent='Calibration failed ('+x.status+')';}
+            };
+            x.onerror=function(){if(el) el.textContent='Calibration request failed';};
+            x.send(JSON.stringify({command:'calibrate_pressure'}));
         };
 
         // ---- PROFILE SELECT + PASSWORD CONFIRM (PW: validated server-side) ----
@@ -2691,6 +2863,7 @@ const char* control_html = R"rawliteral(
                         var ss=$('serialStatus');if(ss){ss.textContent=d.serialActive?'Receiving':'No Data';ss.style.color=d.serialActive?'#2e7d32':'#c62828';}
                         upd('deviceId',d.deviceName);upd('fault',d.fault||'0');
                         upd('adcRawP',d.adcRawPressure||'--');upd('adcRawC',d.adcRawCurrent||'--');
+                        upd('adcZeroP',d.adcZeroPressure||'--');
                         upd('adcInit',d.adcInitialized?'Yes':'No');upd('adcErrors',d.adcErrors||'0');
                         var le=$('lteStatus');if(le)le.innerHTML=d.lteConnected?'<span style=color:#2e7d32>Connected</span>':'<span style=color:#c62828>Disconnected</span>';
                         upd('rsrp',(d.rsrp||'--')+' dBm');upd('rsrq',(d.rsrq||'--')+' dB');
@@ -3228,6 +3401,7 @@ void startConfigAP() {
         // ADC debug
         json += "\"adcRawPressure\":" + String(adcRawPressure) + ",";
         json += "\"adcRawCurrent\":" + String(adcRawCurrent) + ",";
+        json += "\"adcZeroPressure\":" + String(adcZeroPressure, 2) + ",";
         json += "\"adcInitialized\":" + String(adcInitialized ? "true" : "false") + ",";
         json += "\"adcErrors\":" + String(adcTotalErrors) + ",";
         // Alarm states for web display
@@ -3376,6 +3550,21 @@ void startConfigAP() {
             failsafeHighCurrentCount = 0;
             Serial.printf("[WEB] Cleared alarm: %s\r\n", cmd.c_str());
             request->send(200, "application/json", "{\"ok\":true}");
+        }
+        // =========================================================
+        // CALIBRATE PRESSURE — Zero the pressure sensor at current reading.
+        // Triggered from web portal Maintenance screen or serial {"cal":1}.
+        // Body: {"command":"calibrate_pressure"}
+        // Assumes sensor is at atmospheric pressure (0.0 IWC) when issued.
+        // Collects 60 samples, trimmed mean, saves zero point to EEPROM.
+        // =========================================================
+        else if (cmd == "calibrate_pressure") {
+            Serial.println("[WEB CMD] Pressure calibration requested");
+            calibratePressureSensorZeroPoint();
+            char resp[128];
+            snprintf(resp, sizeof(resp),
+                     "{\"ok\":true,\"adcZero\":%.2f}", adcZeroPressure);
+            request->send(200, "application/json", resp);
         }
         else if (cmd == "restart") {
             request->send(200, "application/json", "{\"ok\":true}");
@@ -4183,6 +4372,26 @@ void parsedSerialData() {
     if (msgType.length() == 0) {
         Serial.println("No 'type' field in JSON");
         return;
+    }
+    
+    // ─── COMMAND MESSAGES ─────────────────────────────────────────────────
+    // {"type":"cmd","cmd":"cal"}  — Calibrate pressure sensor zero point.
+    // Separate message type so commands are not confused with data packets.
+    // ─────────────────────────────────────────────────────────────────────
+    if (msgType == "cmd") {
+        String cmdStr = getJsonValue(dataBuffer, "cmd");
+        Serial.printf("[SERIAL CMD] Received command: %s\r\n", cmdStr.c_str());
+        
+        // {"type":"cmd","cmd":"cal"} — Calibrate pressure sensor zero point.
+        // Assumes sensor is at atmospheric pressure (0.0 IWC) when issued.
+        // Collects 60 raw ADC samples, computes trimmed mean, saves to EEPROM.
+        // Mirrors Python pressure_sensor.py calibrate() behavior.
+        if (cmdStr == "cal") {
+            calibratePressureSensorZeroPoint();
+        } else {
+            Serial.println("[SERIAL CMD] Unknown command: " + cmdStr);
+        }
+        return;  // Command handled — don't process as data packet
     }
     
     if (msgType != "data") {
@@ -5226,6 +5435,11 @@ void setup() {
     overfillCheckTimer = 0;
     dispShutdownActive = true;             // DISP_SHUTDN starts HIGH (ON)
     currentRelayMode = 0;                  // Idle mode
+    
+    // =====================================================================
+    // Load pressure sensor calibration from EEPROM (before ADC task starts)
+    // =====================================================================
+    loadPressureCalibrationFromEeprom();
     
     // =====================================================================
     // Create mutex and start ADS1015 reader task on Core 0
