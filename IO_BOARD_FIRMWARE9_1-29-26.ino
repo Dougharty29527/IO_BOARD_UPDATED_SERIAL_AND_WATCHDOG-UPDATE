@@ -1649,6 +1649,15 @@ void calibratePressureSensorZeroPoint() {
     savePressureCalibrationToEeprom();
     
     Serial.printf("[CAL] Active zero point: %.2f — pressure now reads 0.0 IWC at current ambient\r\n", adcZeroPressure);
+    
+    // Send calibration result back to Linux via Serial1.
+    // Linux Python program parses "ps_cal" field and saves to its database.
+    // Format: {"type":"data","ps_cal":964.50}
+    // This allows the Python program to keep a copy of the calibration value.
+    char calMsg[64];
+    snprintf(calMsg, sizeof(calMsg), "{\"type\":\"data\",\"ps_cal\":%.2f}", adcZeroPressure);
+    Serial1.println(calMsg);
+    Serial.printf("[CAL] Sent calibration result to Linux: %s\r\n", calMsg);
 }
 
 // =====================================================================
