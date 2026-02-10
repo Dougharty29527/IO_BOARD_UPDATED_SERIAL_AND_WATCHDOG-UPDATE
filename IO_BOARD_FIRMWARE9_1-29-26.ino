@@ -10,186 +10,9 @@
  *  - Python control.py (Relay cycle logic, profile management, alarm monitoring)
  *  
  *  =====================================================================
- *  REVISION HISTORY
+ *  REVISION HISTORY (newest first)
  *  =====================================================================
  *  
- *  Rev 9.4e (2/6/2026) - CRITICAL: Fix Overfill Polarity Inversion
- *  - FIXED: gpioB_value polarity was inverted vs real MCP23017 behavior
- *    * Real MCP23017: pin HIGH (1) = normal, pin LOW (0) = overfill alarm
- *    * Emulation had it backwards: 0x00 for "safe" which Linux reads as LOW = alarm!
- *    * This caused FALSE OVERFILL ALARMS on every ESP32 reboot/flash
- *    * Also caused real overfill alarms to be INVISIBLE to Linux master
- *  - All gpioB_value assignments now match real MCP23017 pin behavior:
- *    * Boot/lockout safe value: 0x01 (HIGH = normal, no alarm)
- *    * Alarm active: 0x00 (LOW = sensor triggered)
- *    * No alarm: 0x01 (HIGH = pull-up, normal)
- *  - Updated I2C handler lockout return from 0x00 to 0x01
- *  - Affects: global init, mcpEmulatorTask, mcpReadInputsFromPhysicalPins,
- *    handleI2CRead (GPIOA sequential + GPIOB), passthrough boot, setup() pre-init
- *  
- *  Rev 9.4d (2/6/2026) - Cell Tower Info + Scheduled Firmware Checks
- *  - NEW: Cell tower info on web dashboard (MCC/MNC, Cell ID)
- *  - NEW: Cell tower info in serial JSON to modem.py (operator, band, mcc, mnc, cellId)
- *  - Uses WalterModem getCellInformation() for all cellular fields
- *  - Changed firmware/OTA check from frequency-based (every 60s) to schedule-based
- *  - Schedule: 7:00 AM - 1:00 PM EST, every 15 minutes (25 checks/day)
- *  - First boot still runs immediately to sync modem time
- *  - Uses currentTimestamp (UTC) converted to EST for schedule evaluation
- *  - Prevents duplicate checks within same 15-minute slot
- *  - Reduces unnecessary modem traffic outside business hours
- *  - FIXED: RSRP/RSRQ/Operator/Band showing "0"/"Unknown"/"--" on web dashboard
- *    * lteConnect() now stores cell info in globals when first retrieved
- *    * Added refreshCellSignalInfo() called every 60s in main loop
- *    * Renamed buildStatusUpdate() -> refreshCellSignalInfo() for clarity
- *    * Fixed signal bar showing "Excellent" for RSRP=0 (0 means "no data")
- *    * Dashboard shows "--" with gray bar until real signal data arrives
- *  
- *  Rev 9.4b (2/6/2026) - Captive Portal Fix (CRITICAL)
- *  - FIXED: Blank web page caused by AsyncWebServer template processor
- *    * All literal % in HTML/CSS/JS must be escaped as %% when using webProcessor
- *    * Template engine was treating CSS "width:0%" and JS "+'%'" as template vars
- *    * This deleted large chunks of HTML between consecutive % characters
- *  - Rebuilt captive portal for rock-solid detection on all platforms:
- *    * iOS/macOS: /hotspot-detect.html handler
- *    * Android: /generate_204 handler (returns 200 instead of expected 204)
- *    * Windows: /connecttest.txt, /ncsi.txt, /fwlink handlers
- *    * Firefox: /canonical.html handler
- *    * Catch-all: 302 redirect for any unrecognized URL
- *  - Lightweight captive portal landing page with dashboard link
- *  - Switched AJAX from fetch() to XMLHttpRequest for wider captive portal compat
- *  - Uses absolute URLs (http://192.168.4.1/...) in all AJAX calls
- *  - WiFi mode explicitly set to WIFI_AP with stabilization delay
- *  
- *  Rev 9.4a (2/6/2026) - Code Cleanup
- *  - REMOVED: 10 unused global variables (webOverrideActive, lastWebActivity,
- *    WEB_OVERRIDE_TIMEOUT, mode_start_time, previousMillis, statusInterval,
- *    passthroughStartTime, passthroughTimeoutMs, DEFAULT_PASSTHROUGH_TIMEOUT_MS,
- *    profile, global id, imeisv, svn, global lastStatusTime)
- *  - REMOVED: Dead set_relay_mode() function (never called after web relay removal)
- *  - REMOVED: Web override timeout check from MCP emulator loop
- *  - REMOVED: Web override priority check from mcpWriteOutputsToPhysicalPins()
- *  - Relay control exclusively via I2C from Linux master (cleaner code path)
- *  
- *  Rev 9.4 (2/5/2026) - Simplified Diagnostic Dashboard
- *  - REMOVED: Web relay control (mode buttons, individual relay buttons)
- *  - REMOVED: Quality Check Test Mode (password section, ADS1015 ADC)
- *  - KEPT: Web passthrough toggle with confirmation dialog
- *  - REMOVED: Web I2C reset endpoint
- *  - NEW: Read-only Service Diagnostic Dashboard for field contractors
- *  - Dashboard shows: Serial data, Cellular modem status, IO board health
- *  - Displays: RSRP/RSRQ signal quality with visual bar, LTE/BlueCherry status
- *  - Displays: SD card status, I2C transaction counts, overfill sensor, uptime
- *  - Relay control now exclusively via I2C from Linux master (no web conflicts)
- *  - Kept: Device name configuration, watchdog toggle
- *  
- *  Rev 9.3a (2/5/2026) - Critical Safety Fixes
- *  - FIXED: DISP_SHUTDN relay randomly turning off
- *    * gpioA_value now initialized to 0x10 (V6 ON) to match physical state
- *    * I2C handler forces bit 4 ON during 20-second protection period
- *    * set_relay_mode() now preserves V6 state instead of overwriting
- *    * Web /setrelays endpoint always preserves V6 state (can only change via I2C)
- *  - FIXED: False overfill alarms on ESP32 reboot
- *    * Multi-layer protection: variables reset in setup(), task, and passthrough boot
- *    * I2C handler returns 0x00 for GPIOB during 15-second startup lockout
- *    * GPIO38 pull-up configured before I2C slave initialization
- *  - FIXED: Serial output corruption from MCP emulator thread
- *    * Removed all Serial.print calls from Core 0 functions
- *    * Affects: I2C handlers, bus recovery, health check, overfill/DISP protection
- *  
- *  Rev 9.3 (2/5/2026) - Preference-Based Passthrough Boot Mode
- *  - Passthrough now uses preference-based boot strategy for clean modem access
- *  - When "remote XX" command received, stores flag in preferences and restarts
- *  - On boot, checks preference BEFORE loading WalterModem library
- *  - If passthrough requested: runs minimal mode (MCP emulator + serial bridge only)
- *  - No WiFi, web server, or WalterModem during passthrough (matches walter-as-linux-modem.txt)
- *  - Early exit: Linux device can set MCP GPA5 (bit 5) via I2C to trigger restart
- *  - Auto-restarts to normal operation after timeout (default 60 min, max 24 hours)
- *  - Preference is cleared immediately on boot to prevent getting stuck in passthrough
- *  
- *  Rev 9.2f (2/5/2026) - On-Demand Passthrough - SUPERSEDED by 9.3
- *  - Attempted runtime passthrough by reinitializing ModemSerial
- *  - Replaced by preference-based boot for cleaner modem access
- *  
- *  Rev 9.2e (2/4/2026) - Passthrough-Only Boot Mode - SUPERSEDED
- *  - Used preferences flag - replaced by on-demand approach in 9.2f
- *  
- *  Rev 9.2c (2/4/2026) - BlueCherry Remote Commands
- *  - BlueCherry message containing "remote" (case-insensitive) enters passthrough mode
- *  - BlueCherry message containing "restart" (case-insensitive) performs ESP.restart()
- *  - Moved web config HTML back to .ino file (fixes iOS captive portal blank page)
- *  - Compressed HTML/CSS/JS for smaller size
- *  
- *  Rev 9.2b (2/4/2026) - Passthrough Mode Simplification
- *  - WalterModem library configures modem at 115200 (same as host serial)
- *  - Passthrough is now a simple bridge with no baud rate changes
- *  - Simplified enterPassthroughMode() and exitPassthroughMode()
- *  
- *  Rev 9.2a (2/4/2026) - Critical Relay Protection
- *  - Added DISP_SHUTDN startup protection (20 second lockout)
- *  - Relay forced ON during power cycles/firmware flashes
- *  - Prevents accidental site shutdown during startup
- *  - Enhanced overfill validation (15 sec lockout, 8 readings to trigger)
- *  - Both systems log status to Serial Monitor for diagnostics
- *  
- *  Rev 9.2 (2/4/2026) - BlueCherry Message Receiving
- *  - Added support for receiving non-firmware MQTT messages via BlueCherry
- *  - Messages with topic != 0 are printed to Serial Monitor
- *  - Uses blueCherrySync() built-in mechanism (no separate MQTT connection)
- *  - Topic 0 = firmware update, Topic != 0 = custom messages
- *  
- *  Rev 9.1g (1/29/2026) - Passthrough UI Fix for iOS Safari
- *  - Replaced native confirm() dialog with custom HTML modal
- *  - Custom modal works consistently on iOS Safari, Mac Safari, Chrome, etc.
- *  - Added passthroughPending flag to prevent AJAX refresh race condition
- *  - Improved button event handling (preventDefault, stopPropagation)
- *  
- *  Rev 9.1f (1/30/2026) - Dynamic WiFi AP Naming, Serial Status & Passthrough Mode
- *  - WiFi AP name includes random hex suffix on first boot (e.g., "GM IO Board 5c3dfc")
- *  - AP name auto-updates when device ID received from Linux serial
- *  - Manual device name entry via web portal configuration
- *  - Device name persists across reboots in EPROM
- *  - Sends JSON status to Python device every 15 seconds via RS-232 (Serial1)
- *  - JSON format: {"datetime":"YYYY-MM-DD HH:MM:SS","sdcard":"OK|FAULT","passthrough":0|1}
- *  - Passthrough Mode - bridges RS-232 to modem for AT commands/PPP connections
- *  - Web button to enter/exit passthrough mode (NOT persisted - reboot returns to normal)
- *  - I2C emulator and web server continue running in passthrough mode
- *  
- *  Rev 9.1e (1/30/2026) - MCP23017 Compatibility & Debug Improvements
- *  - Added INTCAP register support for Adafruit library compatibility
- *  - Added periodic I2C status logging (every 10 seconds when debug enabled)
- *  - Fixed serial output corruption from multi-core access
- *  
- *  Rev 9.1d (1/30/2026) - BlueCherry Stability Fix
- *  - CRITICAL: Removed modem.reset() on BlueCherry sync failure
- *  - This was causing LTE disconnect -> ESP.restart() loop
- *  - Added fault code 4096 when BlueCherry is offline
- *  - Fault codes: 1024=watchdog, 4096=BlueCherry, 5120=both
- *  - System now stays running during BlueCherry platform outages
- *  - Weekly restart still occurs if BlueCherry never connects
- *  
- *  Rev 9.1c (1/30/2026) - I2C Timeout Fix
- *  - CRITICAL: Reduced mutex timeouts in I2C callbacks from 100ms to 1ms
- *  - I2C slave callbacks must respond in microseconds, not milliseconds
- *  - Prevents OSError [Errno 5] "Input/output error" on Linux master
- *  - Added fallback behavior when mutex unavailable (proceed anyway)
- *  
- *  Rev 9.1b (1/29/2026) - Thread Safety Fix
- *  - Fixed race condition: gpioA_value writes now mutex-protected
- *  - Fixed overfill false alarms: Added INPUT_PULLUP and hysteresis
- *  - Overfill alarm requires 3 consecutive HIGH readings to clear
- *  
- *  Rev 9.1 (1/29/2026) - MCP23017 Enhancements
- *  - Full MCP23017 register support (all 22 registers)
- *  - I2C transaction counting and error tracking
- *  - Non-fatal BlueCherry init (hourly retry, weekly restart)
- *  
- *  Rev 9.0 (1/29/2026) - Initial Release
- *  - AJAX-based web interface (no page refresh flashing)
- *  - Serial watchdog with configurable GPIO pulse
- *  - Thread-safe relay control with mutex protection
- *  - MCP23017 emulation for I2C relay control
- *  
- *  =====================================================================
  *  Rev 10.9 (2/10/2026) - Calibration Safety + ADC Stability + Serial Packet Split
  *  - CHANGED: Cellular status packet now sent every 10 seconds on TIMER
  *    * Previously: only sent when modemDataFresh was true (freshness-gated)
@@ -384,6 +207,190 @@
  *  - SIMPLIFIED: Overfill is direct GPIO38 read (no MCP emulation needed)
  *  - CHANGED: PPP request finishes current purge step before entering passthrough
  *  - ESP32 sends pressure, current, overfill status to Linux via serial JSON
+ *  
+ *  =====================================================================
+ *  Rev 9.4f (2/6/2026) - MCP23017 Emulator Rewrite + RGB LED + Web Enhancements
+ *  - Final Rev 9 release before Rev 10.0 major rewrite
+ *  - MCP23017 emulator rewrite with improved register handling
+ *  - RGB LED (WS2812B on GPIO9): blue breathing idle, red flash passthrough,
+ *    green mode 1, orange mode 2, yellow mode 3
+ *  - Web portal diagnostic dashboard enhancements
+ *  
+ *  Rev 9.4e (2/6/2026) - CRITICAL: Fix Overfill Polarity Inversion
+ *  - FIXED: gpioB_value polarity was inverted vs real MCP23017 behavior
+ *    * Real MCP23017: pin HIGH (1) = normal, pin LOW (0) = overfill alarm
+ *    * Emulation had it backwards: 0x00 for "safe" which Linux reads as LOW = alarm!
+ *    * This caused FALSE OVERFILL ALARMS on every ESP32 reboot/flash
+ *    * Also caused real overfill alarms to be INVISIBLE to Linux master
+ *  - All gpioB_value assignments now match real MCP23017 pin behavior:
+ *    * Boot/lockout safe value: 0x01 (HIGH = normal, no alarm)
+ *    * Alarm active: 0x00 (LOW = sensor triggered)
+ *    * No alarm: 0x01 (HIGH = pull-up, normal)
+ *  - Updated I2C handler lockout return from 0x00 to 0x01
+ *  - Affects: global init, mcpEmulatorTask, mcpReadInputsFromPhysicalPins,
+ *    handleI2CRead (GPIOA sequential + GPIOB), passthrough boot, setup() pre-init
+ *  
+ *  Rev 9.4d (2/6/2026) - Cell Tower Info + Scheduled Firmware Checks
+ *  - NEW: Cell tower info on web dashboard (MCC/MNC, Cell ID)
+ *  - NEW: Cell tower info in serial JSON to modem.py (operator, band, mcc, mnc, cellId)
+ *  - Uses WalterModem getCellInformation() for all cellular fields
+ *  - Changed firmware/OTA check from frequency-based (every 60s) to schedule-based
+ *  - Schedule: 7:00 AM - 1:00 PM EST, every 15 minutes (25 checks/day)
+ *  - First boot still runs immediately to sync modem time
+ *  - Uses currentTimestamp (UTC) converted to EST for schedule evaluation
+ *  - Prevents duplicate checks within same 15-minute slot
+ *  - Reduces unnecessary modem traffic outside business hours
+ *  - FIXED: RSRP/RSRQ/Operator/Band showing "0"/"Unknown"/"--" on web dashboard
+ *    * lteConnect() now stores cell info in globals when first retrieved
+ *    * Added refreshCellSignalInfo() called every 60s in main loop
+ *    * Renamed buildStatusUpdate() -> refreshCellSignalInfo() for clarity
+ *    * Fixed signal bar showing "Excellent" for RSRP=0 (0 means "no data")
+ *    * Dashboard shows "--" with gray bar until real signal data arrives
+ *  
+ *  Rev 9.4b (2/6/2026) - Captive Portal Fix (CRITICAL)
+ *  - FIXED: Blank web page caused by AsyncWebServer template processor
+ *    * All literal % in HTML/CSS/JS must be escaped as %% when using webProcessor
+ *    * Template engine was treating CSS "width:0%" and JS "+'%'" as template vars
+ *    * This deleted large chunks of HTML between consecutive % characters
+ *  - Rebuilt captive portal for rock-solid detection on all platforms:
+ *    * iOS/macOS: /hotspot-detect.html handler
+ *    * Android: /generate_204 handler (returns 200 instead of expected 204)
+ *    * Windows: /connecttest.txt, /ncsi.txt, /fwlink handlers
+ *    * Firefox: /canonical.html handler
+ *    * Catch-all: 302 redirect for any unrecognized URL
+ *  - Lightweight captive portal landing page with dashboard link
+ *  - Switched AJAX from fetch() to XMLHttpRequest for wider captive portal compat
+ *  - Uses absolute URLs (http://192.168.4.1/...) in all AJAX calls
+ *  - WiFi mode explicitly set to WIFI_AP with stabilization delay
+ *  
+ *  Rev 9.4a (2/6/2026) - Code Cleanup
+ *  - REMOVED: 10 unused global variables (webOverrideActive, lastWebActivity,
+ *    WEB_OVERRIDE_TIMEOUT, mode_start_time, previousMillis, statusInterval,
+ *    passthroughStartTime, passthroughTimeoutMs, DEFAULT_PASSTHROUGH_TIMEOUT_MS,
+ *    profile, global id, imeisv, svn, global lastStatusTime)
+ *  - REMOVED: Dead set_relay_mode() function (never called after web relay removal)
+ *  - REMOVED: Web override timeout check from MCP emulator loop
+ *  - REMOVED: Web override priority check from mcpWriteOutputsToPhysicalPins()
+ *  - Relay control exclusively via I2C from Linux master (cleaner code path)
+ *  
+ *  Rev 9.4 (2/5/2026) - Simplified Diagnostic Dashboard
+ *  - REMOVED: Web relay control (mode buttons, individual relay buttons)
+ *  - REMOVED: Quality Check Test Mode (password section, ADS1015 ADC)
+ *  - KEPT: Web passthrough toggle with confirmation dialog
+ *  - REMOVED: Web I2C reset endpoint
+ *  - NEW: Read-only Service Diagnostic Dashboard for field contractors
+ *  - Dashboard shows: Serial data, Cellular modem status, IO board health
+ *  - Displays: RSRP/RSRQ signal quality with visual bar, LTE/BlueCherry status
+ *  - Displays: SD card status, I2C transaction counts, overfill sensor, uptime
+ *  - Relay control now exclusively via I2C from Linux master (no web conflicts)
+ *  - Kept: Device name configuration, watchdog toggle
+ *  
+ *  Rev 9.3a (2/5/2026) - Critical Safety Fixes
+ *  - FIXED: DISP_SHUTDN relay randomly turning off
+ *    * gpioA_value now initialized to 0x10 (V6 ON) to match physical state
+ *    * I2C handler forces bit 4 ON during 20-second protection period
+ *    * set_relay_mode() now preserves V6 state instead of overwriting
+ *    * Web /setrelays endpoint always preserves V6 state (can only change via I2C)
+ *  - FIXED: False overfill alarms on ESP32 reboot
+ *    * Multi-layer protection: variables reset in setup(), task, and passthrough boot
+ *    * I2C handler returns 0x00 for GPIOB during 15-second startup lockout
+ *    * GPIO38 pull-up configured before I2C slave initialization
+ *  - FIXED: Serial output corruption from MCP emulator thread
+ *    * Removed all Serial.print calls from Core 0 functions
+ *    * Affects: I2C handlers, bus recovery, health check, overfill/DISP protection
+ *  
+ *  Rev 9.3 (2/5/2026) - Preference-Based Passthrough Boot Mode
+ *  - Passthrough now uses preference-based boot strategy for clean modem access
+ *  - When "remote XX" command received, stores flag in preferences and restarts
+ *  - On boot, checks preference BEFORE loading WalterModem library
+ *  - If passthrough requested: runs minimal mode (MCP emulator + serial bridge only)
+ *  - No WiFi, web server, or WalterModem during passthrough (matches walter-as-linux-modem.txt)
+ *  - Early exit: Linux device can set MCP GPA5 (bit 5) via I2C to trigger restart
+ *  - Auto-restarts to normal operation after timeout (default 60 min, max 24 hours)
+ *  - Preference is cleared immediately on boot to prevent getting stuck in passthrough
+ *  
+ *  Rev 9.2f (2/5/2026) - On-Demand Passthrough - SUPERSEDED by 9.3
+ *  - Attempted runtime passthrough by reinitializing ModemSerial
+ *  - Replaced by preference-based boot for cleaner modem access
+ *  
+ *  Rev 9.2e (2/4/2026) - Passthrough-Only Boot Mode - SUPERSEDED
+ *  - Used preferences flag - replaced by on-demand approach in 9.2f
+ *  
+ *  Rev 9.2c (2/4/2026) - BlueCherry Remote Commands
+ *  - BlueCherry message containing "remote" (case-insensitive) enters passthrough mode
+ *  - BlueCherry message containing "restart" (case-insensitive) performs ESP.restart()
+ *  - Moved web config HTML back to .ino file (fixes iOS captive portal blank page)
+ *  - Compressed HTML/CSS/JS for smaller size
+ *  
+ *  Rev 9.2b (2/4/2026) - Passthrough Mode Simplification
+ *  - WalterModem library configures modem at 115200 (same as host serial)
+ *  - Passthrough is now a simple bridge with no baud rate changes
+ *  - Simplified enterPassthroughMode() and exitPassthroughMode()
+ *  
+ *  Rev 9.2a (2/4/2026) - Critical Relay Protection
+ *  - Added DISP_SHUTDN startup protection (20 second lockout)
+ *  - Relay forced ON during power cycles/firmware flashes
+ *  - Prevents accidental site shutdown during startup
+ *  - Enhanced overfill validation (15 sec lockout, 8 readings to trigger)
+ *  - Both systems log status to Serial Monitor for diagnostics
+ *  
+ *  Rev 9.2 (2/4/2026) - BlueCherry Message Receiving
+ *  - Added support for receiving non-firmware MQTT messages via BlueCherry
+ *  - Messages with topic != 0 are printed to Serial Monitor
+ *  - Uses blueCherrySync() built-in mechanism (no separate MQTT connection)
+ *  - Topic 0 = firmware update, Topic != 0 = custom messages
+ *  
+ *  Rev 9.1g (1/29/2026) - Passthrough UI Fix for iOS Safari
+ *  - Replaced native confirm() dialog with custom HTML modal
+ *  - Custom modal works consistently on iOS Safari, Mac Safari, Chrome, etc.
+ *  - Added passthroughPending flag to prevent AJAX refresh race condition
+ *  - Improved button event handling (preventDefault, stopPropagation)
+ *  
+ *  Rev 9.1f (1/30/2026) - Dynamic WiFi AP Naming, Serial Status & Passthrough Mode
+ *  - WiFi AP name includes random hex suffix on first boot (e.g., "GM IO Board 5c3dfc")
+ *  - AP name auto-updates when device ID received from Linux serial
+ *  - Manual device name entry via web portal configuration
+ *  - Device name persists across reboots in EPROM
+ *  - Sends JSON status to Python device every 15 seconds via RS-232 (Serial1)
+ *  - JSON format: {"datetime":"YYYY-MM-DD HH:MM:SS","sdcard":"OK|FAULT","passthrough":0|1}
+ *  - Passthrough Mode - bridges RS-232 to modem for AT commands/PPP connections
+ *  - Web button to enter/exit passthrough mode (NOT persisted - reboot returns to normal)
+ *  - I2C emulator and web server continue running in passthrough mode
+ *  
+ *  Rev 9.1e (1/30/2026) - MCP23017 Compatibility & Debug Improvements
+ *  - Added INTCAP register support for Adafruit library compatibility
+ *  - Added periodic I2C status logging (every 10 seconds when debug enabled)
+ *  - Fixed serial output corruption from multi-core access
+ *  
+ *  Rev 9.1d (1/30/2026) - BlueCherry Stability Fix
+ *  - CRITICAL: Removed modem.reset() on BlueCherry sync failure
+ *  - This was causing LTE disconnect -> ESP.restart() loop
+ *  - Added fault code 4096 when BlueCherry is offline
+ *  - Fault codes: 1024=watchdog, 4096=BlueCherry, 5120=both
+ *  - System now stays running during BlueCherry platform outages
+ *  - Weekly restart still occurs if BlueCherry never connects
+ *  
+ *  Rev 9.1c (1/30/2026) - I2C Timeout Fix
+ *  - CRITICAL: Reduced mutex timeouts in I2C callbacks from 100ms to 1ms
+ *  - I2C slave callbacks must respond in microseconds, not milliseconds
+ *  - Prevents OSError [Errno 5] "Input/output error" on Linux master
+ *  - Added fallback behavior when mutex unavailable (proceed anyway)
+ *  
+ *  Rev 9.1b (1/29/2026) - Thread Safety Fix
+ *  - Fixed race condition: gpioA_value writes now mutex-protected
+ *  - Fixed overfill false alarms: Added INPUT_PULLUP and hysteresis
+ *  - Overfill alarm requires 3 consecutive HIGH readings to clear
+ *  
+ *  Rev 9.1 (1/29/2026) - MCP23017 Enhancements
+ *  - Full MCP23017 register support (all 22 registers)
+ *  - I2C transaction counting and error tracking
+ *  - Non-fatal BlueCherry init (hourly retry, weekly restart)
+ *  
+ *  Rev 9.0 (1/29/2026) - Initial Release
+ *  - AJAX-based web interface (no page refresh flashing)
+ *  - Serial watchdog with configurable GPIO pulse
+ *  - Thread-safe relay control with mutex protection
+ *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
  *  FEATURES
