@@ -1,7 +1,7 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.7
- *  Date: 2/9/2026
+ *  Walter IO Board Firmware - Rev 10.8
+ *  Date: 2/10/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -190,6 +190,24 @@
  *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
+ *  Rev 10.8 (2/10/2026) - Mode Confirmation: 15-Second Relay Refresh + Extended Sensor Packet
+ *  - NEW: Periodic relay state refresh every 15 seconds in main loop()
+ *    * Re-applies currentRelayMode to physical GPIO pins via setRelaysForMode()
+ *    * Guards against relay driver glitch, failed GPIO write, or pin drift
+ *    * Only runs during normal serial-controlled mode (skipped in failsafe)
+ *    * Compensates for missed mode commands: worst-case 15-second recovery
+ *    * Uses lastRelayRefreshTime timer + RELAY_REFRESH_INTERVAL constant
+ *  - IMPROVED: sendFastSensorPacket() now includes failsafe and shutdown state
+ *    * Added "failsafe":0/1 and "shutdown":0/1 fields to 5Hz JSON packet
+ *    * Linux program can see system state without needing a new message type
+ *    * Python ignores unrecognized JSON fields — zero Python changes required
+ *  - ARCHITECTURE: Mode delivery redundancy (no Python changes needed):
+ *    * Immediate: send_mode_immediate() on mode change (~1ms)
+ *    * Periodic: Linux 15-second payload always includes mode field
+ *    * Refresh: ESP32 re-applies stored mode to relay pins every 15 seconds
+ *    * Failsafe: After 2 watchdog restarts, ESP32 takes autonomous control
+ *
+ *  =====================================================================
  *  Rev 10.7 (2/9/2026) - Pressure Sensor Calibration + Instant Zero Point
  *  - NEW: Pressure calibration via serial {"type":"cmd","cmd":"cal"} or web portal button
  *    * Instant non-blocking: uses existing 60-sample rolling average (no delay loop)
@@ -233,9 +251,10 @@
  *  - REMOVED: STATUS_SEND_INTERVAL (15-second timer) and lastStatusSendTime
  *    * Full status is now event-driven (fresh modem data), not time-driven
  *  - ARCHITECTURE: Two distinct serial packet types to Linux:
- *    * Fast (5Hz): {"pressure":X,"current":X,"overfill":X,"sdcard":"OK","relayMode":X}
+ *    * Fast (5Hz): {"pressure":X,"current":X,"overfill":X,"sdcard":"OK","relayMode":X,"failsafe":0,"shutdown":0}
  *    * Fresh cellular: {"datetime":"...","lte":X,"rsrp":"...","rsrq":"...", ... }
  *    * Python modem.py parser handles both — same JSON field extraction logic
+ *    * Rev 10.8: Fast packet extended with failsafe + shutdown state fields
  *  
  *  =====================================================================
  *  Rev 10.4 (2/9/2026) - Web Portal Test/Cycle Fix + Full Button Audit
@@ -346,7 +365,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.7"
+#define VERSION "Rev 10.8"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -759,6 +778,17 @@ unsigned long lastSensorSendTime = 0;
 const unsigned long SENSOR_SEND_INTERVAL = 200;    // 200ms = 5Hz - fast sensor updates (pressure, current, overfill, sdcard)
 // NOTE: lastStatusSendTime and STATUS_SEND_INTERVAL removed in Rev 10.5
 // Full status is now triggered by modemDataFresh/modemTimeFresh flags, not a timer
+
+// REV 10.8: Periodic relay state refresh timer
+// Re-applies currentRelayMode to physical GPIO pins every 15 seconds.
+// Guards against: relay driver glitch, failed GPIO write, pin drift, or missed mode command.
+// The Linux 15-second payload also includes mode, so this refresh runs at the same cadence.
+// Skipped when in failsafe mode (failsafe manages its own relays autonomously).
+//
+// Usage: Checked in loop(). If 15 seconds elapsed and not in failsafe, calls
+//        setRelaysForMode(currentRelayMode) to re-assert the stored mode to pins.
+unsigned long lastRelayRefreshTime = 0;
+const unsigned long RELAY_REFRESH_INTERVAL = 15000; // 15 seconds — matches Linux payload cadence
 
 // Passthrough mode - allows IO Board to act as a serial bridge to the modem
 // When enabled, Serial1 (RS-232) data is forwarded directly to/from the modem
@@ -2248,7 +2278,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.7</title>
+    <title>Walter IO Board - Rev 10.8</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -2332,7 +2362,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.7</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.8</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -3943,30 +3973,50 @@ void sendStatusToSerial() {
  *   sendFastSensorPacket();  // Called 5x/second from checkAndSendStatusToSerial()
  */
 void sendFastSensorPacket() {
-    // Lightweight JSON — real-time sensor data + SD status, no modem/cell queries
+    // Lightweight JSON — real-time sensor data + SD status + system state, no modem/cell queries
     // SD card check (SD.cardType()) is fast — just reads cached card type, no I/O
-    char buf[128];
+    //
+    // REV 10.8: Added "failsafe" and "shutdown" fields so Linux can see system state
+    // without needing a new message type. Python ignores unrecognized JSON fields,
+    // so this is fully backward-compatible — zero Python parsing changes required.
+    //
+    // Packet format (sent at 5Hz on Serial1 to Linux):
+    //   {"pressure":-1.23,"current":5.67,"overfill":0,"sdcard":"OK","relayMode":1,"failsafe":0,"shutdown":0}
+    //
+    // Fields:
+    //   pressure  - ESP32 ADC pressure in IWC (60Hz rolling average)
+    //   current   - ESP32 ADC motor current in amps (differential, peak-detect)
+    //   overfill  - 0=normal, 1=overfill alarm active (GPIO38 LOW)
+    //   sdcard    - "OK" or "FAULT"
+    //   relayMode - Current relay mode applied to GPIO pins (0-9)
+    //   failsafe  - 0=normal serial-controlled, 1=ESP32 autonomous (Comfile down)
+    //   shutdown  - 0=DISP_SHUTDN HIGH (normal), 1=DISP_SHUTDN LOW (72-hour shutdown)
+    char buf[160];
     snprintf(buf, sizeof(buf),
-             "{\"pressure\":%.2f,\"current\":%.2f,\"overfill\":%d,\"sdcard\":\"%s\",\"relayMode\":%d}",
+             "{\"pressure\":%.2f,\"current\":%.2f,\"overfill\":%d,\"sdcard\":\"%s\","
+             "\"relayMode\":%d,\"failsafe\":%d,\"shutdown\":%d}",
              adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
-             isSDCardOK() ? "OK" : "FAULT", currentRelayMode);
+             isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
+             failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1);
     Serial1.println(buf);
     
     // Debug log to USB Serial Monitor — shows timestamp (ms) so you can verify 5Hz rate
     // Expect ~200ms between each line. Look for consistent spacing in the millis() values.
-    Serial.printf("[FAST-TX @%lums] P=%.2f C=%.2f OV=%d SD=%s M=%d\r\n",
+    Serial.printf("[FAST-TX @%lums] P=%.2f C=%.2f OV=%d SD=%s M=%d FS=%d SD=%d\r\n",
                   millis(), adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
-                  isSDCardOK() ? "OK" : "FAULT", currentRelayMode);
+                  isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
+                  failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1);
 }
 
 /**
  * Check if it's time to send status/sensor data to Python and send if due.
  * Called from main loop - handles timing internally.
  * 
- * REV 10.5: Two send mechanisms:
- *   - Every 200ms (5Hz): Fast sensor packet (pressure, current, overfill, sdcard, mode)
+ * REV 10.5/10.8: Two send mechanisms:
+ *   - Every 200ms (5Hz): Fast sensor packet (pressure, current, overfill, sdcard, mode, failsafe, shutdown)
  *     Always sent on schedule — these values change rapidly and the Linux controller
  *     needs them in real-time for operating decisions.
+ *     REV 10.8: Added failsafe and shutdown fields for system state visibility.
  *   - On fresh data ONLY: Cellular status (datetime, LTE, rsrp, rsrq, operator, etc.)
  *     Only sent when refreshCellSignalInfo() or initModemTime() retrieves NEW data
  *     from the modem library. This prevents repeating stale datetime and signal values.
@@ -5479,7 +5529,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.7                 ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.8                 ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -5659,7 +5709,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.7 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.8 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
@@ -5823,6 +5873,27 @@ void loop() {
     // Fast sensors (pressure, current, overfill, sdcard) at 5Hz (every 200ms)
     // Cellular status (datetime, lte, rsrp, rsrq) only when fresh from modem
     checkAndSendStatusToSerial();
+    
+    // =====================================================================
+    // REV 10.8: PERIODIC RELAY STATE REFRESH (every 15 seconds)
+    // Re-applies currentRelayMode to physical GPIO pins to compensate for:
+    //   - Missed mode commands (serial packet lost)
+    //   - Relay driver glitch or failed GPIO write
+    //   - Drift between currentRelayMode variable and actual pin states
+    // Skipped during failsafe mode (failsafe manages its own relay cycle).
+    // Also skipped during passthrough (relays should be idle).
+    //
+    // The Linux 15-second payload also re-sends the mode field, so even if
+    // this refresh re-applies an old mode, the next Linux packet will correct
+    // it. Worst-case recovery from a missed mode command: 15 seconds.
+    // =====================================================================
+    if (!failsafeMode && !passthroughMode &&
+        (currentTime - lastRelayRefreshTime >= RELAY_REFRESH_INTERVAL)) {
+        setRelaysForMode(currentRelayMode);
+        Serial.printf("[RELAY-REFRESH] Re-applied mode %d to relay pins (every %lus)\r\n",
+                      currentRelayMode, RELAY_REFRESH_INTERVAL / 1000);
+        lastRelayRefreshTime = currentTime;
+    }
     
     // =====================================================================
     // FAILSAFE MODE CHECK (Rev 10)

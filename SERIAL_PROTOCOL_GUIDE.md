@@ -1,7 +1,7 @@
 # ESP32 IO Board Serial Protocol Guide
 
-**Firmware:** IO_BOARD_FIRMWARE9 Rev 10.5  
-**Date:** February 9, 2026  
+**Firmware:** IO_BOARD_FIRMWARE9 Rev 10.8  
+**Date:** February 10, 2026  
 **Audience:** Anyone writing software that talks to this ESP32 over serial
 
 ---
@@ -74,7 +74,7 @@ Linux Device                    ESP32 IO Board
 This is the critical real-time data path. The Linux device uses these values for all operational decisions.
 
 ```json
-{"pressure":-14.22,"current":0.07,"overfill":0,"sdcard":"OK","relayMode":1}
+{"pressure":-14.22,"current":0.07,"overfill":0,"sdcard":"OK","relayMode":1,"failsafe":0,"shutdown":0}
 ```
 
 | Field | Type | Range | Description |
@@ -84,6 +84,8 @@ This is the critical real-time data path. The Linux device uses these values for
 | `overfill` | int | 0 or 1 | Overfill alarm state. 0 = normal, 1 = alarm active. Read from GPIO38 with 8-of-5 hysteresis (must read LOW 8 out of last 5 checks to trigger). Has internal pull-up. |
 | `sdcard` | string | `"OK"` or `"FAULT"` | SD card status. Reads cached card type, no disk I/O. |
 | `relayMode` | int | 0-9 | Current relay mode the ESP32 has applied. Useful for confirming the relay state matches what Linux requested. |
+| `failsafe` | int | 0 or 1 | **Rev 10.8.** 0 = normal serial-controlled operation, 1 = ESP32 in autonomous failsafe mode (Comfile panel unresponsive). |
+| `shutdown` | int | 0 or 1 | **Rev 10.8.** 0 = DISP_SHUTDN HIGH (site normal), 1 = DISP_SHUTDN LOW (72-hour shutdown active). |
 
 **Why 5Hz:** The Linux controller makes real-time decisions based on pressure (start/stop cycles, detect alarms). 200ms updates give the controller sub-second response to pressure changes. The ADC itself samples at 60Hz internally; the 5Hz serial rate is a practical balance between freshness and serial bandwidth.
 
@@ -386,14 +388,54 @@ This prevents a race condition where the Linux device's periodic 15-second paylo
 
 ---
 
+## Mode Delivery Redundancy (Rev 10.8)
+
+The relay mode has **three layers of delivery** to compensate for missed serial commands. No Python changes are required — the existing Linux 15-second payload already provides the retry mechanism.
+
+### Layer 1: Immediate Mode Command (Linux → ESP32)
+
+When the Linux device changes mode, it sends `{"type":"data","mode":N}` immediately. Latency: ~100-200ms. This is the primary relay control path.
+
+### Layer 2: 15-Second Payload Re-send (Linux → ESP32)
+
+The Linux device's `create_payload()` always includes the current `mode` field in every 15-second status packet. The ESP32 applies the mode **every time** it receives a data packet (not just on change). If an immediate mode command is lost, the next 15-second payload corrects it.
+
+### Layer 3: ESP32 Relay State Refresh (ESP32 internal)
+
+Every 15 seconds, the ESP32 calls `setRelaysForMode(currentRelayMode)` to re-assert the stored mode to physical GPIO pins. This guards against:
+
+- A relay driver glitch that silently dropped a pin
+- A GPIO write that failed during the original mode application
+- Any drift between the `currentRelayMode` variable and actual pin states
+
+This refresh is **skipped** during failsafe mode (failsafe manages its own relay cycle) and during passthrough mode (relays should be idle).
+
+### Worst-Case Recovery
+
+If an immediate mode command is lost, the next 15-second Linux payload corrects the mode. If that payload is also lost, the one after that (30 seconds max). Meanwhile, the relay refresh ensures the ESP32 keeps driving the correct GPIO states for whatever mode it last received.
+
+```
+  Time ─────────────────────────────────────────────────►
+  
+  Linux:    MODE 1 ──────────── payload(mode=1) ──── payload(mode=1) ───
+                │                     │                     │
+  ESP32:        ▼ setRelaysForMode(1) ▼ setRelaysForMode(1) ▼ setRelaysForMode(1)
+                                      ▲                     ▲
+  Refresh:                 refresh(1) ┘          refresh(1) ┘
+                           (every 15s)           (every 15s)
+```
+
+---
+
 ## Timing Summary
 
 | Event | Interval | Direction | Purpose |
 |-------|----------|-----------|---------|
-| Fast sensor packet | 200ms (5Hz) | ESP32 → Linux | Real-time pressure, current, overfill, SD status |
+| Fast sensor packet | 200ms (5Hz) | ESP32 → Linux | Real-time pressure, current, overfill, SD status, failsafe, shutdown |
 | Cellular status | ~60s (event-driven) | ESP32 → Linux | Modem data, only when fresh |
-| Periodic data payload | 15s | Linux → ESP32 | CBOR/SD logging data (gmid, fault, cycles) |
+| Periodic data payload | 15s | Linux → ESP32 | CBOR/SD logging data (gmid, fault, cycles) + mode re-send |
 | Immediate mode command | On change | Linux → ESP32 | Relay control (<200ms response) |
+| **Relay state refresh** | **15s** | **ESP32 internal** | **Re-applies currentRelayMode to GPIO pins (Rev 10.8)** |
 | Mode polling (internal) | 100ms | Linux internal | ModeManager mmap check for child process mode changes |
 | ESP32 serial check | 100ms | ESP32 internal | How often ESP32 checks Serial1 for incoming data |
 | Serial watchdog timeout | 30 min | ESP32 internal | Triggers power-cycle pulse on GPIO39 |

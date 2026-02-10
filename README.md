@@ -1,7 +1,7 @@
 # Walter IO Board Firmware
 
-**Version:** Rev 10.7  
-**Date:** February 9, 2026  
+**Version:** Rev 10.8  
+**Date:** February 10, 2026  
 **Authors:** Todd Adams & Doug Harty
 
 ESP32-based IO board firmware for the Walter cellular modem platform. Provides relay control, sensor monitoring, web configuration portal, CBOR cellular data transmission, and PPP passthrough for remote access.
@@ -30,7 +30,7 @@ ESP32-based IO board firmware for the Walter cellular modem platform. Provides r
 The Walter IO Board connects a Linux controller (Raspberry Pi) to a Walter cellular modem. The system has a clear division of responsibility:
 
 - **Linux (Python)** = The brain. Makes all operating decisions — when to start cycles, when to stop, alarm detection, scheduling, profile management.
-- **ESP32** = The body. Reads sensors, controls relays, sends data to the cloud, and reports status to Linux every 1 second.
+- **ESP32** = The body. Reads sensors, controls relays, sends data to the cloud, and reports status to Linux at 5Hz (every 200ms).
 
 The ESP32 only takes autonomous control in **failsafe mode** — when the Linux device has been unresponsive for an extended period.
 
@@ -39,7 +39,7 @@ The ESP32 only takes autonomous control in **failsafe mode** — when the Linux 
 │   Linux Device   │ ◄──────────────────────────► │   ESP32 IO Board │
 │  (Raspberry Pi)  │                               │                  │
 │                  │  ← Pressure, Current, Overfill │  ADS1015 ADC     │
-│  Python Control  │     (every 1 second)          │  (60Hz sampling) │
+│  Python Control  │     (5Hz / every 200ms)       │  (60Hz sampling) │
 │  Panel (Kivy)    │                               │                  │
 │                  │  Mode commands, cycle counts → │  5 Relay Outputs │
 │  io_manager.py   │     (every 15 seconds)        │  (Motor, Valves) │
@@ -56,7 +56,7 @@ The ESP32 only takes autonomous control in **failsafe mode** — when the Linux 
 
 | Direction | Frequency | Purpose | Data |
 |-----------|-----------|---------|------|
-| ESP32 → Linux | **5Hz** (every 200ms) | **CRITICAL** — Real-time sensor data for controller decisions | Pressure (IWC), Current (A), Overfill, SD card, Relay Mode |
+| ESP32 → Linux | **5Hz** (every 200ms) | **CRITICAL** — Real-time sensor data for controller decisions | Pressure (IWC), Current (A), Overfill, SD card, Relay Mode, Failsafe, Shutdown |
 | ESP32 → Linux | Fresh data only (~60s) | Supplementary status (only when modem returns new data) | Datetime, LTE, cell signal, profile, failsafe |
 | Linux → ESP32 | Every 15 seconds | CBOR payload data for cellular transmission | Device ID, pressure, current, mode, faults, cycles |
 | ESP32 → Linux | On demand | Web portal commands forwarded to Python | start_cycle, stop_cycle, start_test, set_profile |
@@ -139,10 +139,10 @@ The rolling averages smooth out electrical noise while still reflecting real sen
 ### Fast Sensor Packet (ESP32 → Linux, 5 times per second)
 
 ```json
-{"pressure":-14.22,"current":0.07,"overfill":0,"sdcard":"OK","relayMode":1}
+{"pressure":-14.22,"current":0.07,"overfill":0,"sdcard":"OK","relayMode":1,"failsafe":0,"shutdown":0}
 ```
 
-Sent at 5Hz (every 200ms). This is the **critical** data path. The Linux controller uses these values to make real-time decisions about cycle starts, stops, alarms, and safety shutdowns.
+Sent at 5Hz (every 200ms). This is the **critical** data path. The Linux controller uses these values to make real-time decisions about cycle starts, stops, alarms, and safety shutdowns. Rev 10.8 added `failsafe` and `shutdown` fields for system state visibility.
 
 ### Cellular Status Packet (ESP32 → Linux, only when fresh from modem)
 
@@ -275,6 +275,7 @@ The overfill sensor (GPIO38, active LOW with internal pull-up) uses multi-layer 
 | 1024 | Serial watchdog triggered (no Linux data for 30+ minutes) |
 | 4096 | BlueCherry platform offline |
 | 5120 | Both watchdog AND BlueCherry faults |
+| 8192 | Failsafe mode active (ESP32 running autonomously — Comfile panel down) |
 
 These codes are **added** to any existing fault codes from the Linux device.
 
@@ -284,7 +285,8 @@ These codes are **added** to any existing fault codes from the Linux device.
 
 | Version | Date | Description |
 |---------|------|-------------|
-| **Rev 10.7** | **2/9/2026** | **Pressure sensor calibration via serial or web portal. Instant non-blocking zero point adjustment using existing 60-sample rolling average. EEPROM persistence. ESP32 sends ps_cal result to Linux for database save. New "type":"cmd" message type.** |
+| **Rev 10.8** | **2/10/2026** | **Mode confirmation: 15-second relay state refresh re-applies currentRelayMode to GPIO pins. Fast sensor packet extended with failsafe and shutdown fields. Three-layer mode delivery redundancy (immediate + 15s payload + relay refresh). Zero Python changes required.** |
+| Rev 10.7 | 2/9/2026 | Pressure sensor calibration via serial or web portal. Instant non-blocking zero point adjustment using existing 60-sample rolling average. EEPROM persistence. ESP32 sends ps_cal result to Linux for database save. New "type":"cmd" message type. |
 | Rev 10.6 | 2/9/2026 | Fixed pressure sign (vacuum now negative). Fixed current stuck at 0A (hardware differential mode). Added `{"mode":"normal"}` to clear 72-hour shutdown without reboot. |
 | Rev 10.5 | 2/9/2026 | Sensor data now sent at 5Hz (was 1Hz). Cellular/datetime sent only on fresh modem data (was every 15s). |
 | Rev 10.4 | 2/9/2026 | Fixed web portal tests/cycles not starting (Python screen guard bypass). Full button audit. |
