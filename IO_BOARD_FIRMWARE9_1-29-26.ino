@@ -1617,28 +1617,19 @@ float mapFloat(float x, float in_min, float in_max, float out_min, float out_max
  * Usage: Called from ADS1015 task at 60Hz.
  */
 float addPressureSample(float sample) {
-    // REV 10.9: Outlier rejection — discard samples that deviate too far from
-    // the current rolling average. Gas pressure changes slowly (physically cannot
-    // jump >2 IWC in 16ms), so large deviations are electrical noise spikes from
-    // relay switching, I2C bus glitches, or motor start/stop transients.
+    // Simple 60-sample rolling average — no outlier rejection.
     //
-    // Threshold: 2.0 IWC — allows all legitimate pressure changes (motor cycles
-    // typically change pressure 2-3 IWC over 1-2 seconds) but rejects spikes
-    // that would otherwise corrupt the 60-sample rolling average for a full second.
+    // REV 10.10: Removed all outlier rejection logic (soft/hard thresholds, buffer
+    // resets). The outlier filter was unstable — it rejected legitimate ADC values
+    // at boot and during normal operation on a fixed-pressure sensor with no
+    // physical movement between samples. I2C communication failures are already
+    // caught and discarded BEFORE this function is called (in adcReaderTask),
+    // so bad reads never enter the rolling average.
     //
-    // Only active after the buffer is full (60 samples) — during initial fill,
-    // all samples are accepted to build up the baseline quickly.
-    const float PRESSURE_OUTLIER_THRESHOLD = 2.0;  // IWC — max allowed deviation per sample
+    // The rolling average itself provides sufficient noise smoothing:
+    //   60 samples at 60Hz = 1 second window → smooths electrical noise naturally.
     
-    if (pressureSampleCount >= PRESSURE_AVG_SAMPLES) {
-        float currentAvg = adcPressure;  // Current rolling average (volatile, written by this task)
-        if (fabs(sample - currentAvg) > PRESSURE_OUTLIER_THRESHOLD) {
-            adcOutlierCount++;  // Track for diagnostics (visible on web portal)
-            return currentAvg;  // Discard spike, keep current average unchanged
-        }
-    }
-    
-    // Normal rolling average: add sample to circular buffer and recompute mean
+    // Add sample to circular buffer
     pressureBuffer[pressureBufferIdx] = sample;
     pressureBufferIdx = (pressureBufferIdx + 1) % PRESSURE_AVG_SAMPLES;
     if (pressureSampleCount < PRESSURE_AVG_SAMPLES) pressureSampleCount++;
@@ -5160,6 +5151,7 @@ bool lteConnect() {
                       modemBand.c_str(), modemNetName.c_str(), modemRSRP.c_str(), modemRSRQ.c_str(),
                       modemCC, modemNC, modemCID, modemTAC);
         }
+    }  // end if (modem.getCellInformation)
     
     Serial.println("LTE connection established successfully");
     return true;
