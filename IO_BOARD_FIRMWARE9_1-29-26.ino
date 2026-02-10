@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.9
+ *  Walter IO Board Firmware - Rev 10.10
  *  Date: 2/10/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -13,6 +13,28 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *  
+ *  Rev 10.10 (2/10/2026) - ADC I2C Error Diagnostics
+ *  - NEW: Loud, obnoxious Serial Monitor error logging for ALL ADC read failures
+ *    * Pressure CH0: detects negative or >=2048 raw values (invalid for single-ended)
+ *    * Current CH2-CH3 differential: three-tier validation
+ *      1. rawDiff == -1: I2C NACK/bus failure signature → read SKIPPED
+ *      2. rawDiff == ±2048: full-scale rail (clipping or corruption) → read SKIPPED
+ *      3. absDiff > 800: abnormally high (>expected 580 max) → WARNING, still processed
+ *    * Each error prints a ###-bordered block with raw value, error count, timestamp
+ *    * Easy to spot in Serial Monitor when monitoring for I2C line noise issues
+ *  - NEW: Invalid current reads are now SKIPPED to protect rolling average
+ *    * Previously: all differential reads were processed regardless of validity
+ *    * Now: I2C NACK (-1) and full-scale rail (±2048) values are discarded
+ *    * Bad reads increment adcErrorCount toward 10-error reinit threshold
+ *  - IMPROVED: Reinit (10 consecutive errors) now prints !!!!-bordered block
+ *    * Reinit success and failure both print #### blocks for visibility
+ *  - IMPROVED: ADS1015 reconnect attempts (when not initialized) now log every try
+ *    * 5-second retry loop prints #### blocks for each attempt, success, or failure
+ *  - NOTE: All ADC error messages print ALWAYS (not gated by serialDebugMode)
+ *    * I2C errors are critical diagnostics — must be visible even in quiet mode
+ *  - IMPROVED: Pressure valid range tightened from >=0 to >=0 && <2048
+ *    * Catches edge case where I2C returns max 12-bit value (bus corruption)
+ *
  *  Rev 10.9 (2/10/2026) - Debug Mode + Cellular Identity + Packet Split + Cal Safety
  *  - NEW: Serial Monitor debug mode (default OFF — quiet output)
  *    * When OFF: only essential messages (boot, errors, mode changes, watchdog, calibration)
@@ -432,7 +454,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.9"
+#define VERSION "Rev 10.10"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -1965,7 +1987,7 @@ void adcReaderTask(void *parameter) {
                 // Read Channel 0: Pressure sensor (single-ended)
                 int16_t rawPressure = ads.readADC_SingleEnded(0);
                 
-                if (rawPressure >= 0) {
+                if (rawPressure >= 0 && rawPressure < 2048) {
                     // Success - convert to pressure IWC using Python-compatible linear formula
                     // pressure = (raw - adc_zero) / slope
                     // Vacuum (raw < adc_zero) → negative IWC (normal operating range)
@@ -1977,6 +1999,13 @@ void adcReaderTask(void *parameter) {
                 } else {
                     adcErrorCount++;
                     adcTotalErrors++;
+                    // ALWAYS print pressure errors — I2C communication failure indicator
+                    Serial.println("####################################################################");
+                    Serial.printf("## ADC PRESSURE READ ERROR  |  raw=%d  |  errors=%lu  |  @%lums\r\n",
+                                  rawPressure, adcTotalErrors, millis());
+                    Serial.println("## Single-ended CH0 should be 0-2047. Negative = I2C NACK/bus error");
+                    Serial.printf("## Consecutive errors: %lu (reinit at 10)\r\n", adcErrorCount);
+                    Serial.println("####################################################################");
                 }
                 
                 // Read Channels 2 & 3: Current monitoring (hardware differential)
@@ -1994,24 +2023,85 @@ void adcReaderTask(void *parameter) {
                 delayMicroseconds(100);  // REV 10.9: Allow PGA to settle after gain change (0.6% of 16ms cycle)
                 
                 int16_t absDiff = abs(rawDiff);
-                adcRawCurrent = absDiff;
-                float currentAmps = mapFloat((float)absDiff, adcZeroCurrent, adcFullCurrent, currentRangeLow, currentRangeHigh);
-                if (currentAmps < 0) currentAmps = 0;  // Clamp below-threshold to 0
-                adcCurrent = addCurrentSample(currentAmps);
-                
-                // Track peak current for high-current detection
-                if (currentAmps > adcPeakCurrent) {
-                    adcPeakCurrent = currentAmps;
+
+                // ---------------------------------------------------------------
+                // CURRENT READ VALIDATION: Detect I2C bus errors or line noise
+                // ADS1015 12-bit range: -2048 to +2047
+                // Expected motor current range: ~0 to 580 counts differential
+                // Values at ±2048 (full-scale rail) or >>800 suggest I2C corruption
+                // rawDiff of exactly -1 is a common I2C NACK/failure return
+                // ---------------------------------------------------------------
+                bool currentReadValid = true;
+                if (rawDiff == -1) {
+                    // Common I2C failure signature — bus NACK or read timeout
+                    currentReadValid = false;
+                    adcTotalErrors++;
+                    Serial.println("####################################################################");
+                    Serial.println("## ADC CURRENT READ FAILURE — I2C NACK  (rawDiff == -1)          ##");
+                    Serial.printf("## Differential CH2-CH3  |  raw=%d  |  total errors=%lu  |  @%lums\r\n",
+                                  rawDiff, adcTotalErrors, millis());
+                    Serial.println("## This usually means: I2C bus noise, SDA/SCL glitch, or ADS1015 ##");
+                    Serial.println("## not responding. Check wiring, pull-ups, cable shielding.       ##");
+                    Serial.println("####################################################################");
+                } else if (rawDiff == -2048 || rawDiff == 2047) {
+                    // Value pinned at absolute full-scale rail — likely clipping or bus error
+                    currentReadValid = false;
+                    adcTotalErrors++;
+                    Serial.println("####################################################################");
+                    Serial.println("## ADC CURRENT FULL-SCALE RAIL — POSSIBLE I2C BUS CORRUPTION     ##");
+                    Serial.printf("## Differential CH2-CH3  |  raw=%d  |  total errors=%lu  |  @%lums\r\n",
+                                  rawDiff, adcTotalErrors, millis());
+                    Serial.println("## Value is pinned at 12-bit limit. Check for shorted/open input ##");
+                    Serial.println("## or I2C line noise causing corrupted register reads.            ##");
+                    Serial.println("####################################################################");
+                } else if (absDiff > 800) {
+                    // Abnormally high — well beyond expected max of ~580 counts at 8.0A
+                    // Still use the value but WARN — could be transient noise spike
+                    Serial.println("################################################################");
+                    Serial.printf("## ADC CURRENT ABNORMAL  |  raw=%d  |  abs=%d  (expected <600)\r\n",
+                                  rawDiff, absDiff);
+                    Serial.printf("## Differential CH2-CH3  |  total errors=%lu  |  @%lums\r\n",
+                                  adcTotalErrors, millis());
+                    Serial.println("## Value is unusually high — possible noise spike on I2C bus    ##");
+                    Serial.println("################################################################");
+                    // NOTE: We still process this value but it will be visible in logs
+                }
+
+                if (currentReadValid) {
+                    adcRawCurrent = absDiff;
+                    float currentAmps = mapFloat((float)absDiff, adcZeroCurrent, adcFullCurrent, currentRangeLow, currentRangeHigh);
+                    if (currentAmps < 0) currentAmps = 0;  // Clamp below-threshold to 0
+                    adcCurrent = addCurrentSample(currentAmps);
+                    
+                    // Track peak current for high-current detection
+                    if (currentAmps > adcPeakCurrent) {
+                        adcPeakCurrent = currentAmps;
+                    }
+                } else {
+                    // Skip updating current value on bad read to avoid corrupting the rolling average
+                    adcErrorCount++;  // Count toward reinit threshold
                 }
                 
                 // Error recovery: After 10 consecutive errors, attempt reinit
                 if (adcErrorCount >= 10) {
+                    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    Serial.println("!! ADC CRITICAL: 10 CONSECUTIVE ERRORS — REINITIALIZING I2C BUS !!");
+                    Serial.printf("!!   Total errors since boot: %lu   |  @%lums\r\n", adcTotalErrors, millis());
+                    Serial.println("!!   Stopping Wire, waiting 100ms, then re-initializing ADS1015  !!");
+                    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
                     adcInitialized = false;
                     Wire.end();
                     vTaskDelay(100 / portTICK_PERIOD_MS);
                     if (initializeADS1015()) {
                         adcErrorCount = 0;
+                        Serial.println("####################################################################");
+                        Serial.println("## ADC REINIT SUCCESS — ADS1015 responding again after I2C reset ##");
+                        Serial.println("####################################################################");
                     } else {
+                        Serial.println("####################################################################");
+                        Serial.println("## ADC REINIT FAILED — ADS1015 STILL NOT RESPONDING             ##");
+                        Serial.println("## Will retry in 1 second. Check I2C wiring & pull-ups!          ##");
+                        Serial.println("####################################################################");
                         vTaskDelay(1000 / portTICK_PERIOD_MS);  // Wait 1 second before retry
                     }
                 }
@@ -2020,8 +2110,19 @@ void adcReaderTask(void *parameter) {
                 static unsigned long lastReinitAttempt = 0;
                 if (now - lastReinitAttempt >= 5000) {  // Try every 5 seconds
                     lastReinitAttempt = now;
+                    Serial.println("####################################################################");
+                    Serial.println("## ADC NOT INITIALIZED — Attempting ADS1015 reconnection...       ##");
+                    Serial.printf("##   Attempt @%lums  |  Total errors: %lu\r\n", millis(), adcTotalErrors);
+                    Serial.println("####################################################################");
                     if (initializeADS1015()) {
                         adcErrorCount = 0;
+                        Serial.println("####################################################################");
+                        Serial.println("## ADC RECONNECTED — ADS1015 now responding on I2C bus!          ##");
+                        Serial.println("####################################################################");
+                    } else {
+                        Serial.println("####################################################################");
+                        Serial.println("## ADC RECONNECT FAILED — Will retry in 5 seconds               ##");
+                        Serial.println("####################################################################");
                     }
                 }
             }
@@ -2414,7 +2515,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.9</title>
+    <title>Walter IO Board - Rev 10.10</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -2498,7 +2599,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.9</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.10</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -5798,7 +5899,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.9                 ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.10                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -6030,7 +6131,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.9 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.10 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());

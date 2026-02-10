@@ -1,6 +1,6 @@
 # ESP32 IO Board Serial Protocol Guide
 
-**Firmware:** IO_BOARD_FIRMWARE9 Rev 10.9  
+**Firmware:** IO_BOARD_FIRMWARE9 Rev 10.10  
 **Date:** February 10, 2026  
 **Audience:** Anyone writing software that talks to this ESP32 over serial
 
