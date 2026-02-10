@@ -46,9 +46,12 @@ Linux Device                    ESP32 IO Board
      │       (pressure, current,     │  Sent regardless of Linux state
      │        overfill, sdcard)      │
      │                               │
-     │  ◄─── Cellular Status ─────  │  Only when modem returns fresh data (~60s)
-     │       (datetime, lte, rsrp,   │  Never repeated with stale values
-     │        rsrq, operator, etc.)  │
+     │  ◄─── Cellular Status ─────  │  Every 10 seconds (cached values)
+     │       (lte, rsrp, rsrq,      │  Always sent on timer
+     │        operator, band, etc.)  │
+     │                               │
+     │  ◄─── Datetime Packet ─────  │  Only when fresh from modem clock
+     │       (datetime only)         │  Never repeated with stale values
      │                               │
      │  ── Data Payload ──────────►  │  Every 15 seconds
      │     (gmid, mode, fault,       │  Used for CBOR/cellular/SD logging
@@ -93,17 +96,20 @@ This is the critical real-time data path. The Linux device uses these values for
 
 ---
 
-### 2. Cellular Status Packet (event-driven, ~60s)
+### 2. Cellular Status Packet (timer-driven, every 10 seconds)
 
-Sent only when the Walter modem library returns genuinely new data. Never repeated with cached values.
+Sent every 10 seconds using cached values from the last successful modem query. **Rev 10.9 change:** Previously this was freshness-gated (only sent when modem returned new data). If modem queries failed silently, the Linux device received nothing. Now the Linux device always receives the last-known cellular state on a timer.
+
+`datetime` and `failsafe` have been **removed** from this packet:
+- `datetime` is now sent in its own standalone packet only when fresh (see section 2b below)
+- `failsafe` is already included in the 5Hz fast sensor packet (Rev 10.8)
 
 ```json
-{"datetime":"2026-02-09 13:10:49","passthrough":0,"lte":1,"rsrp":"-85.5","rsrq":"-10.2","operator":"T-Mobile","band":"B2","mcc":310,"mnc":260,"cellId":12345678,"tac":9876,"profile":"CS8","failsafe":0}
+{"passthrough":0,"lte":1,"rsrp":"-85.5","rsrq":"-10.2","operator":"T-Mobile","band":"B2","mcc":310,"mnc":260,"cellId":12345678,"tac":9876,"profile":"CS8"}
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `datetime` | string | UTC timestamp from the cellular modem clock. Format: `"YYYY-MM-DD HH:MM:SS"` |
 | `passthrough` | int | 0 = normal operation, 1 = PPP passthrough mode active |
 | `lte` | int | 1 = connected to LTE network, 0 = not connected |
 | `rsrp` | string | Reference Signal Received Power in dBm (e.g., `"-85.5"`). `"--"` if unavailable. Typical: -80 excellent, -100 poor. |
@@ -115,9 +121,24 @@ Sent only when the Walter modem library returns genuinely new data. Never repeat
 | `cellId` | int | Cell Tower ID |
 | `tac` | int | Tracking Area Code |
 | `profile` | string | Active equipment profile on ESP32 (e.g., `"CS8"`, `"CS9"`, `"CS12"`) |
-| `failsafe` | int | 1 = ESP32 is in autonomous failsafe mode (Linux was unresponsive), 0 = normal |
 
-**Why event-driven:** The cellular modem is slow to query (~2-5 seconds per signal info request). Sending only on fresh data avoids flooding the serial line with repeated stale values and avoids confusing the Linux log. Signal info refreshes every ~60 seconds; time syncs every ~15 minutes.
+**Why 10-second timer:** Guarantees the Linux device always has cellular info, even during modem communication failures. Uses cached values from the last successful query — stale but useful beats missing entirely.
+
+---
+
+### 2b. Datetime Packet (fresh-only, when modem clock updates)
+
+Sent **only** when the modem clock returns a genuinely new timestamp (`modemTimeFresh` flag). This is a standalone single-field packet. Never repeated with stale/frozen values.
+
+```json
+{"datetime":"2026-02-10 13:23:51"}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `datetime` | string | UTC timestamp from the cellular modem clock. Format: `"YYYY-MM-DD HH:MM:SS"` |
+
+**Why separate from cellular:** Datetime should only update when the modem provides a fresh clock reading. Sending a stale datetime on a timer would make it appear the modem clock is frozen. The Python parser handles this standalone packet identically — it checks `if "datetime" in data` independent of other fields.
 
 ---
 
@@ -434,7 +455,8 @@ If an immediate mode command is lost, the next 15-second Linux payload corrects 
 | Event | Interval | Direction | Purpose |
 |-------|----------|-----------|---------|
 | Fast sensor packet | 200ms (5Hz) | ESP32 → Linux | Real-time pressure, current, overfill, SD status, failsafe, shutdown |
-| Cellular status | ~60s (event-driven) | ESP32 → Linux | Modem data, only when fresh |
+| Cellular status | 10s (timer) | ESP32 → Linux | Cached cellular info (lte, rsrp, rsrq, operator, band, cell tower) |
+| Datetime packet | Event-driven | ESP32 → Linux | Fresh modem clock only — never repeated with stale values |
 | Periodic data payload | 15s | Linux → ESP32 | CBOR/SD logging data (gmid, fault, cycles) + mode re-send |
 | Immediate mode command | On change | Linux → ESP32 | Relay control (<200ms response) |
 | **Relay state refresh** | **15s** | **ESP32 internal** | **Re-applies currentRelayMode to GPIO pins (Rev 10.8)** |

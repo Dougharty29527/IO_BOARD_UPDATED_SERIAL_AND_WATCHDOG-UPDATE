@@ -144,11 +144,10 @@ The rolling averages smooth out electrical noise while still reflecting real sen
 
 Sent at 5Hz (every 200ms). This is the **critical** data path. The Linux controller uses these values to make real-time decisions about cycle starts, stops, alarms, and safety shutdowns. Rev 10.8 added `failsafe` and `shutdown` fields for system state visibility.
 
-### Cellular Status Packet (ESP32 → Linux, only when fresh from modem)
+### Cellular Status Packet (ESP32 → Linux, every 10 seconds)
 
 ```json
 {
-  "datetime": "2026-02-09 14:30:00",
   "passthrough": 0,
   "lte": 1,
   "rsrp": "-85.5",
@@ -156,12 +155,19 @@ Sent at 5Hz (every 200ms). This is the **critical** data path. The Linux control
   "operator": "T-Mobile",
   "band": "12",
   "mcc": 310, "mnc": 260, "cellId": 12345, "tac": 678,
-  "profile": "CS2",
-  "failsafe": 0
+  "profile": "CS2"
 }
 ```
 
-**Not sent on a timer.** This packet is only sent when `refreshCellSignalInfo()` retrieves new data from the modem (~every 60 seconds). This prevents stale/repeated datetime and signal values from flooding the serial line.
+**Rev 10.9: Sent on a 10-second timer** using cached values from the last successful modem query. Previously this was freshness-gated (only sent when modem returned new data), which meant the Linux device received nothing if modem queries failed silently. `datetime` and `failsafe` removed — datetime is sent separately only when fresh; failsafe is already in the 5Hz fast sensor packet.
+
+### Datetime Packet (ESP32 → Linux, only when fresh from modem)
+
+```json
+{"datetime": "2026-02-10 13:23:51"}
+```
+
+**Only sent when `modemTimeFresh` flag is set** — i.e., when the modem clock returns a genuinely new timestamp. This prevents stale/frozen datetime values. Python parser handles this standalone packet via `if "datetime" in data`.
 
 ### CBOR Data Payload (Linux → ESP32, every 15 seconds)
 
@@ -285,7 +291,7 @@ These codes are **added** to any existing fault codes from the Linux device.
 
 | Version | Date | Description |
 |---------|------|-------------|
-| **Rev 10.9** | **2/10/2026** | **Calibration safety: restricted to middle 20% of ADC scale (factory default +/-10%). EEPROM load validates stored value, rejects bad calibrations on boot. ADC outlier rejection eliminates 1.0 IWC oscillation from electrical noise. PGA settling delay after gain switch.** |
+| **Rev 10.9** | **2/10/2026** | **Cellular packet now 10-second timer (was freshness-gated). Datetime split into own packet (fresh only). Failsafe removed from cellular (already in 5Hz). Calibration safety: restricted to middle 20% of ADC scale. EEPROM validates on boot. ADC outlier rejection. PGA settling delay.** |
 | Rev 10.8 | 2/10/2026 | Mode confirmation: 15-second relay state refresh re-applies currentRelayMode to GPIO pins. Fast sensor packet extended with failsafe and shutdown fields. Three-layer mode delivery redundancy (immediate + 15s payload + relay refresh). Zero Python changes required. |
 | Rev 10.7 | 2/9/2026 | Pressure sensor calibration via serial or web portal. Instant non-blocking zero point adjustment using existing 60-sample rolling average. EEPROM persistence. ESP32 sends ps_cal result to Linux for database save. New "type":"cmd" message type. |
 | Rev 10.6 | 2/9/2026 | Fixed pressure sign (vacuum now negative). Fixed current stuck at 0A (hardware differential mode). Added `{"mode":"normal"}` to clear 72-hour shutdown without reboot. |

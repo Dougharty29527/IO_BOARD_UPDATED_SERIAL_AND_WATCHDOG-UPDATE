@@ -190,7 +190,22 @@
  *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
- *  Rev 10.9 (2/10/2026) - Calibration Safety + ADC Stability Fix
+ *  Rev 10.9 (2/10/2026) - Calibration Safety + ADC Stability + Serial Packet Split
+ *  - CHANGED: Cellular status packet now sent every 10 seconds on TIMER
+ *    * Previously: only sent when modemDataFresh was true (freshness-gated)
+ *    * Problem: if modem queries fail silently, Linux device got NO cellular data
+ *    * Now: sendCellularStatusToSerial() sends cached values every 10 seconds
+ *    * Linux always has last-known cellular state even during modem issues
+ *  - CHANGED: Removed "datetime" and "failsafe" from cellular status packet
+ *    * "datetime" now sent separately via sendDateTimeToSerial() ONLY when fresh
+ *    * "failsafe" already included in 5Hz fast sensor packet (Rev 10.8)
+ *    * Prevents stale/frozen datetime from confusing the Linux controller
+ *  - NEW: Standalone datetime packet {"datetime":"..."} sent only on modemTimeFresh
+ *    * Small packet (~40 bytes) sent independently of cellular info
+ *    * Python parser uses 'if "datetime" in data' — fully compatible
+ *  - RENAMED: sendStatusToSerial() → sendCellularStatusToSerial() + sendDateTimeToSerial()
+ *    * Split into two focused functions for clarity and independent timing
+ *  - NEW: CELLULAR_SEND_INTERVAL (10000ms) and lastCellularSendTime timer
  *  - FIXED: Bad calibration under vacuum saved wrong zero point to EEPROM
  *    * Root cause: Calibrating while sensor reads -6 IWC set newZero ≈ 827
  *    * This made all subsequent readings ≈ 0.0 IWC (calibrated vacuum as zero)
@@ -270,11 +285,10 @@
  *    * Problem: Values repeated unchanged between modem queries, wasting bandwidth.
  *      datetime appeared to "freeze then jump" because interpolated value was stale.
  *    * Now: modemDataFresh flag set by refreshCellSignalInfo() (~every 60s) and
- *      lteConnect(). modemTimeFresh flag set by initModemTime(). sendStatusToSerial()
- *      only fires when one of these flags is true, then clears both flags.
- *    * Result: Cellular fields appear only when genuinely new — no stale repeats.
- *  - REMOVED: STATUS_SEND_INTERVAL (15-second timer) and lastStatusSendTime
- *    * Full status is now event-driven (fresh modem data), not time-driven
+ *      lteConnect(). modemTimeFresh flag set by initModemTime().
+ *    * REV 10.9: sendStatusToSerial() split into sendCellularStatusToSerial() (10s timer)
+ *      and sendDateTimeToSerial() (fresh only). Cellular no longer freshness-gated.
+ *    * Result: Cellular data always arrives on 10s timer. Datetime only when fresh.
  *  - ARCHITECTURE: Two distinct serial packet types to Linux:
  *    * Fast (5Hz): {"pressure":X,"current":X,"overfill":X,"sdcard":"OK","relayMode":X,"failsafe":0,"shutdown":0}
  *    * Fresh cellular: {"datetime":"...","lte":X,"rsrp":"...","rsrq":"...", ... }
@@ -322,6 +336,13 @@
  *    uses the ESP32's own ADC readings for pressure and current (not the Linux values),
  *    so cellular data is always real-time regardless of the 15-second Linux send rate.
  *  
+ *  =====================================================================
+ *  Rev 10.2 (2/8/2026) - CBOR Pressure Fix + Web Test Handlers
+ *  - FIXED: Stale CBOR pressure — ESP32 CBOR builder now uses own ADC readings
+ *    * Previously round-tripped Python values were used, causing stale/delayed data
+ *    * ESP32 ADC (60Hz rolling average) provides real-time pressure and current
+ *  - NEW: Web portal test handlers added for remote test initiation
+ *
  *  =====================================================================
  *  Rev 10.1 (2/8/2026) - Performance & Security: Faster Relay Response, Portal Passwords
  *  - PERFORMANCE: Serial read interval reduced from 5s to 100ms
@@ -749,12 +770,13 @@ uint16_t modemNC = 0;             // Network Code (e.g. 260 for T-Mobile US)
 uint32_t modemCID = 0;
 uint32_t modemTAC = 0;            // Cell ID - unique identifier of the serving cell tower
 
-// REV 10.5 — Freshness tracking for modem/cellular data
-// These flags are set TRUE when fresh data arrives from the modem library
-// (refreshCellSignalInfo, lteConnect, initModemTime). They are cleared after
-// the data is sent to the Linux device via sendStatusToSerial().
-// This prevents sending stale/repeated datetime, rsrp, rsrq, lte, passthrough
-// values in every packet — those fields are only included when genuinely new.
+// REV 10.5/10.9 -- Freshness tracking for modem/cellular data
+// modemDataFresh: set TRUE when refreshCellSignalInfo() or lteConnect() gets new cell data.
+//   REV 10.9: No longer gates sending -- cellular packet is sent every 10 seconds on timer.
+//   Flag is cleared after each 10-second send for internal tracking only.
+// modemTimeFresh: set TRUE when initModemTime() gets a fresh clock from modem.
+//   REV 10.9: Gates sending of standalone datetime packet. Only sends when fresh.
+//   This prevents the "datetime repeats then updates" problem.
 bool modemDataFresh = false;      // Set true when refreshCellSignalInfo() gets new cell data
 bool modemTimeFresh = false;      // Set true when modem clock is freshly queried
 String imei = "";
@@ -803,16 +825,22 @@ String  activeTestType = "";          // "leak", "func", "eff", "" (empty = no t
 unsigned long testStartTime = 0;      // millis() when test started
 bool    testRunning = false;          // True while a test is in progress
 
-// REV 10.5: Serial JSON output to Python device (via Serial1/RS-232)
-// Two sending mechanisms:
-//   FAST sensor packet: pressure, current, overfill, sdcard, relayMode — every 200ms (5Hz)
-//   FRESH cellular status: datetime, lte, rsrp, rsrq, operator, etc. — ONLY on fresh modem data
-// The 15-second fixed timer for cellular data is REMOVED. Cellular fields are sent
-// only when refreshCellSignalInfo() or initModemTime() retrieves new data from modem.
+// REV 10.5/10.9: Serial JSON output to Python device (via Serial1/RS-232)
+// Three sending mechanisms (Rev 10.9):
+//   1. FAST sensor packet: pressure, current, overfill, sdcard, relayMode, failsafe, shutdown — every 200ms (5Hz)
+//   2. Cellular status: lte, rsrp, rsrq, operator, band, mcc, mnc, cellId, tac, profile — every 10s (timer)
+//   3. Datetime: {"datetime":"..."} — ONLY when modemTimeFresh is true (fresh from modem)
 unsigned long lastSensorSendTime = 0;
 const unsigned long SENSOR_SEND_INTERVAL = 200;    // 200ms = 5Hz - fast sensor updates (pressure, current, overfill, sdcard)
-// NOTE: lastStatusSendTime and STATUS_SEND_INTERVAL removed in Rev 10.5
-// Full status is now triggered by modemDataFresh/modemTimeFresh flags, not a timer
+
+// REV 10.9: Cellular status now sent every 10 seconds on a TIMER (not freshness-gated).
+// Previously (Rev 10.5): only sent when modemDataFresh/modemTimeFresh flags were set.
+// Problem: if modem queries fail silently, the cellular packet was NEVER sent, leaving
+// the Linux device with no signal/LTE info at all. Now we always send cached values
+// every 10 seconds so the Linux device always has the latest known state.
+// Datetime is sent separately, ONLY when modemTimeFresh is true (fresh from modem).
+unsigned long lastCellularSendTime = 0;
+const unsigned long CELLULAR_SEND_INTERVAL = 10000; // 10 seconds — always send cached cellular info
 
 // REV 10.8: Periodic relay state refresh timer
 // Re-applies currentRelayMode to physical GPIO pins every 15 seconds.
@@ -3968,50 +3996,55 @@ bool isSDCardOK() {
 }
 
 /**
- * Send FRESH modem/cellular status JSON to the Python device via Serial1 (RS-232).
+ * Send cellular status to Python device via Serial1 (RS-232).
  * 
- * REV 10.5: This function is now ONLY called when fresh data was retrieved from
- * the modem library (refreshCellSignalInfo or initModemTime succeeded). It is NOT
- * called on a fixed timer. This prevents sending stale/repeated datetime, RSRP,
- * RSRQ, LTE, and passthrough values in every packet.
+ * REV 10.9: Sent every 10 seconds on a TIMER (not freshness-gated).
+ * Previously (Rev 10.5): only sent when modemDataFresh/modemTimeFresh flags
+ * were set. Problem: if modem queries fail silently, the cellular packet was
+ * NEVER sent, leaving the Linux device with no signal/LTE info at all.
  * 
- * The fast sensor data (pressure, current, overfill, sdcard) is handled by
- * sendFastSensorPacket() at 5Hz — this function only sends the slow-changing
- * cellular and system fields that the Python program caches.
+ * Now we always send cached values every 10 seconds so the Linux device
+ * always has the latest known cellular state.
  * 
- * JSON Format (only sent when modem data is fresh):
- *   {"datetime":"2026-02-09 14:30:00","passthrough":0,"lte":1,"rsrp":"-85.5",
- *    "rsrq":"-10.2","operator":"T-Mobile","band":"12","mcc":310,"mnc":260,
- *    "cellId":12345,"tac":678,"profile":"CS2","failsafe":0}
- * 
+ * REMOVED from this packet (Rev 10.9):
+ *   - "datetime" - sent separately via sendDateTimeToSerial() only when fresh
+ *     from modem, avoiding stale/frozen timestamps.
+ *   - "failsafe" - already included in the 5Hz fast sensor packet (Rev 10.8).
+ *
+ * Python modem.py parses each field with 'if "field" in data' - fully
+ * compatible with this packet containing no datetime or failsafe fields.
+ *
+ * Packet format (sent every 10s on Serial1 to Linux):
+ *   {"passthrough":0,"lte":1,"rsrp":"-87.2","rsrq":"-10.8",
+ *    "operator":"AT&T","band":"17","mcc":310,"mnc":410,
+ *    "cellId":20878097,"tac":10519,"profile":"CS8"}
+ *
  * Usage example:
- *   sendStatusToSerial();  // Called only when modemDataFresh or modemTimeFresh is true
+ *   sendCellularStatusToSerial();  // Called every 10 seconds from loop()
+ *
+ * REV_HISTORY: Previously sendStatusToSerial() -- renamed and split in Rev 10.9
  */
-void sendStatusToSerial() {
-    // Get current timestamp from modem (only meaningful when freshly queried)
-    String dateTimeStr = formatTimestamp(currentTimestamp);
-    
+void sendCellularStatusToSerial() {
     // Check LTE connection status
     int lteStatus = lteConnected() ? 1 : 0;
     
-    // Get signal quality — these are FRESH because this function is only called
-    // after refreshCellSignalInfo() or lteConnect() successfully updated them
+    // Use cached signal values -- may be stale if modem queries are failing,
+    // but sending stale values is better than sending nothing.
     String rsrpStr = modemRSRP.length() > 0 ? modemRSRP : "--";
     String rsrqStr = modemRSRQ.length() > 0 ? modemRSRQ : "--";
     String operatorStr = modemNetName.length() > 0 ? modemNetName : "--";
     String bandStr = modemBand.length() > 0 ? modemBand : "--";
     
-    // REV 10.5: Cellular-only JSON — no pressure/current/overfill/sdcard here.
-    // Those fast-changing values are sent at 5Hz by sendFastSensorPacket().
-    // This packet contains ONLY the slow-changing modem/system fields.
-    char jsonBuffer[512];
+    // REV 10.9: Cellular-only JSON -- no datetime, no failsafe.
+    // datetime: sent separately via sendDateTimeToSerial() only when fresh.
+    // failsafe: already in the 5Hz fast sensor packet (Rev 10.8).
+    char jsonBuffer[384];
     snprintf(jsonBuffer, sizeof(jsonBuffer),
-             "{\"datetime\":\"%s\",\"passthrough\":%d,"
+             "{\"passthrough\":%d,"
              "\"lte\":%d,\"rsrp\":\"%s\",\"rsrq\":\"%s\","
              "\"operator\":\"%s\",\"band\":\"%s\","
              "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u,\"tac\":%u,"
-             "\"profile\":\"%s\",\"failsafe\":%d}",
-             dateTimeStr.c_str(),
+             "\"profile\":\"%s\"}",
              passthroughValue,
              lteStatus,
              rsrpStr.c_str(),
@@ -4019,18 +4052,48 @@ void sendStatusToSerial() {
              operatorStr.c_str(),
              bandStr.c_str(),
              modemCC, modemNC, modemCID, modemTAC,
-             profileManager.getActiveProfileName().c_str(),
-             failsafeMode ? 1 : 0);
+             profileManager.getActiveProfileName().c_str());
     
     // Send to Python device via Serial1 (RS-232)
     Serial1.println(jsonBuffer);
     
-    // Clear freshness flags — won't send again until modem provides new data
-    modemDataFresh = false;
-    modemTimeFresh = false;
+    // Debug output to Serial Monitor
+    Serial.print("[RS232-TX CELL @10s] ");
+    Serial.println(jsonBuffer);
+}
+
+/**
+ * Send fresh datetime to Python device via Serial1 (RS-232).
+ * 
+ * REV 10.9: ONLY sent when modemTimeFresh is true -- i.e., when the modem
+ * clock has been freshly queried and returned a new timestamp. This prevents
+ * sending stale/frozen datetime values that confuse the Linux controller.
+ * 
+ * Separated from cellular packet so that:
+ *   1. Cellular info (rsrp, rsrq, lte, etc.) is always available on a 10s timer
+ *   2. Datetime only updates when genuinely fresh from modem
+ * 
+ * Packet format (sent only when modemTimeFresh, on Serial1 to Linux):
+ *   {"datetime":"2026-02-10 13:23:51"}
+ * 
+ * Python modem.py parses "datetime" with 'if "datetime" in data' -- fully
+ * compatible with this being a standalone single-field packet.
+ * 
+ * Usage example:
+ *   if (modemTimeFresh) { sendDateTimeToSerial(); modemTimeFresh = false; }
+ */
+void sendDateTimeToSerial() {
+    String dateTimeStr = formatTimestamp(currentTimestamp);
+    
+    char jsonBuffer[64];
+    snprintf(jsonBuffer, sizeof(jsonBuffer),
+             "{\"datetime\":\"%s\"}",
+             dateTimeStr.c_str());
+    
+    Serial1.println(jsonBuffer);
     
     // Debug output to Serial Monitor
-    Serial.print("[RS232-TX FRESH] ");
+    Serial.print("[RS232-TX TIME FRESH] ");
     Serial.println(jsonBuffer);
 }
 
@@ -4091,15 +4154,22 @@ void sendFastSensorPacket() {
  * Check if it's time to send status/sensor data to Python and send if due.
  * Called from main loop - handles timing internally.
  * 
- * REV 10.5/10.8: Two send mechanisms:
- *   - Every 200ms (5Hz): Fast sensor packet (pressure, current, overfill, sdcard, mode, failsafe, shutdown)
- *     Always sent on schedule — these values change rapidly and the Linux controller
- *     needs them in real-time for operating decisions.
- *     REV 10.8: Added failsafe and shutdown fields for system state visibility.
- *   - On fresh data ONLY: Cellular status (datetime, LTE, rsrp, rsrq, operator, etc.)
- *     Only sent when refreshCellSignalInfo() or initModemTime() retrieves NEW data
- *     from the modem library. This prevents repeating stale datetime and signal values.
- *     Typically fires every ~60 seconds (when cell info refresh succeeds).
+ * REV 10.9: Three send mechanisms:
+ *   1. Every 200ms (5Hz): Fast sensor packet via sendFastSensorPacket()
+ *      (pressure, current, overfill, sdcard, relayMode, failsafe, shutdown)
+ *      Always sent on schedule -- these values change rapidly.
+ *   2. Every 10 seconds: Cellular status via sendCellularStatusToSerial()
+ *      (passthrough, lte, rsrp, rsrq, operator, band, mcc, mnc, cellId, tac, profile)
+ *      Always sent on timer using cached values -- ensures Linux always receives
+ *      cellular info even if modem queries fail. Datetime and failsafe REMOVED
+ *      from this packet (Rev 10.9).
+ *   3. On fresh time ONLY: Datetime via sendDateTimeToSerial()
+ *      (datetime) -- only when modemTimeFresh flag is set, preventing stale timestamps.
+ * 
+ * REV 10.9 CHANGE: Cellular packet was previously freshness-gated (only sent when
+ * modemDataFresh was true). If modem queries failed silently, the Linux device
+ * never received cellular data. Now uses a 10-second timer with cached values.
+ * modemDataFresh flag is cleared when new data arrives but no longer gates sending.
  * 
  * IMPORTANT: Skips ALL sending during passthrough mode to avoid interfering
  * with modem communication (PPP/AT commands)
@@ -4114,22 +4184,34 @@ void checkAndSendStatusToSerial() {
     
     unsigned long currentTime = millis();
     
-    // Fast sensor packet every 200ms (5Hz) — pressure, current, overfill, sdcard
+    // === 1. Fast sensor packet every 200ms (5Hz) ===
+    // pressure, current, overfill, sdcard, relayMode, failsafe, shutdown
     // These are the CRITICAL real-time values the Linux controller uses for decisions.
     if (currentTime - lastSensorSendTime >= SENSOR_SEND_INTERVAL) {
         sendFastSensorPacket();
         lastSensorSendTime = currentTime;
     }
     
-    // REV 10.5: Cellular/datetime status — ONLY when fresh data from modem.
-    // modemDataFresh is set by refreshCellSignalInfo() (every 60s) and lteConnect().
-    // modemTimeFresh is set by initModemTime() when modem clock is queried.
-    // sendStatusToSerial() clears both flags after sending.
-    // This eliminates the "time repeats then updates" problem — datetime and cell
-    // signal values are only sent when the modem library returns genuinely new data.
-    if (modemDataFresh || modemTimeFresh) {
-        sendStatusToSerial();
-        // Flags are cleared inside sendStatusToSerial()
+    // === 2. Cellular status every 10 seconds (timer-based, NOT freshness-gated) ===
+    // REV 10.9: Always sends cached cellular values on a 10-second timer.
+    // Previously (Rev 10.5): only sent when modemDataFresh was true, which meant
+    // the Linux device got NOTHING if modem queries failed. Now the Linux device
+    // always receives the last known cellular state every 10 seconds.
+    // modemDataFresh is still set/cleared for internal tracking but does NOT gate this send.
+    if (currentTime - lastCellularSendTime >= CELLULAR_SEND_INTERVAL) {
+        sendCellularStatusToSerial();
+        lastCellularSendTime = currentTime;
+        // Clear modemDataFresh since we've sent whatever we have
+        modemDataFresh = false;
+    }
+    
+    // === 3. Datetime -- ONLY when fresh from modem ===
+    // REV 10.9: Separated from cellular packet so stale timestamps are never sent.
+    // modemTimeFresh is set by initModemTime() when modem clock returns new data.
+    // Typically fires when modem time query succeeds (~every 60s depending on modem).
+    if (modemTimeFresh) {
+        sendDateTimeToSerial();
+        modemTimeFresh = false;
     }
 }
 
@@ -5095,11 +5177,13 @@ void refreshCellSignalInfo() {
         modemCID = rsp.data.cellInformation.cid;                  // Cell Tower ID
         modemTAC = rsp.data.cellInformation.tac;                  // Tracking Area Code
         
-        // REV 10.5: Mark modem data as FRESH — sendStatusToSerial() will include
-        // cellular fields (rsrp, rsrq, lte, operator, etc.) on the next send cycle.
-        // This prevents repeating stale cellular data in every serial packet.
+        // REV 10.5/10.9: Mark modem data as FRESH for internal tracking.
+        // REV 10.9: Cellular is now sent every 10s on timer (not freshness-gated),
+        // so this flag is informational -- it gets cleared on next 10s send cycle.
+        // The cached values (modemRSRP, modemBand, etc.) updated above will be
+        // included in the next sendCellularStatusToSerial() call automatically.
         modemDataFresh = true;
-        Serial.println("[CELL] Fresh cell info retrieved — will include in next serial status");
+        Serial.println("[CELL] Fresh cell info retrieved -- cached for next 10s send cycle");
     }
     // On failure, keep previous values rather than overwriting with "Unknown"
     // This prevents dashboard from flickering between real data and "Unknown"
