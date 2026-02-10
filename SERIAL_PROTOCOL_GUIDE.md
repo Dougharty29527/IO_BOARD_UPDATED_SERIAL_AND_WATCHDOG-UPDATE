@@ -1,6 +1,6 @@
 # ESP32 IO Board Serial Protocol Guide
 
-**Firmware:** IO_BOARD_FIRMWARE9 Rev 10.8  
+**Firmware:** IO_BOARD_FIRMWARE9 Rev 10.9  
 **Date:** February 10, 2026  
 **Audience:** Anyone writing software that talks to this ESP32 over serial
 
@@ -255,15 +255,17 @@ Command messages use `"type":"cmd"` to distinguish them from data packets. The E
 
 This command tells the ESP32 to recalibrate the pressure sensor zero point. The sensor should be **open to ambient air (no vacuum applied)** when this command is issued. Whatever the sensor is currently reading becomes the new 0.0 IWC reference. For example, if the sensor reads -0.5 IWC due to altitude, after calibration it will read 0.0 IWC.
 
-**Calibration process (mirrors Python `pressure_sensor.py` `calibrate()`):**
-1. Collects 60 raw ADC samples from channel 0 (~1 second at 60Hz)
-2. Sorts the samples and removes the 5 highest and 5 lowest outliers
-3. Averages the remaining 50 samples to compute the new zero point
-4. Validates the result is within a sane range (200-1800 ADC counts)
-5. Saves the new zero point to EEPROM (Preferences key: `"adcZero"` in namespace `"RMS"`)
-6. Clears the pressure averaging buffer so readings immediately reflect the new calibration
+**Calibration process (instant, non-blocking — Rev 10.7+):**
+1. Uses the existing 60-sample rolling average (`adcPressure`) — no delay or sample loop
+2. Computes the new zero point: `newZero = oldZero + (currentPressure × slope)`
+3. **Rev 10.9:** Validates the result is within the middle 20% of scale (~868-1060 ADC counts, factory default ±10%). If out of range, calibration is **REJECTED** with an error message — this prevents calibrating under vacuum.
+4. Saves the new zero point to EEPROM (Preferences key: `"adcZero"` in namespace `"RMS"`)
+5. Clears the pressure averaging buffer so readings immediately reflect the new calibration
+6. Sends `{"type":"data","ps_cal":NNN.NN}` back to Linux with the new zero point
 
-**Persistence:** The calibration value is saved to EEPROM and loaded automatically on every ESP32 boot. If no calibration has been saved, the factory default (964.0) is used.
+**IMPORTANT:** The sensor **must be at ambient air pressure** (no vacuum) when calibrating. If the sensor is under vacuum (e.g., reading -6 IWC), the calibration will be rejected because the computed zero point falls outside the allowed range.
+
+**Persistence:** The calibration value is saved to EEPROM and loaded automatically on every ESP32 boot. **Rev 10.9:** On boot, the stored value is validated against the same ±10% range. If a bad value was saved by a prior firmware version, it is rejected and the factory default (964.0) is used instead. The device self-heals on next reboot.
 
 **Factory default:** 964.0 (= 15422/16, the ADS1015 12-bit equivalent of the Python `pressure_sensor.py` default 15422.0 for the ADS1115 16-bit).
 

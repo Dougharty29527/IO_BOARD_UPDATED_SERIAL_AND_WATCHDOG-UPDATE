@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.8
+ *  Walter IO Board Firmware - Rev 10.9
  *  Date: 2/10/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -190,6 +190,31 @@
  *  - MCP23017 emulation for I2C relay control
  *  
  *  =====================================================================
+ *  Rev 10.9 (2/10/2026) - Calibration Safety + ADC Stability Fix
+ *  - FIXED: Bad calibration under vacuum saved wrong zero point to EEPROM
+ *    * Root cause: Calibrating while sensor reads -6 IWC set newZero ≈ 827
+ *    * This made all subsequent readings ≈ 0.0 IWC (calibrated vacuum as zero)
+ *    * Old validation range 200-1800 was far too wide — accepted nearly anything
+ *  - NEW: Calibration range restricted to middle 20% of scale (factory default ±10%)
+ *    * New allowed range: ~868 to ~1060 ADC counts (derived from 964.0 ±10%)
+ *    * At sea level: newZero ≈ 964 → accepted
+ *    * At altitude (-0.5 IWC): newZero ≈ 953 → accepted
+ *    * Under vacuum (-6 IWC): newZero ≈ 827 → REJECTED with error message
+ *    * Constants: CAL_TOLERANCE_PERCENT, CAL_RANGE_MIN, CAL_RANGE_MAX
+ *  - FIXED: EEPROM load had no range validation (accepted any positive value)
+ *    * Bad stored values now rejected on boot → falls back to factory default 964.0
+ *    * Devices with corrupt EEPROM self-heal on next reboot (no manual intervention)
+ *  - NEW: ADC pressure outlier rejection in addPressureSample()
+ *    * Discards samples deviating >2.0 IWC from current rolling average
+ *    * Eliminates 1.0 IWC oscillation caused by electrical noise / relay switching
+ *    * Gas pressure physically cannot change >2 IWC in 16ms (one sample period)
+ *    * Only active after buffer is full (60 samples) — initial fill unrestricted
+ *    * New diagnostic counter: adcOutlierCount (visible on web portal diagnostics)
+ *  - IMPROVED: 100µs PGA settling delay after ADC gain switch (GAIN_TWO → GAIN_ONE)
+ *    * Reduces baseline noise floor when alternating pressure/current reads
+ *    * 0.6% overhead on 16ms ADC cycle — negligible impact
+ *
+ *  =====================================================================
  *  Rev 10.8 (2/10/2026) - Mode Confirmation: 15-Second Relay Refresh + Extended Sensor Packet
  *  - NEW: Periodic relay state refresh every 15 seconds in main loop()
  *    * Re-applies currentRelayMode to physical GPIO pins via setRelaysForMode()
@@ -365,7 +390,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.8"
+#define VERSION "Rev 10.9"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -464,6 +489,7 @@ volatile int16_t adcRawPressure = 0;    // Raw ADC value for channel 0 (diagnost
 volatile int16_t adcRawCurrent = 0;     // Raw abs(ch2-ch3) value (diagnostics)
 volatile uint32_t adcErrorCount = 0;    // Consecutive read errors (resets on success)
 volatile uint32_t adcTotalErrors = 0;   // Total lifetime read errors (diagnostics)
+volatile uint32_t adcOutlierCount = 0;  // REV 10.9: Pressure samples rejected by outlier filter (diagnostics)
 volatile bool adcInitialized = false;   // True once ADS1015 responds successfully
 
 // ADC calibration constants (matched to Python pressure_sensor.py two-point formula)
@@ -480,6 +506,15 @@ volatile bool adcInitialized = false;   // True once ADS1015 responds successful
 float adcZeroPressure = 964.0;        // Overwritten by EEPROM value in setup()
 float pressureSlope12bit = 22.84;     // 365.44/16 — ADC counts (12-bit) per IWC
 const float ADC_ZERO_FACTORY_DEFAULT = 964.0;  // Factory default if EEPROM has no calibration
+
+// REV 10.9: Calibration range validation — middle 20% of scale centered on factory default.
+// Prevents bad calibrations (e.g., sensor under vacuum) from saving a wildly wrong zero point.
+// ±10% of 964.0 = ±96.4 ADC counts → allowed range: 867.6 to 1060.4
+// A calibration at -6 IWC vacuum would compute newZero ≈ 827 → REJECTED (below 867.6).
+// At sea level ambient: newZero ≈ 964 → accepted. High altitude (-0.5 IWC): newZero ≈ 953 → accepted.
+const float CAL_TOLERANCE_PERCENT = 10.0;  // ±10% = 20% total band (middle 20% of scale)
+const float CAL_RANGE_MIN = ADC_ZERO_FACTORY_DEFAULT * (1.0f - CAL_TOLERANCE_PERCENT / 100.0f);  // ~867.6
+const float CAL_RANGE_MAX = ADC_ZERO_FACTORY_DEFAULT * (1.0f + CAL_TOLERANCE_PERCENT / 100.0f);  // ~1060.4
 
 // Current: Python uses mapit(abs(ch2-ch3), 1248, 4640, 2.1, 8.0) on ADS1115 (16-bit)
 // Those 16-bit single-ended differences correspond to physical voltages:
@@ -1501,6 +1536,28 @@ float mapFloat(float x, float in_min, float in_max, float out_min, float out_max
  * Usage: Called from ADS1015 task at 60Hz.
  */
 float addPressureSample(float sample) {
+    // REV 10.9: Outlier rejection — discard samples that deviate too far from
+    // the current rolling average. Gas pressure changes slowly (physically cannot
+    // jump >2 IWC in 16ms), so large deviations are electrical noise spikes from
+    // relay switching, I2C bus glitches, or motor start/stop transients.
+    //
+    // Threshold: 2.0 IWC — allows all legitimate pressure changes (motor cycles
+    // typically change pressure 2-3 IWC over 1-2 seconds) but rejects spikes
+    // that would otherwise corrupt the 60-sample rolling average for a full second.
+    //
+    // Only active after the buffer is full (60 samples) — during initial fill,
+    // all samples are accepted to build up the baseline quickly.
+    const float PRESSURE_OUTLIER_THRESHOLD = 2.0;  // IWC — max allowed deviation per sample
+    
+    if (pressureSampleCount >= PRESSURE_AVG_SAMPLES) {
+        float currentAvg = adcPressure;  // Current rolling average (volatile, written by this task)
+        if (fabs(sample - currentAvg) > PRESSURE_OUTLIER_THRESHOLD) {
+            adcOutlierCount++;  // Track for diagnostics (visible on web portal)
+            return currentAvg;  // Discard spike, keep current average unchanged
+        }
+    }
+    
+    // Normal rolling average: add sample to circular buffer and recompute mean
     pressureBuffer[pressureBufferIdx] = sample;
     pressureBufferIdx = (pressureBufferIdx + 1) % PRESSURE_AVG_SAMPLES;
     if (pressureSampleCount < PRESSURE_AVG_SAMPLES) pressureSampleCount++;
@@ -1582,10 +1639,23 @@ void loadPressureCalibrationFromEeprom() {
     float savedZero = prefs.getFloat("adcZero", -1.0);  // -1 = not set
     prefs.end();
     
-    if (savedZero > 0) {
+    // REV 10.9: Validate EEPROM value against the same middle-20% range used for calibration.
+    // If a bad calibration was saved previously (e.g., sensor under vacuum), the stored value
+    // will be out of range and we fall back to the factory default. This fixes devices that
+    // already have a corrupt EEPROM value — they self-heal on the next reboot.
+    if (savedZero >= CAL_RANGE_MIN && savedZero <= CAL_RANGE_MAX) {
+        // Stored value is within the valid calibration range — use it
         adcZeroPressure = savedZero;
-        Serial.printf("[CAL] Loaded pressure zero from EEPROM: %.2f (12-bit ADC counts)\r\n", adcZeroPressure);
+        Serial.printf("[CAL] Loaded pressure zero from EEPROM: %.2f (valid range: %.0f-%.0f)\r\n",
+                      adcZeroPressure, CAL_RANGE_MIN, CAL_RANGE_MAX);
+    } else if (savedZero > 0) {
+        // Value exists but is out of range — bad calibration from a prior firmware version
+        adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
+        Serial.printf("[CAL] WARNING: EEPROM value %.2f OUT OF RANGE (%.0f-%.0f) — using factory default %.2f\r\n",
+                      savedZero, CAL_RANGE_MIN, CAL_RANGE_MAX, ADC_ZERO_FACTORY_DEFAULT);
+        Serial.printf("[CAL] Previous calibration was likely done under pressure — re-calibrate at ambient air\r\n");
     } else {
+        // No calibration saved — first boot or EEPROM cleared
         adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
         Serial.printf("[CAL] No EEPROM calibration — using factory default: %.2f\r\n", adcZeroPressure);
     }
@@ -1654,9 +1724,15 @@ void calibratePressureSensorZeroPoint() {
     // Since rawADC = oldZero + (oldPressure × slope):
     float newZero = oldZero + (oldPressure * pressureSlope12bit);
     
-    // Sanity check: zero point should be a reasonable ADC value (200-1800 for 12-bit)
-    if (newZero < 200.0 || newZero > 1800.0) {
-        Serial.printf("[CAL] ERROR: Computed zero %.2f out of range (200-1800) — not applied\r\n", newZero);
+    // REV 10.9: Strict range validation — middle 20% of scale (factory default ±10%).
+    // Prevents calibrating under pressure: e.g., at -6 IWC → newZero ≈ 827 → REJECTED.
+    // Old range (200-1800) was too wide and accepted nearly any value including bad calibrations.
+    // New range (~868-1060) ensures the sensor must be near atmospheric (0.0 IWC) to calibrate.
+    if (newZero < CAL_RANGE_MIN || newZero > CAL_RANGE_MAX) {
+        Serial.printf("[CAL] REJECTED: new zero %.2f outside allowed range (%.0f-%.0f)\r\n",
+                      newZero, CAL_RANGE_MIN, CAL_RANGE_MAX);
+        Serial.printf("[CAL] Sensor may be under pressure — calibrate ONLY at ambient air\r\n");
+        Serial.printf("[CAL] Current reading: %.2f IWC (should be near 0.0 for calibration)\r\n", oldPressure);
         return;
     }
     
@@ -1856,6 +1932,7 @@ void adcReaderTask(void *parameter) {
                 ads.setGain(GAIN_TWO);   // ±2.048V range, 1mV/count — max expected ~580mV
                 int16_t rawDiff = ads.readADC_Differential_2_3();
                 ads.setGain(GAIN_ONE);   // Restore to ±4.096V for next pressure read
+                delayMicroseconds(100);  // REV 10.9: Allow PGA to settle after gain change (0.6% of 16ms cycle)
                 
                 int16_t absDiff = abs(rawDiff);
                 adcRawCurrent = absDiff;
@@ -2278,7 +2355,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.8</title>
+    <title>Walter IO Board - Rev 10.9</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -2362,7 +2439,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.8</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.9</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -2621,6 +2698,7 @@ const char* control_html = R"rawliteral(
             <div class="row"><span class="lbl">ADC Zero Point</span><span class="val" id="adcZeroP">--</span></div>
             <div class="row"><span class="lbl">ADC Initialized</span><span class="val" id="adcInit">--</span></div>
             <div class="row"><span class="lbl">ADC Errors</span><span class="val" id="adcErrors">0</span></div>
+            <div class="row"><span class="lbl">ADC Outliers Rejected</span><span class="val" id="adcOutliers">0</span></div>
         </div></div>
         <div class="card"><div class="card-title bg-green">Cellular Modem</div><div class="card-body">
             <div class="row"><span class="lbl">LTE Status</span><span class="val" id="lteStatus">--</span></div>
@@ -2906,7 +2984,7 @@ const char* control_html = R"rawliteral(
                         upd('deviceId',d.deviceName);upd('fault',d.fault||'0');
                         upd('adcRawP',d.adcRawPressure||'--');upd('adcRawC',d.adcRawCurrent||'--');
                         upd('adcZeroP',d.adcZeroPressure||'--');
-                        upd('adcInit',d.adcInitialized?'Yes':'No');upd('adcErrors',d.adcErrors||'0');
+                        upd('adcInit',d.adcInitialized?'Yes':'No');upd('adcErrors',d.adcErrors||'0');upd('adcOutliers',d.adcOutliers||'0');
                         var le=$('lteStatus');if(le)le.innerHTML=d.lteConnected?'<span style=color:#2e7d32>Connected</span>':'<span style=color:#c62828>Disconnected</span>';
                         upd('rsrp',(d.rsrp||'--')+' dBm');upd('rsrq',(d.rsrq||'--')+' dB');
                         upd('diagOperator',d.operator||'--');upd('band',d.band||'--');
@@ -3446,6 +3524,7 @@ void startConfigAP() {
         json += "\"adcZeroPressure\":" + String(adcZeroPressure, 2) + ",";
         json += "\"adcInitialized\":" + String(adcInitialized ? "true" : "false") + ",";
         json += "\"adcErrors\":" + String(adcTotalErrors) + ",";
+        json += "\"adcOutliers\":" + String(adcOutlierCount) + ",";
         // Alarm states for web display
         json += "\"alarmLowPress\":" + String((adcPressure < profileManager.getActiveProfile()->lowPressThreshold && currentRelayMode > 0) ? "true" : "false") + ",";
         json += "\"alarmHighPress\":" + String((adcPressure > profileManager.getActiveProfile()->highPressThreshold && currentRelayMode > 0) ? "true" : "false") + ",";
@@ -5529,7 +5608,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.8                 ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.9                 ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -5709,7 +5788,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.8 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.9 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());

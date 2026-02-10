@@ -1,6 +1,6 @@
 # Walter IO Board Firmware
 
-**Version:** Rev 10.8  
+**Version:** Rev 10.9  
 **Date:** February 10, 2026  
 **Authors:** Todd Adams & Doug Harty
 
@@ -285,7 +285,8 @@ These codes are **added** to any existing fault codes from the Linux device.
 
 | Version | Date | Description |
 |---------|------|-------------|
-| **Rev 10.8** | **2/10/2026** | **Mode confirmation: 15-second relay state refresh re-applies currentRelayMode to GPIO pins. Fast sensor packet extended with failsafe and shutdown fields. Three-layer mode delivery redundancy (immediate + 15s payload + relay refresh). Zero Python changes required.** |
+| **Rev 10.9** | **2/10/2026** | **Calibration safety: restricted to middle 20% of ADC scale (factory default +/-10%). EEPROM load validates stored value, rejects bad calibrations on boot. ADC outlier rejection eliminates 1.0 IWC oscillation from electrical noise. PGA settling delay after gain switch.** |
+| Rev 10.8 | 2/10/2026 | Mode confirmation: 15-second relay state refresh re-applies currentRelayMode to GPIO pins. Fast sensor packet extended with failsafe and shutdown fields. Three-layer mode delivery redundancy (immediate + 15s payload + relay refresh). Zero Python changes required. |
 | Rev 10.7 | 2/9/2026 | Pressure sensor calibration via serial or web portal. Instant non-blocking zero point adjustment using existing 60-sample rolling average. EEPROM persistence. ESP32 sends ps_cal result to Linux for database save. New "type":"cmd" message type. |
 | Rev 10.6 | 2/9/2026 | Fixed pressure sign (vacuum now negative). Fixed current stuck at 0A (hardware differential mode). Added `{"mode":"normal"}` to clear 72-hour shutdown without reboot. |
 | Rev 10.5 | 2/9/2026 | Sensor data now sent at 5Hz (was 1Hz). Cellular/datetime sent only on fresh modem data (was every 15s). |
