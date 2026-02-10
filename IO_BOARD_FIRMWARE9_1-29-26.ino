@@ -13,7 +13,21 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *  
- *  Rev 10.9 (2/10/2026) - Calibration Safety + ADC Stability + Serial Packet Split
+ *  Rev 10.9 (2/10/2026) - Debug Mode + Cellular Identity + Packet Split + Cal Safety
+ *  - NEW: Serial Monitor debug mode (default OFF — quiet output)
+ *    * When OFF: only essential messages (boot, errors, mode changes, watchdog, calibration)
+ *    * When ON: verbose output (FAST-TX 5Hz, RS232-TX CELL, RS232-TX TIME, RELAY-REFRESH,
+ *      cell refresh, SD writes) — useful for serial timing verification
+ *    * Toggle via Web Config Portal (/setdebug?enabled=1&pwd=...) with password protection
+ *    * Saved to EEPROM — persists across reboots
+ *    * Global flag: serialDebugMode (bool)
+ *  - NEW: IMEI, IMSI, ICCID, Technology added to cellular status JSON (10s timer)
+ *    * imei: modem hardware identity (queried once at boot from getIdentity)
+ *    * imsi: SIM subscriber identity (queried once at boot from getSIMCardIMSI)
+ *    * iccid: SIM card ID (queried once at boot from getSIMCardID)
+ *    * technology: Radio Access Technology (queried once at boot from getRAT)
+ *    * Python parser ignores unknown fields — zero Python changes required
+ *  - NEW: Boot display shows IMSI, ICCID, RAT alongside IMEI and MAC
  *  - CHANGED: Cellular status packet now sent every 10 seconds on TIMER
  *    * Previously: only sent when modemDataFresh was true (freshness-gated)
  *    * Problem: if modem queries fail silently, Linux device got NO cellular data
@@ -681,6 +695,13 @@ SemaphoreHandle_t relayMutex = NULL;
 // Current mode tracking (read-only from web dashboard, set by I2C master)
 RunMode current_mode = IDLE_MODE;
 
+// REV 10.9: Serial Monitor debug mode
+// When OFF (default): only essential messages print to USB Serial Monitor
+//   (boot, errors, mode changes, watchdog events, calibration)
+// When ON: verbose messages print (FAST-TX 5Hz, SD card writes, cell refresh, relay refresh)
+// Toggled via Web Config Portal with password. Saved to EEPROM.
+bool serialDebugMode = false;                    // Debug mode for Serial Monitor output (default: OFF)
+
 // Serial watchdog variables
 bool watchdogEnabled = true;                     // Watchdog feature enable/disable flag (default: enabled)
 unsigned long lastSerialDataTime = 0;            // Timestamp of last received serial data
@@ -787,6 +808,9 @@ uint32_t modemTAC = 0;            // Cell ID - unique identifier of the serving 
 bool modemDataFresh = false;      // Set true when refreshCellSignalInfo() gets new cell data
 bool modemTimeFresh = false;      // Set true when modem clock is freshly queried
 String imei = "";
+String modemIMSI = "";                           // REV 10.9: SIM card IMSI (International Mobile Subscriber Identity)
+String modemICCID = "";                          // REV 10.9: SIM card ICCID (Integrated Circuit Card ID)
+String modemTechnology = "";                     // REV 10.9: Radio Access Technology ("LTE-M", "NB-IoT", "Auto", "Unknown")
 String macStr = "";
 int64_t currentTimestamp = 0;
 uint32_t lastMillis = 0;
@@ -2716,6 +2740,14 @@ const char* control_html = R"rawliteral(
                 </label>
             </div>
             <div style="font-size:0.75em;color:#999;padding:2px 0 8px">Pulses GPIO39 if no serial data for 30 min</div>
+            <div class="cfg-row" style="padding:6px 0;display:flex;gap:6px;align-items:center">
+                <span class="lbl">Serial Debug:</span>
+                <label style="display:flex;align-items:center;cursor:pointer">
+                    <input type="checkbox" id="dbgToggle" onchange="setDebugMode(this.checked)" style="width:20px;height:20px;margin-right:6px">
+                    <span id="dbgLabel" style="font-weight:600;font-size:0.85em">--</span>
+                </label>
+            </div>
+            <div style="font-size:0.75em;color:#999;padding:2px 0 8px">Verbose Serial Monitor output (FAST-TX, cell refresh, relay refresh)</div>
         </div></div>
     </div><!-- end scr-config -->
 
@@ -2940,6 +2972,17 @@ const char* control_html = R"rawliteral(
             };
             x.send();
         };
+        window.setDebugMode=function(on){
+            var p=$('cfgPwd').value;
+            if(!p){alert('Password required');$('dbgToggle').checked=!on;return;}
+            var x=new XMLHttpRequest();
+            x.open('GET','http://'+IP+'/setdebug?enabled='+(on?'1':'0')+'&pwd='+encodeURIComponent(p),true);
+            x.onload=function(){
+                if(x.status===403){alert('Wrong password');$('dbgToggle').checked=!on;}
+                else{$('dbgLabel').textContent=on?'ON':'OFF';$('dbgLabel').style.color=on?'#e65100':'#999';}
+            };
+            x.send();
+        };
         window.showPtModal=function(){$('ptModal').style.display='flex';};
         window.closePtModal=function(){$('ptModal').style.display='none';};
         window.confirmPassthrough=function(){
@@ -3031,6 +3074,7 @@ const char* control_html = R"rawliteral(
                         var od=$('overfillDebug');if(od)od.innerHTML='Pin='+(d.gpio38Raw?'HIGH':'LOW')+' L:'+d.overfillLowCnt+' H:'+d.overfillHighCnt;
                         upd('watchdog',d.watchdogEnabled?'Enabled':'Disabled');
                         var wt=$('wdToggle'),wl=$('wdLabel');if(wt)wt.checked=d.watchdogEnabled;if(wl){wl.textContent=d.watchdogEnabled?'ENABLED':'DISABLED';wl.style.color=d.watchdogEnabled?'#2e7d32':'#999';}
+                        var dt=$('dbgToggle'),dl=$('dbgLabel');if(dt)dt.checked=d.serialDebugMode;if(dl){dl.textContent=d.serialDebugMode?'ON':'OFF';dl.style.color=d.serialDebugMode?'#e65100':'#999';}
                         upd('uptime',d.uptime);upd('mac',d.macAddress);
                     }catch(e){errs++;if(errs>=3)conn(false);}
                 }else{errs++;if(errs>=3)conn(false);}
@@ -3415,6 +3459,39 @@ void startConfigAP() {
         request->send(200, "text/plain", watchdogEnabled ? "Watchdog ENABLED" : "Watchdog DISABLED");
     });
     
+    // REV 10.9: Set serial debug mode endpoint
+    // Usage: GET /setdebug?enabled=1&pwd=1793 (enable verbose Serial Monitor output)
+    //        GET /setdebug?enabled=0&pwd=1793 (disable — quiet mode, default)
+    // Requires CONFIG_PASSWORD. Saved to EEPROM.
+    // When ON: FAST-TX (5Hz), cellular refresh, relay refresh print to Serial Monitor
+    // When OFF: Only essential messages (boot, errors, mode changes, watchdog events)
+    server.on("/setdebug", HTTP_GET, [](AsyncWebServerRequest *request){
+        if (!request->hasParam("enabled")) {
+            request->send(400, "text/plain", "Missing parameter: enabled");
+            return;
+        }
+        
+        if (!request->hasParam("pwd") || request->getParam("pwd")->value() != CONFIG_PASSWORD) {
+            Serial.println("[Web] Debug mode change DENIED - wrong or missing password");
+            request->send(403, "text/plain", "Invalid password");
+            return;
+        }
+        
+        int enabledVal = request->getParam("enabled")->value().toInt();
+        serialDebugMode = (enabledVal == 1);
+        
+        // Save to preferences/EPROM
+        preferences.begin("RMS", false);
+        preferences.putBool("debugMode", serialDebugMode);
+        preferences.end();
+        
+        Serial.print("Serial debug mode changed: ");
+        Serial.println(serialDebugMode ? "ON (verbose)" : "OFF (quiet)");
+        Serial.println("✓ Debug mode saved to EPROM (password verified)");
+        
+        request->send(200, "text/plain", serialDebugMode ? "Debug ON" : "Debug OFF");
+    });
+    
     // Set passthrough mode endpoint
     // Usage: GET /setpassthrough?enabled=1 (enter passthrough mode)
     // Uses preference-based boot: sets flag, restarts, runs minimal passthrough
@@ -3569,6 +3646,7 @@ void startConfigAP() {
         json += "\"alarmHighCurrent\":" + String((adcCurrent > HIGH_CURRENT_THRESHOLD) ? "true" : "false") + ",";
         json += "\"watchdogTriggered\":" + String(watchdogTriggered ? "true" : "false") + ",";
         json += "\"watchdogEnabled\":" + String(watchdogEnabled ? "true" : "false") + ",";
+        json += "\"serialDebugMode\":" + String(serialDebugMode ? "true" : "false") + ",";
         // Test state for web portal timer display
         json += "\"testRunning\":" + String(testRunning ? "true" : "false") + ",";
         json += "\"testType\":\"" + activeTestType + "\",";
@@ -4024,12 +4102,15 @@ bool isSDCardOK() {
  * Packet format (sent every 10s on Serial1 to Linux):
  *   {"passthrough":0,"lte":1,"rsrp":"-87.2","rsrq":"-10.8",
  *    "operator":"AT&T","band":"17","mcc":310,"mnc":410,
- *    "cellId":20878097,"tac":10519,"profile":"CS8"}
+ *    "cellId":20878097,"tac":10519,"profile":"CS8",
+ *    "imei":"351234567890123","imsi":"310410123456789",
+ *    "iccid":"8901260882310000000","technology":"LTE-M"}
  *
  * Usage example:
  *   sendCellularStatusToSerial();  // Called every 10 seconds from loop()
  *
  * REV_HISTORY: Previously sendStatusToSerial() -- renamed and split in Rev 10.9
+ *              Rev 10.9: Added imei, imsi, iccid, technology fields
  */
 void sendCellularStatusToSerial() {
     // Check LTE connection status
@@ -4045,13 +4126,17 @@ void sendCellularStatusToSerial() {
     // REV 10.9: Cellular-only JSON -- no datetime, no failsafe.
     // datetime: sent separately via sendDateTimeToSerial() only when fresh.
     // failsafe: already in the 5Hz fast sensor packet (Rev 10.8).
-    char jsonBuffer[384];
+    // REV 10.9: Added imei, imsi, iccid, technology for Linux device identification.
+    // These are static values queried once at boot -- they don't change at runtime.
+    char jsonBuffer[512];
     snprintf(jsonBuffer, sizeof(jsonBuffer),
              "{\"passthrough\":%d,"
              "\"lte\":%d,\"rsrp\":\"%s\",\"rsrq\":\"%s\","
              "\"operator\":\"%s\",\"band\":\"%s\","
              "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u,\"tac\":%u,"
-             "\"profile\":\"%s\"}",
+             "\"profile\":\"%s\","
+             "\"imei\":\"%s\",\"imsi\":\"%s\","
+             "\"iccid\":\"%s\",\"technology\":\"%s\"}",
              passthroughValue,
              lteStatus,
              rsrpStr.c_str(),
@@ -4059,14 +4144,20 @@ void sendCellularStatusToSerial() {
              operatorStr.c_str(),
              bandStr.c_str(),
              modemCC, modemNC, modemCID, modemTAC,
-             profileManager.getActiveProfileName().c_str());
+             profileManager.getActiveProfileName().c_str(),
+             imei.c_str(),
+             modemIMSI.length() > 0 ? modemIMSI.c_str() : "--",
+             modemICCID.length() > 0 ? modemICCID.c_str() : "--",
+             modemTechnology.length() > 0 ? modemTechnology.c_str() : "--");
     
     // Send to Python device via Serial1 (RS-232)
     Serial1.println(jsonBuffer);
     
-    // Debug output to Serial Monitor
-    Serial.print("[RS232-TX CELL @10s] ");
-    Serial.println(jsonBuffer);
+    // Debug output to Serial Monitor (verbose — only when debug mode ON)
+    if (serialDebugMode) {
+        Serial.print("[RS232-TX CELL @10s] ");
+        Serial.println(jsonBuffer);
+    }
 }
 
 /**
@@ -4099,9 +4190,11 @@ void sendDateTimeToSerial() {
     
     Serial1.println(jsonBuffer);
     
-    // Debug output to Serial Monitor
-    Serial.print("[RS232-TX TIME FRESH] ");
-    Serial.println(jsonBuffer);
+    // Debug output to Serial Monitor (verbose — only when debug mode ON)
+    if (serialDebugMode) {
+        Serial.print("[RS232-TX TIME FRESH] ");
+        Serial.println(jsonBuffer);
+    }
 }
 
 /**
@@ -4151,10 +4244,13 @@ void sendFastSensorPacket() {
     
     // Debug log to USB Serial Monitor — shows timestamp (ms) so you can verify 5Hz rate
     // Expect ~200ms between each line. Look for consistent spacing in the millis() values.
-    Serial.printf("[FAST-TX @%lums] P=%.2f C=%.2f OV=%d SD=%s M=%d FS=%d SD=%d\r\n",
-                  millis(), adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
-                  isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
-                  failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1);
+    // REV 10.9: Only prints when debug mode ON — this fires 5x/second and floods the monitor
+    if (serialDebugMode) {
+        Serial.printf("[FAST-TX @%lums] P=%.2f C=%.2f OV=%d SD=%s M=%d FS=%d SD=%d\r\n",
+                      millis(), adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
+                      isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
+                      failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1);
+    }
 }
 
 /**
@@ -4958,10 +5054,11 @@ bool lteConnect() {
         // REV 10.5: Mark modem data as fresh for serial status output
         modemDataFresh = true;
  
-        Serial.printf("[CELL] Band=%s, Op=%s, RSRP=%s, RSRQ=%s, MCC=%u, MNC=%02u, CID=%u, TAC=%u\r\n",
+        if (serialDebugMode) {
+            Serial.printf("[CELL] Band=%s, Op=%s, RSRP=%s, RSRQ=%s, MCC=%u, MNC=%02u, CID=%u, TAC=%u\r\n",
                       modemBand.c_str(), modemNetName.c_str(), modemRSRP.c_str(), modemRSRQ.c_str(),
                       modemCC, modemNC, modemCID, modemTAC);
-    }
+        }
     
     Serial.println("LTE connection established successfully");
     return true;
@@ -5190,7 +5287,9 @@ void refreshCellSignalInfo() {
         // The cached values (modemRSRP, modemBand, etc.) updated above will be
         // included in the next sendCellularStatusToSerial() call automatically.
         modemDataFresh = true;
-        Serial.println("[CELL] Fresh cell info retrieved -- cached for next 10s send cycle");
+        if (serialDebugMode) {
+            Serial.println("[CELL] Fresh cell info retrieved -- cached for next 10s send cycle");
+        }
     }
     // On failure, keep previous values rather than overwriting with "Unknown"
     // This prevents dashboard from flickering between real data and "Unknown"
@@ -5724,10 +5823,13 @@ void setup() {
     preferences.begin("RMS", false);
     DeviceName = preferences.getString("DeviceName", "CSX-9000");
     watchdogEnabled = preferences.getBool("watchdog", true);   // Default to ENABLED for safety
+    serialDebugMode = preferences.getBool("debugMode", false); // Default to OFF (quiet Serial Monitor)
     preferences.end();
     
     Serial.print("✓ Loaded watchdog setting from EPROM: ");
     Serial.println(watchdogEnabled ? "ENABLED" : "DISABLED");
+    Serial.print("✓ Loaded debug mode from EPROM: ");
+    Serial.println(serialDebugMode ? "ON (verbose)" : "OFF (quiet)");
     
     // Fixed send interval (Python sends every 15 seconds)
     sendInterval = 15000;  // 15 seconds in milliseconds
@@ -5842,8 +5944,45 @@ void setup() {
         Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     }
     
+    // REV 10.9: Retrieve modem identity (IMEI) and SIM card info (IMSI, ICCID)
+    // These are static values that don't change at runtime — queried once at boot.
     if (modem.getIdentity(&rsp)) {
         imei = rsp.data.identity.imei;
+    }
+    
+    // REV 10.9: Get SIM card ICCID (Integrated Circuit Card ID)
+    // Identifies the physical SIM card. Useful for carrier troubleshooting.
+    if (modem.getSIMCardID(&rsp)) {
+        modemICCID = rsp.data.simCardID.iccid;
+        Serial.print("✓ SIM ICCID: ");
+        Serial.println(modemICCID);
+    } else {
+        Serial.println("⚠️ Could not read SIM ICCID");
+    }
+    
+    // REV 10.9: Get SIM IMSI (International Mobile Subscriber Identity)
+    // Identifies the subscriber on the carrier network.
+    if (modem.getSIMCardIMSI(&rsp)) {
+        modemIMSI = rsp.data.imsi;
+        Serial.print("✓ SIM IMSI: ");
+        Serial.println(modemIMSI);
+    } else {
+        Serial.println("⚠️ Could not read SIM IMSI");
+    }
+    
+    // REV 10.9: Get Radio Access Technology (LTE-M, NB-IoT, Auto)
+    if (modem.getRAT(&rsp)) {
+        switch (rsp.data.rat) {
+            case WALTER_MODEM_RAT_LTEM:    modemTechnology = "LTE-M";   break;
+            case WALTER_MODEM_RAT_NBIOT:   modemTechnology = "NB-IoT";  break;
+            case WALTER_MODEM_RAT_AUTO:    modemTechnology = "Auto";    break;
+            default:                       modemTechnology = "Unknown"; break;
+        }
+        Serial.print("✓ RAT: ");
+        Serial.println(modemTechnology);
+    } else {
+        modemTechnology = "Unknown";
+        Serial.println("⚠️ Could not read RAT");
     }
     
     // Read MAC address AFTER BlueCherry init (matching original code structure)
@@ -5865,6 +6004,18 @@ void setup() {
     Serial.print("║  IMEI: ");
     Serial.print(imei);
     for (int i = imei.length(); i < 47; i++) Serial.print(" ");
+    Serial.println("║");
+    Serial.print("║  IMSI: ");
+    Serial.print(modemIMSI.length() > 0 ? modemIMSI : "--");
+    for (int i = (modemIMSI.length() > 0 ? modemIMSI.length() : 2); i < 47; i++) Serial.print(" ");
+    Serial.println("║");
+    Serial.print("║  ICCID:");
+    Serial.print(modemICCID.length() > 0 ? modemICCID : "--");
+    for (int i = (modemICCID.length() > 0 ? modemICCID.length() : 2); i < 47; i++) Serial.print(" ");
+    Serial.println("║");
+    Serial.print("║  RAT:  ");
+    Serial.print(modemTechnology.length() > 0 ? modemTechnology : "--");
+    for (int i = (modemTechnology.length() > 0 ? modemTechnology.length() : 2); i < 47; i++) Serial.print(" ");
     Serial.println("║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -6060,8 +6211,10 @@ void loop() {
     if (!failsafeMode && !passthroughMode &&
         (currentTime - lastRelayRefreshTime >= RELAY_REFRESH_INTERVAL)) {
         setRelaysForMode(currentRelayMode);
-        Serial.printf("[RELAY-REFRESH] Re-applied mode %d to relay pins (every %lus)\r\n",
-                      currentRelayMode, RELAY_REFRESH_INTERVAL / 1000);
+        if (serialDebugMode) {
+            Serial.printf("[RELAY-REFRESH] Re-applied mode %d to relay pins (every %lus)\r\n",
+                          currentRelayMode, RELAY_REFRESH_INTERVAL / 1000);
+        }
         lastRelayRefreshTime = currentTime;
     }
     

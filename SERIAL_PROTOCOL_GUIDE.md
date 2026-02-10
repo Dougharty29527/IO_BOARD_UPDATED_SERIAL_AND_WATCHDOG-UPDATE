@@ -105,7 +105,7 @@ Sent every 10 seconds using cached values from the last successful modem query. 
 - `failsafe` is already included in the 5Hz fast sensor packet (Rev 10.8)
 
 ```json
-{"passthrough":0,"lte":1,"rsrp":"-85.5","rsrq":"-10.2","operator":"T-Mobile","band":"B2","mcc":310,"mnc":260,"cellId":12345678,"tac":9876,"profile":"CS8"}
+{"passthrough":0,"lte":1,"rsrp":"-85.5","rsrq":"-10.2","operator":"T-Mobile","band":"B2","mcc":310,"mnc":260,"cellId":12345678,"tac":9876,"profile":"CS8","imei":"351234567890123","imsi":"310410123456789","iccid":"8901260882310000000","technology":"LTE-M"}
 ```
 
 | Field | Type | Description |
@@ -121,6 +121,10 @@ Sent every 10 seconds using cached values from the last successful modem query. 
 | `cellId` | int | Cell Tower ID |
 | `tac` | int | Tracking Area Code |
 | `profile` | string | Active equipment profile on ESP32 (e.g., `"CS8"`, `"CS9"`, `"CS12"`) |
+| `imei` | string | **Rev 10.9.** Modem IMEI (15-digit hardware identity). Queried once at boot. |
+| `imsi` | string | **Rev 10.9.** SIM IMSI (International Mobile Subscriber Identity). `"--"` if unavailable. |
+| `iccid` | string | **Rev 10.9.** SIM ICCID (Integrated Circuit Card ID). `"--"` if unavailable. |
+| `technology` | string | **Rev 10.9.** Radio Access Technology: `"LTE-M"`, `"NB-IoT"`, `"Auto"`, or `"Unknown"`. |
 
 **Why 10-second timer:** Guarantees the Linux device always has cellular info, even during modem communication failures. Uses cached values from the last successful query — stale but useful beats missing entirely.
 

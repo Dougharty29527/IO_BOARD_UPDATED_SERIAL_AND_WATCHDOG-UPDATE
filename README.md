@@ -155,11 +155,15 @@ Sent at 5Hz (every 200ms). This is the **critical** data path. The Linux control
   "operator": "T-Mobile",
   "band": "12",
   "mcc": 310, "mnc": 260, "cellId": 12345, "tac": 678,
-  "profile": "CS2"
+  "profile": "CS2",
+  "imei": "351234567890123",
+  "imsi": "310410123456789",
+  "iccid": "8901260882310000000",
+  "technology": "LTE-M"
 }
 ```
 
-**Rev 10.9: Sent on a 10-second timer** using cached values from the last successful modem query. Previously this was freshness-gated (only sent when modem returned new data), which meant the Linux device received nothing if modem queries failed silently. `datetime` and `failsafe` removed — datetime is sent separately only when fresh; failsafe is already in the 5Hz fast sensor packet.
+**Rev 10.9: Sent on a 10-second timer** using cached values from the last successful modem query. Previously this was freshness-gated (only sent when modem returned new data), which meant the Linux device received nothing if modem queries failed silently. `datetime` and `failsafe` removed — datetime is sent separately only when fresh; failsafe is already in the 5Hz fast sensor packet. Rev 10.9 also added `imei`, `imsi`, `iccid`, and `technology` fields (static values queried once at boot).
 
 ### Datetime Packet (ESP32 → Linux, only when fresh from modem)
 
@@ -291,7 +295,7 @@ These codes are **added** to any existing fault codes from the Linux device.
 
 | Version | Date | Description |
 |---------|------|-------------|
-| **Rev 10.9** | **2/10/2026** | **Cellular packet now 10-second timer (was freshness-gated). Datetime split into own packet (fresh only). Failsafe removed from cellular (already in 5Hz). Calibration safety: restricted to middle 20% of ADC scale. EEPROM validates on boot. ADC outlier rejection. PGA settling delay.** |
+| **Rev 10.9** | **2/10/2026** | **Serial debug mode (toggle via web portal, EEPROM-persisted). IMEI/IMSI/ICCID/Technology added to cellular JSON. Cellular packet now 10-second timer. Datetime split into own packet. Calibration safety: middle 20% ADC range. EEPROM validates on boot. ADC outlier rejection.** |
 | Rev 10.8 | 2/10/2026 | Mode confirmation: 15-second relay state refresh re-applies currentRelayMode to GPIO pins. Fast sensor packet extended with failsafe and shutdown fields. Three-layer mode delivery redundancy (immediate + 15s payload + relay refresh). Zero Python changes required. |
 | Rev 10.7 | 2/9/2026 | Pressure sensor calibration via serial or web portal. Instant non-blocking zero point adjustment using existing 60-sample rolling average. EEPROM persistence. ESP32 sends ps_cal result to Linux for database save. New "type":"cmd" message type. |
 | Rev 10.6 | 2/9/2026 | Fixed pressure sign (vacuum now negative). Fixed current stuck at 0A (hardware differential mode). Added `{"mode":"normal"}` to clear 72-hour shutdown without reboot. |
