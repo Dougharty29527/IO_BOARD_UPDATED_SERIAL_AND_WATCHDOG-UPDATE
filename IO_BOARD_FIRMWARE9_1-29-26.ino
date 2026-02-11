@@ -1,7 +1,7 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.10
- *  Date: 2/10/2026
+ *  Walter IO Board Firmware - Rev 10.11
+ *  Date: 2/11/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -13,6 +13,41 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *  
+ *  Rev 10.11 (2/11/2026) - ADC Stale Data Detection & DISP_SHUTDN GPIO Hold
+ *  - BUG FIX: FAST-TX packets sent stale pressure/current when ADC failed silently
+ *    * Previously: adcPressure and adcCurrent globals retained last good values forever
+ *    * If ADC reads failed (I2C errors, bus hang), Linux received unchanged data
+ *    * The sensor appeared to be working when it was actually not reading
+ *    * Issue manifested as "data retained same stale values" when pressure/current changed
+ *    * Often recovered silently after the ADC reinit cycle restored communication
+ *  - NEW: Stale data detection with 60-second timeout (ADC_STALE_TIMEOUT_MS)
+ *    * lastSuccessfulAdcRead tracks millis() of most recent valid pressure or current read
+ *    * adcDataStale flag goes TRUE when no good read for 60 continuous seconds
+ *    * When stale: FAST-TX sends pressure=-99.9 (ADC_FAULT_PRESSURE sentinel) and current=0.0
+ *    * Python should interpret -99.9 as "sensor fault — data unavailable"
+ *    * Loud !!!-bordered Serial Monitor alert printed ONCE when data goes stale
+ *    * ###-bordered recovery message printed when good reads resume
+ *    * Flag auto-clears on next successful read — no manual intervention needed
+ *  - NEW: Web dashboard /api/status includes adcDataStale and adcLastGoodMs fields
+ *    * adcDataStale: true/false — whether FAST-TX is sending fault values
+ *    * adcLastGoodMs: milliseconds since last successful ADC read (for diagnostics)
+ *  - NOTE: 60-second timeout chosen to allow for I2C bus recovery and reinit attempts
+ *    (reinit triggers at 10 consecutive errors at 60Hz = ~167ms, so 60s is very generous)
+ *  - NEW: DISP_SHUTDN (GPIO13 / RTC_GPIO13 / CR6) internal pull-up + GPIO hold
+ *    * Problem: during firmware updates or ESP.restart(), GPIO13 floated LOW for ~100-500ms
+ *      between chip reset and setup() execution, causing unwanted site shutdowns
+ *    * Solution: Three-layer protection per ESP-IDF GPIO docs for ESP32-S3:
+ *      1. gpio_hold_en() — latches pin state through SOFTWARE resets (ESP.restart, OTA)
+ *      2. gpio_deep_sleep_hold_en() — holds ALL digital GPIOs through DEEP SLEEP
+ *         (ESP-IDF: "For ESP32-S3, gpio_hold_en alone cannot hold digital GPIO
+ *          during Deep-sleep — call gpio_deep_sleep_hold_en additionally")
+ *      3. gpio_pullup_en() — internal ~45kΩ pull-up as backup for full power-on resets
+ *    * initializeDispShutdownPinWithHold() runs as FIRST GPIO init in setup()
+ *    * All DISP_SHUTDN writes now use writeDispShutdownPinWithHold() which
+ *      temporarily disables hold, writes the pin, then re-enables hold
+ *    * Includes driver/gpio.h for ESP-IDF gpio_hold_en/dis, gpio_pullup_en
+ *    * Ref: https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html
+ *
  *  Rev 10.10 (2/10/2026) - ADC I2C Error Diagnostics
  *  - NEW: Loud, obnoxious Serial Monitor error logging for ALL ADC read failures
  *    * Pressure CH0: detects negative or >=2048 raw values (invalid for single-ended)
@@ -454,7 +489,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.10"
+#define VERSION "Rev 10.11"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -463,6 +498,8 @@ String ver = VERSION;
 
 // ### Libraries ###
 #include <esp_mac.h>
+#include "driver/gpio.h"             // ESP-IDF GPIO driver for gpio_hold_en/dis, gpio_pullup_en
+                                      // Used to latch DISP_SHUTDN HIGH through reboots & OTA updates
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <ESPAsyncDNSServer.h>
@@ -555,6 +592,16 @@ volatile uint32_t adcErrorCount = 0;    // Consecutive read errors (resets on su
 volatile uint32_t adcTotalErrors = 0;   // Total lifetime read errors (diagnostics)
 volatile uint32_t adcOutlierCount = 0;  // REV 10.9: Pressure samples rejected by outlier filter (diagnostics)
 volatile bool adcInitialized = false;   // True once ADS1015 responds successfully
+
+// REV 10.10: ADC freshness tracking — detect stale data from continuous read failures.
+// lastSuccessfulAdcRead is updated every time a valid pressure or current value is read.
+// If no successful read occurs for ADC_STALE_TIMEOUT_MS (60 seconds), sendFastSensorPacket()
+// sends -99.9 for pressure and 0.0 for current to signal a sensor fault to the Linux device.
+// The Python program should interpret -99.9 as "ADC sensor fault — data unavailable."
+volatile unsigned long lastSuccessfulAdcRead = 0;    // millis() of last good ADC read (either channel)
+const unsigned long ADC_STALE_TIMEOUT_MS = 60000;    // 60 seconds — data considered stale after this
+const float ADC_FAULT_PRESSURE = -99.9;              // Sentinel value: "pressure sensor fault"
+volatile bool adcDataStale = false;                   // True when no good read for > 60 seconds
 
 // ADC calibration constants (matched to Python pressure_sensor.py two-point formula)
 // Calibration data: ADC 4080 = -31.35 IWC, ADC 26496 = +30.0 IWC (16-bit ADS1115)
@@ -735,6 +782,18 @@ const unsigned long WATCHDOG_FIRST_PULSE = 1000; // First reboot attempt: 1 seco
 const unsigned long WATCHDOG_LONG_PULSE = 30000; // Subsequent attempts: 30 second pulse
 const int WATCHDOG_FAULT_CODE = 1024;            // Fault code to send when no serial data
 const int BLUECHERRY_FAULT_CODE = 4096;          // Fault code to send when BlueCherry is disconnected
+
+// REV 10.10: LTE connection check interval
+// Previously: lteConnected() was checked EVERY loop iteration. If the cellular modem
+// temporarily lost registration (normal tower handoff), lteConnect() was called immediately,
+// blocking the main loop for up to 5+ minutes (7s of delays + 300s registration timeout).
+// During this entire block, ZERO serial data was sent to Linux — no pressure, current, or
+// overfill updates. This caused the "serial stall after ~1 hour" bug.
+// Now: LTE is checked every 60 seconds. If it drops, serial data continues flowing while
+// reconnection is attempted on the next check cycle. No more ESP.restart() on failure.
+unsigned long lastLteCheckTime = 0;
+const unsigned long LTE_CHECK_INTERVAL = 60000;  // 60 seconds between LTE status checks
+int lteReconnectFailures = 0;                     // Track consecutive reconnect failures
 
 // BlueCherry connection tracking variables
 // Allows system to run without BlueCherry, but schedules weekly restart for OTA retry
@@ -1326,28 +1385,118 @@ void setRelaysForMode(uint8_t modeNum) {
         if (modeNum <= 3) current_mode = (RunMode)modeNum;
     }
     // DISP_SHUTDN is NOT changed here - managed separately via serial shutdown command
-    digitalWrite(DISP_SHUTDN, dispShutdownActive ? HIGH : LOW);
+    // REV 10.11: Use hold-aware write to maintain latch through reboots/OTA
+    writeDispShutdownPinWithHold(dispShutdownActive ? HIGH : LOW);
+}
+
+/**
+ * Write DISP_SHUTDN pin with GPIO hold — latches state through reboots & OTA.
+ * 
+ * REV 10.11: Uses ESP-IDF gpio_hold_en/dis to latch DISP_SHUTDN (GPIO13) state
+ * so it persists through software resets (ESP.restart(), OTA firmware updates).
+ * Without hold, GPIO13 floats during the ~100-500ms between chip reset and setup(),
+ * which can cause a momentary LOW and trigger an unwanted site shutdown.
+ * 
+ * Sequence: disable hold → write pin → re-enable hold
+ * The internal pull-up (~45kΩ) provides additional protection as a backup.
+ * 
+ * Usage example:
+ *   writeDispShutdownPinWithHold(HIGH);  // Set CR6 ON and latch it
+ *   writeDispShutdownPinWithHold(LOW);   // Set CR6 OFF (shutdown) and latch it
+ * 
+ * @param state HIGH (site normal) or LOW (site shutdown / 72-hour alarm)
+ */
+void writeDispShutdownPinWithHold(uint8_t state) {
+    gpio_hold_dis((gpio_num_t)DISP_SHUTDN);    // Release hold to allow pin change
+    digitalWrite(DISP_SHUTDN, state);            // Write the new state
+    gpio_hold_en((gpio_num_t)DISP_SHUTDN);      // Re-latch — persists through reboot/OTA
+}
+
+/**
+ * Initialize DISP_SHUTDN pin with internal pull-up and GPIO hold.
+ * 
+ * REV 10.11: Called FIRST in setup, before any other GPIO configuration.
+ * Ensures GPIO13 is driven HIGH and latched before anything else can glitch it.
+ * 
+ * The sequence matters:
+ *   1. Release any hold from previous boot (so we CAN reconfigure)
+ *   2. Set as OUTPUT and drive HIGH
+ *   3. Enable internal pull-up (backup for the brief window during next reset)
+ *   4. Disable pull-down (just in case)
+ *   5. Enable GPIO hold — latches the HIGH state through software resets
+ *   6. Enable deep sleep hold — latches ALL digital GPIOs through deep sleep
+ * 
+ * Three layers of protection (per ESP-IDF docs for ESP32-S3):
+ *   - gpio_hold_en():          holds pin state through SOFTWARE resets (ESP.restart, OTA)
+ *   - gpio_deep_sleep_hold_en(): holds ALL digital GPIOs through DEEP SLEEP
+ *     (ESP-IDF docs: "For ESP32/S2/C3/S3/C2, gpio_hold_en alone cannot hold
+ *      digital GPIO during Deep-sleep. Call gpio_deep_sleep_hold_en additionally.")
+ *   - gpio_pullup_en():        internal ~45kΩ pull-up as backup for full power-on resets
+ * 
+ * GPIO13 = RTC_GPIO13 on ESP32-S3, so it supports both digital and RTC hold domains.
+ * 
+ * Ref: https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html
+ * 
+ * Usage example:
+ *   initializeDispShutdownPinWithHold();  // Call once at top of setup()
+ */
+void initializeDispShutdownPinWithHold() {
+    // Step 1: Release hold from previous boot so we can reconfigure the pin
+    // Per ESP-IDF: "configure gpio to a known state BEFORE calling gpio_hold_dis"
+    // After software reset, the pin is still latched HIGH from previous hold.
+    // Releasing the hold lets us reconfigure, but won't glitch since we immediately re-drive.
+    gpio_hold_dis((gpio_num_t)DISP_SHUTDN);
+    
+    // Step 2: Configure as output and drive HIGH immediately
+    pinMode(DISP_SHUTDN, OUTPUT);
+    digitalWrite(DISP_SHUTDN, HIGH);
+    
+    // Step 3: Enable internal pull-up (~45kΩ) — backup for full power-on resets
+    // The pull-up keeps the pin HIGH during the brief window before setup() runs
+    // after a cold power-on (where hold state is lost)
+    gpio_pullup_en((gpio_num_t)DISP_SHUTDN);
+    gpio_pulldown_dis((gpio_num_t)DISP_SHUTDN);
+    
+    // Step 4: Enable GPIO hold — latches the current HIGH state
+    // Per ESP-IDF: "state is latched at that moment and will not change when the
+    // internal signal or the IO MUX/GPIO configuration is modified"
+    // This survives software resets (ESP.restart, OTA firmware updates)
+    gpio_hold_en((gpio_num_t)DISP_SHUTDN);
+    
+    // Step 5: Enable deep sleep hold for ALL digital GPIOs
+    // Per ESP-IDF: "For ESP32/S2/C3/S3/C2, gpio_hold_en cannot hold digital GPIO
+    // during Deep-sleep. Call gpio_deep_sleep_hold_en additionally."
+    // This is a global enable — it won't affect pins that don't have gpio_hold_en set.
+    // Belt-and-suspenders: covers deep sleep, light sleep, AND software resets.
+    gpio_deep_sleep_hold_en();
+    
+    Serial.println("[GPIO-HOLD] DISP_SHUTDN (GPIO13/RTC_GPIO13) initialized HIGH");
+    Serial.println("[GPIO-HOLD]   Internal pull-up: ENABLED (~45kΩ)");
+    Serial.println("[GPIO-HOLD]   gpio_hold_en: ENABLED (survives software resets & OTA)");
+    Serial.println("[GPIO-HOLD]   gpio_deep_sleep_hold_en: ENABLED (survives deep sleep)");
 }
 
 /**
  * Activate DISP_SHUTDN (site shutdown) - sets GPIO13 LOW.
  * Called ONLY when {"mode":"shutdown"} is received via serial.
  * This is the ONLY way to shut down the site in Rev 10.
+ * REV 10.11: Uses GPIO hold to latch the LOW state through reboots.
  */
 void activateDispShutdown() {
     dispShutdownActive = false;
-    digitalWrite(DISP_SHUTDN, LOW);
-    Serial.println("[SHUTDOWN] DISP_SHUTDN set LOW - site shutdown activated");
+    writeDispShutdownPinWithHold(LOW);
+    Serial.println("[SHUTDOWN] DISP_SHUTDN set LOW (with hold) - site shutdown activated");
 }
 
 /**
  * Deactivate DISP_SHUTDN (restore site) - sets GPIO13 HIGH.
  * Called when a non-shutdown mode is received after a shutdown.
+ * REV 10.11: Uses GPIO hold to latch the HIGH state through reboots.
  */
 void deactivateDispShutdown() {
     dispShutdownActive = true;
-    digitalWrite(DISP_SHUTDN, HIGH);
-    Serial.println("[SHUTDOWN] DISP_SHUTDN set HIGH - site restored");
+    writeDispShutdownPinWithHold(HIGH);
+    Serial.println("[SHUTDOWN] DISP_SHUTDN set HIGH (with hold) - site restored");
 }
 
 // =====================================================================
@@ -1856,8 +2005,9 @@ bool initializeADS1015() {
     
     // Initialize I2C as MASTER (not slave like Rev 9)
     Wire.begin(SDA_PIN, SCL_PIN);
-    Wire.setClock(100000);  // 100kHz I2C clock
-    
+    // Wire.setClock(100000);  // 100kHz I2C clock
+    Wire.setClock(400000);  // 400kHz I2C clock
+
     // Initialize ADS1015
     if (!ads.begin(ADS1015_ADDRESS, &Wire)) {
         return false;
@@ -1871,6 +2021,8 @@ bool initializeADS1015() {
     
     adcInitialized = true;
     adcErrorCount = 0;
+    lastSuccessfulAdcRead = millis();  // REV 10.10: Start freshness timer on init
+    adcDataStale = false;
     return true;
 }
 
@@ -1893,7 +2045,7 @@ void i2cBusRecovery() {
             digitalWrite(SCL_PIN, HIGH);
             delayMicroseconds(5);
             if (digitalRead(SDA_PIN) == HIGH) break;
-        }
+            }
         // Generate STOP condition
         pinMode(SDA_PIN, OUTPUT);
         digitalWrite(SDA_PIN, LOW);
@@ -1937,13 +2089,13 @@ void adcReaderTask(void *parameter) {
     pinMode(CR1, OUTPUT);
     pinMode(CR2, OUTPUT);
     pinMode(CR5, OUTPUT);
-    pinMode(DISP_SHUTDN, OUTPUT);
     
     digitalWrite(CR0_MOTOR, LOW);     // Motor OFF
     digitalWrite(CR1, LOW);           // Relay 1 OFF
     digitalWrite(CR2, LOW);           // Relay 2 OFF
     digitalWrite(CR5, LOW);           // Relay 5 OFF
-    digitalWrite(DISP_SHUTDN, HIGH);  // CRITICAL: DISP_SHUTDN ON (safety)
+    // REV 10.11: DISP_SHUTDN is initialized with hold in setup() via initializeDispShutdownPinWithHold()
+    // Do NOT reconfigure it here — the hold is already active and the pin is HIGH
     
     // STEP 3: Initialize ADS1015 I2C master
     bool adsOk = initializeADS1015();
@@ -1987,6 +2139,13 @@ void adcReaderTask(void *parameter) {
                     float pressureIWC = ((float)rawPressure - adcZeroPressure) / pressureSlope12bit;
                     adcPressure = addPressureSample(pressureIWC);
                     adcErrorCount = 0;  // Reset consecutive error count
+                    lastSuccessfulAdcRead = millis();  // REV 10.10: Mark data as fresh
+                    if (adcDataStale) {
+                        adcDataStale = false;
+                        Serial.println("####################################################################");
+                        Serial.println("## ADC DATA RECOVERED — fresh pressure data after stale period   ##");
+                        Serial.println("####################################################################");
+                    }
                 } else {
                     adcErrorCount++;
                     adcTotalErrors++;
@@ -2063,6 +2222,7 @@ void adcReaderTask(void *parameter) {
                     float currentAmps = mapFloat((float)absDiff, adcZeroCurrent, adcFullCurrent, currentRangeLow, currentRangeHigh);
                     if (currentAmps < 0) currentAmps = 0;  // Clamp below-threshold to 0
                     adcCurrent = addCurrentSample(currentAmps);
+                    lastSuccessfulAdcRead = millis();  // REV 10.10: Mark data as fresh
                     
                     // Track peak current for high-current detection
                     if (currentAmps > adcPeakCurrent) {
@@ -2506,7 +2666,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.10</title>
+    <title>Walter IO Board - Rev 10.11</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -2590,7 +2750,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.10</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.11</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -2646,7 +2806,7 @@ const char* control_html = R"rawliteral(
             <input type="password" id="maintPwd" maxlength="10" placeholder="Password" style="padding:10px 14px;border:1px solid #ccc;border-radius:6px;font-size:1em;width:140px;text-align:center">
             <div style="margin-top:12px">
                 <button class="btn" style="padding:10px 28px;background:#1565c0;color:#fff;border:none;border-radius:6px;font-weight:700" onclick="checkMaintPw()">Unlock</button>
-            </div>
+    </div>
             <p id="maintPwMsg" style="color:#c62828;font-size:0.85em;margin-top:8px"></p>
         </div>
         <!-- Maintenance menu (shown when unlocked) -->
@@ -2700,8 +2860,8 @@ const char* control_html = R"rawliteral(
         <div style="display:flex;gap:8px;margin:10px 0">
             <button class="btn" style="flex:1;padding:12px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('start_test','func')">Start</button>
             <button class="btn" style="flex:1;padding:12px;background:#c62828;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('stop_test')">Stop</button>
-        </div>
-    </div>
+            </div>
+            </div>
 
     <!-- ============ EFFICIENCY TEST SCREEN ============ -->
     <div class="screen" id="scr-eff">
@@ -2714,8 +2874,8 @@ const char* control_html = R"rawliteral(
         <div style="display:flex;gap:8px;margin:10px 0">
             <button class="btn" style="flex:1;padding:12px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('start_test','eff')">Start</button>
             <button class="btn" style="flex:1;padding:12px;background:#c62828;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('stop_test')">Stop</button>
-        </div>
-    </div>
+                </div>
+            </div>
 
     <!-- ============ CLEAN CANISTER SCREEN ============ -->
     <div class="screen" id="scr-clean">
@@ -3531,24 +3691,24 @@ void startConfigAP() {
             return;
         }
         
-        int enabledVal = request->getParam("enabled")->value().toInt();
-        watchdogEnabled = (enabledVal == 1);
-        
-        // Save to preferences/EPROM
-        preferences.begin("RMS", false);
-        preferences.putBool("watchdog", watchdogEnabled);
-        preferences.end();
-        
-        Serial.print("Watchdog setting changed: ");
-        Serial.println(watchdogEnabled ? "ENABLED" : "DISABLED");
+            int enabledVal = request->getParam("enabled")->value().toInt();
+            watchdogEnabled = (enabledVal == 1);
+            
+            // Save to preferences/EPROM
+            preferences.begin("RMS", false);
+            preferences.putBool("watchdog", watchdogEnabled);
+            preferences.end();
+            
+            Serial.print("Watchdog setting changed: ");
+            Serial.println(watchdogEnabled ? "ENABLED" : "DISABLED");
         Serial.println("✓ Watchdog setting saved to EPROM (password verified)");
-        
-        // Reset watchdog state when toggled
-        if (watchdogEnabled) {
-            resetSerialWatchdog();
-        }
-        
-        request->send(200, "text/plain", watchdogEnabled ? "Watchdog ENABLED" : "Watchdog DISABLED");
+            
+            // Reset watchdog state when toggled
+            if (watchdogEnabled) {
+                resetSerialWatchdog();
+            }
+            
+            request->send(200, "text/plain", watchdogEnabled ? "Watchdog ENABLED" : "Watchdog DISABLED");
     });
     
     // REV 10.9: Set serial debug mode endpoint
@@ -3626,33 +3786,33 @@ void startConfigAP() {
             return;
         }
         
-        String newName = request->getParam("name")->value();
-        
-        // Validate name (alphanumeric, dashes, 3-20 chars)
-        if (newName.length() < 3 || newName.length() > 20) {
-            request->send(400, "text/plain", "Name must be 3-20 characters");
-            return;
-        }
-        
-        // Update device name
-        DeviceName = newName;
-        strncpy(deviceName, newName.c_str(), sizeof(deviceName) - 1);
-        deviceName[sizeof(deviceName) - 1] = '\0';
-        
-        // Save to preferences/EPROM
-        preferences.begin("RMS", false);
-        preferences.putString("DeviceName", DeviceName);
-        preferences.putString("APSuffix", DeviceName);  // Also update AP suffix
-        preferences.end();
-        
-        // Update WiFi AP name
-        updateAPName(DeviceName, true);  // Restart AP with new name
-        apNameFromSerial = false;  // Mark as manually set
-        
-        Serial.println("[Web] Device name manually set to: " + DeviceName);
+            String newName = request->getParam("name")->value();
+            
+            // Validate name (alphanumeric, dashes, 3-20 chars)
+            if (newName.length() < 3 || newName.length() > 20) {
+                request->send(400, "text/plain", "Name must be 3-20 characters");
+                return;
+            }
+            
+            // Update device name
+            DeviceName = newName;
+            strncpy(deviceName, newName.c_str(), sizeof(deviceName) - 1);
+            deviceName[sizeof(deviceName) - 1] = '\0';
+            
+            // Save to preferences/EPROM
+            preferences.begin("RMS", false);
+            preferences.putString("DeviceName", DeviceName);
+            preferences.putString("APSuffix", DeviceName);  // Also update AP suffix
+            preferences.end();
+            
+            // Update WiFi AP name
+            updateAPName(DeviceName, true);  // Restart AP with new name
+            apNameFromSerial = false;  // Mark as manually set
+            
+            Serial.println("[Web] Device name manually set to: " + DeviceName);
         Serial.println("✓ Device name saved to EPROM (password verified)");
-        
-        request->send(200, "text/plain", "Device name set to: " + DeviceName + "\nWiFi AP updated to: " + String(apSSID));
+            
+            request->send(200, "text/plain", "Device name set to: " + DeviceName + "\nWiFi AP updated to: " + String(apSSID));
     });
     
     // API endpoint for AJAX status updates (returns JSON for diagnostic dashboard)
@@ -3678,80 +3838,108 @@ void startConfigAP() {
             snprintf(uptimeStr, sizeof(uptimeStr), "%luh %lum", hours, minutes);
         }
         
-        // Get signal quality strings (updated by refreshCellSignalInfo every 60s)
-        String rsrpStr = modemRSRP.length() > 0 ? modemRSRP : "--";
-        String rsrqStr = modemRSRQ.length() > 0 ? modemRSRQ : "--";
-        String operatorStr = modemNetName.length() > 0 ? modemNetName : "--";
-        String bandStr = modemBand.length() > 0 ? modemBand : "--";
+        // REV 10.10: Build JSON with snprintf into stack buffer — ZERO heap allocation.
+        // Previously used ~60+ String += operations, each causing heap reallocation.
+        // Over hours of web dashboard polling, this fragmented the heap and could
+        // contribute to memory exhaustion and stalls.
         
-        // Build JSON response with all status fields (Rev 10)
-        String json = "{";
-        // Serial data
-        json += "\"serialActive\":" + String(serialActive ? "true" : "false") + ",";
-        json += "\"deviceName\":\"" + DeviceName + "\",";
-        // ADC readings (from ADS1015, replaces Linux-sourced pressure/current)
-        json += "\"pressure\":\"" + String(adcPressure, 2) + "\",";
-        json += "\"current\":\"" + String(adcCurrent, 2) + "\",";
-        json += "\"mode\":" + String(currentRelayMode) + ",";
-        json += "\"cycles\":\"" + String(cycles) + "\",";
-        json += "\"fault\":\"" + String(faults + getCombinedFaultCode()) + "\",";
-        // Profile
-        json += "\"profile\":\"" + profileManager.getActiveProfileName() + "\",";
-        // Failsafe
-        json += "\"failsafe\":" + String(failsafeMode ? "true" : "false") + ",";
+        // Pre-compute alarm states (avoid complex expressions inside snprintf)
+        const ProfileConfig* activeProfile = profileManager.getActiveProfile();
+        bool alarmLowPress = (adcPressure < activeProfile->lowPressThreshold && currentRelayMode > 0);
+        bool alarmHighPress = (adcPressure > activeProfile->highPressThreshold && currentRelayMode > 0);
+        bool alarmZeroPress = (activeProfile->hasZeroPressAlarm && fabs(adcPressure) < 0.15 && currentRelayMode > 0);
+        bool alarmLowCurrent = (adcCurrent > 0 && adcCurrent < LOW_CURRENT_THRESHOLD && currentRelayMode > 0);
+        bool alarmHighCurrent = (adcCurrent > HIGH_CURRENT_THRESHOLD);
+        int combinedFault = faults + getCombinedFaultCode();
+        unsigned long testElapsedSec = testRunning ? (millis() - testStartTime) / 1000 : 0;
+        bool lteOk = lteConnected();
+        String dtStr = getDateTimeString();
+        String profName = profileManager.getActiveProfileName();
+        
+        // Safe string accessors (avoid sending null pointers to snprintf)
+        const char* rsrpC = modemRSRP.length() > 0 ? modemRSRP.c_str() : "--";
+        const char* rsrqC = modemRSRQ.length() > 0 ? modemRSRQ.c_str() : "--";
+        const char* operC = modemNetName.length() > 0 ? modemNetName.c_str() : "--";
+        const char* bandC = modemBand.length() > 0 ? modemBand.c_str() : "--";
+        
+        // Build JSON into stack-allocated buffer (no heap allocation)
+        static char json[2048];
+        int pos = 0;
+        
+        // Serial & device
+        pos += snprintf(json + pos, sizeof(json) - pos,
+            "{\"serialActive\":%s,\"deviceName\":\"%s\","
+            "\"pressure\":\"%.2f\",\"current\":\"%.2f\","
+            "\"mode\":%d,\"cycles\":\"%d\",\"fault\":\"%d\","
+            "\"profile\":\"%s\",\"failsafe\":%s,",
+            serialActive ? "true" : "false", DeviceName.c_str(),
+            adcPressure, adcCurrent,
+            currentRelayMode, cycles, combinedFault,
+            profName.c_str(), failsafeMode ? "true" : "false");
+        
         // Cellular modem
-        json += "\"lteConnected\":" + String(lteConnected() ? "true" : "false") + ",";
-        json += "\"rsrp\":\"" + rsrpStr + "\",";
-        json += "\"rsrq\":\"" + rsrqStr + "\",";
-        json += "\"operator\":\"" + operatorStr + "\",";
-        json += "\"band\":\"" + bandStr + "\",";
-        json += "\"mcc\":" + String(modemCC) + ",";
-        json += "\"mnc\":" + String(modemNC) + ",";
-        json += "\"cellId\":" + String(modemCID) + ",";
-        json += "\"tac\":" + String(modemTAC) + ",";
-        json += "\"blueCherryConnected\":" + String(blueCherryConnected ? "true" : "false") + ",";
-        json += "\"modemStatus\":\"" + Modem_Status + "\",";
-        json += "\"imei\":\"" + imei + "\",";
+        pos += snprintf(json + pos, sizeof(json) - pos,
+            "\"lteConnected\":%s,\"rsrp\":\"%s\",\"rsrq\":\"%s\","
+            "\"operator\":\"%s\",\"band\":\"%s\","
+            "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u,\"tac\":%u,"
+            "\"blueCherryConnected\":%s,\"modemStatus\":\"%s\","
+            "\"imei\":\"%s\",",
+            lteOk ? "true" : "false", rsrpC, rsrqC,
+            operC, bandC,
+            modemCC, modemNC, modemCID, modemTAC,
+            blueCherryConnected ? "true" : "false", Modem_Status.c_str(),
+            imei.c_str());
+        
         // IO Board status
-        json += "\"version\":\"" + ver + "\",";
-        json += "\"temperature\":\"" + String(fahrenheit, 1) + "\",";
-        json += "\"sdCardOK\":" + String(isSDCardOK() ? "true" : "false") + ",";
-        // Overfill (direct GPIO38 read)
-        json += "\"overfillAlarm\":" + String(overfillAlarmActive ? "true" : "false") + ",";
-        json += "\"gpio38Raw\":" + String(digitalRead(ESP_OVERFILL)) + ",";
-        json += "\"overfillLowCnt\":" + String(overfillLowCount) + ",";
-        json += "\"overfillHighCnt\":" + String(overfillHighCount) + ",";
-        json += "\"overfillValidated\":" + String(overfillValidationComplete ? "true" : "false") + ",";
-        // ADC debug
-        json += "\"adcRawPressure\":" + String(adcRawPressure) + ",";
-        json += "\"adcRawCurrent\":" + String(adcRawCurrent) + ",";
-        json += "\"adcZeroPressure\":" + String(adcZeroPressure, 2) + ",";
-        json += "\"adcInitialized\":" + String(adcInitialized ? "true" : "false") + ",";
-        json += "\"adcErrors\":" + String(adcTotalErrors) + ",";
-        json += "\"adcOutliers\":" + String(adcOutlierCount) + ",";
-        // Alarm states for web display
-        json += "\"alarmLowPress\":" + String((adcPressure < profileManager.getActiveProfile()->lowPressThreshold && currentRelayMode > 0) ? "true" : "false") + ",";
-        json += "\"alarmHighPress\":" + String((adcPressure > profileManager.getActiveProfile()->highPressThreshold && currentRelayMode > 0) ? "true" : "false") + ",";
-        json += "\"alarmZeroPress\":" + String((profileManager.getActiveProfile()->hasZeroPressAlarm && fabs(adcPressure) < 0.15 && currentRelayMode > 0) ? "true" : "false") + ",";
-        json += "\"alarmVarPress\":false,";
-        json += "\"alarmLowCurrent\":" + String((adcCurrent > 0 && adcCurrent < LOW_CURRENT_THRESHOLD && currentRelayMode > 0) ? "true" : "false") + ",";
-        json += "\"alarmHighCurrent\":" + String((adcCurrent > HIGH_CURRENT_THRESHOLD) ? "true" : "false") + ",";
-        json += "\"watchdogTriggered\":" + String(watchdogTriggered ? "true" : "false") + ",";
-        json += "\"watchdogEnabled\":" + String(watchdogEnabled ? "true" : "false") + ",";
-        json += "\"serialDebugMode\":" + String(serialDebugMode ? "true" : "false") + ",";
-        // Test state for web portal timer display
-        json += "\"testRunning\":" + String(testRunning ? "true" : "false") + ",";
-        json += "\"testType\":\"" + activeTestType + "\",";
-        if (testRunning) {
-            json += "\"testElapsed\":" + String((millis() - testStartTime) / 1000) + ",";
-        } else {
-            json += "\"testElapsed\":0,";
-        }
-        // Datetime
-        json += "\"datetime\":\"" + getDateTimeString() + "\",";
-        json += "\"uptime\":\"" + String(uptimeStr) + "\",";
-        json += "\"macAddress\":\"" + macStr + "\"";
-        json += "}";
+        pos += snprintf(json + pos, sizeof(json) - pos,
+            "\"version\":\"%s\",\"temperature\":\"%.1f\","
+            "\"sdCardOK\":%s,"
+            "\"overfillAlarm\":%s,\"gpio38Raw\":%d,"
+            "\"overfillLowCnt\":%d,\"overfillHighCnt\":%d,"
+            "\"overfillValidated\":%s,",
+            ver.c_str(), fahrenheit,
+            isSDCardOK() ? "true" : "false",
+            overfillAlarmActive ? "true" : "false", digitalRead(ESP_OVERFILL),
+            (int)overfillLowCount, (int)overfillHighCount,
+            overfillValidationComplete ? "true" : "false");
+        
+        // ADC debug — REV 10.10: Added adcDataStale and adcLastGoodMs fields
+        // adcDataStale: true when no successful read for > 60 seconds (FAST-TX sends -99.9)
+        // adcLastGoodMs: milliseconds since last successful ADC read (0 if never read)
+        unsigned long adcLastGoodAgo = (lastSuccessfulAdcRead > 0) ? (millis() - lastSuccessfulAdcRead) : 0;
+        pos += snprintf(json + pos, sizeof(json) - pos,
+            "\"adcRawPressure\":%d,\"adcRawCurrent\":%d,"
+            "\"adcZeroPressure\":%.2f,\"adcInitialized\":%s,"
+            "\"adcErrors\":%lu,\"adcOutliers\":%lu,"
+            "\"adcDataStale\":%s,\"adcLastGoodMs\":%lu,",
+            (int)adcRawPressure, (int)adcRawCurrent,
+            adcZeroPressure, adcInitialized ? "true" : "false",
+            adcTotalErrors, adcOutlierCount,
+            adcDataStale ? "true" : "false", adcLastGoodAgo);
+        
+        // Alarms & watchdog & debug mode
+        pos += snprintf(json + pos, sizeof(json) - pos,
+            "\"alarmLowPress\":%s,\"alarmHighPress\":%s,"
+            "\"alarmZeroPress\":%s,\"alarmVarPress\":false,"
+            "\"alarmLowCurrent\":%s,\"alarmHighCurrent\":%s,"
+            "\"watchdogTriggered\":%s,\"watchdogEnabled\":%s,"
+            "\"serialDebugMode\":%s,",
+            alarmLowPress ? "true" : "false", alarmHighPress ? "true" : "false",
+            alarmZeroPress ? "true" : "false",
+            alarmLowCurrent ? "true" : "false", alarmHighCurrent ? "true" : "false",
+            watchdogTriggered ? "true" : "false", watchdogEnabled ? "true" : "false",
+            serialDebugMode ? "true" : "false");
+        
+        // Test state, datetime, uptime, mac
+        pos += snprintf(json + pos, sizeof(json) - pos,
+            "\"testRunning\":%s,\"testType\":\"%s\","
+            "\"testElapsed\":%lu,"
+            "\"datetime\":\"%s\",\"uptime\":\"%s\","
+            "\"macAddress\":\"%s\"}",
+            testRunning ? "true" : "false", activeTestType.c_str(),
+            testElapsedSec,
+            dtStr.c_str(), uptimeStr,
+            macStr.c_str());
         
         request->send(200, "application/json", json);
     });
@@ -4197,7 +4385,7 @@ bool isSDCardOK() {
  *    "cellId":20878097,"tac":10519,"profile":"CS8",
  *    "imei":"351234567890123","imsi":"310410123456789",
  *    "iccid":"8901260882310000000","technology":"LTE-M"}
- *
+ * 
  * Usage example:
  *   sendCellularStatusToSerial();  // Called every 10 seconds from loop()
  *
@@ -4248,7 +4436,7 @@ void sendCellularStatusToSerial() {
     // Debug output to Serial Monitor (verbose — only when debug mode ON)
     if (serialDebugMode) {
         Serial.print("[RS232-TX CELL @10s] ");
-        Serial.println(jsonBuffer);
+    Serial.println(jsonBuffer);
     }
 }
 
@@ -4314,22 +4502,50 @@ void sendFastSensorPacket() {
     // without needing a new message type. Python ignores unrecognized JSON fields,
     // so this is fully backward-compatible — zero Python parsing changes required.
     //
+    // REV 10.10: Stale data detection — if no successful ADC read for 60 seconds,
+    // send -99.9 for pressure and 0.0 for current to signal a sensor fault.
+    // The Linux program should interpret -99.9 as "ADC sensor fault — data unavailable."
+    // Previously, stale values from the last good read persisted indefinitely,
+    // making it look like the sensor was working when it wasn't.
+    //
     // Packet format (sent at 5Hz on Serial1 to Linux):
-    //   {"pressure":-1.23,"current":5.67,"overfill":0,"sdcard":"OK","relayMode":1,"failsafe":0,"shutdown":0}
+    //   Normal:  {"pressure":-1.23,"current":5.67,"overfill":0,"sdcard":"OK","relayMode":1,"failsafe":0,"shutdown":0}
+    //   Stale:   {"pressure":-99.90,"current":0.00,"overfill":0,"sdcard":"OK","relayMode":1,"failsafe":0,"shutdown":0}
     //
     // Fields:
-    //   pressure  - ESP32 ADC pressure in IWC (60Hz rolling average)
-    //   current   - ESP32 ADC motor current in amps (differential, peak-detect)
+    //   pressure  - ESP32 ADC pressure in IWC (60Hz rolling average), or -99.9 if stale
+    //   current   - ESP32 ADC motor current in amps (differential, peak-detect), or 0.0 if stale
     //   overfill  - 0=normal, 1=overfill alarm active (GPIO38 LOW)
     //   sdcard    - "OK" or "FAULT"
     //   relayMode - Current relay mode applied to GPIO pins (0-9)
     //   failsafe  - 0=normal serial-controlled, 1=ESP32 autonomous (Comfile down)
     //   shutdown  - 0=DISP_SHUTDN HIGH (normal), 1=DISP_SHUTDN LOW (72-hour shutdown)
+    
+    // Check if ADC data is stale (no successful read for ADC_STALE_TIMEOUT_MS)
+    float sendPressure = adcPressure;
+    float sendCurrent = adcCurrent;
+    
+    if (lastSuccessfulAdcRead > 0 && (millis() - lastSuccessfulAdcRead >= ADC_STALE_TIMEOUT_MS)) {
+        // ADC has been failing for > 60 seconds — send fault sentinel values
+        if (!adcDataStale) {
+            adcDataStale = true;
+            Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            Serial.println("!! ADC DATA STALE — no successful read for 60 seconds            !!");
+            Serial.printf("!!   Last good read: %lu ms ago  |  Total errors: %lu\r\n",
+                          millis() - lastSuccessfulAdcRead, adcTotalErrors);
+            Serial.println("!!   Sending pressure=-99.9 (FAULT) to Linux device               !!");
+            Serial.println("!!   ADC will auto-recover when I2C bus responds again             !!");
+            Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        }
+        sendPressure = ADC_FAULT_PRESSURE;  // -99.9 = sensor fault
+        sendCurrent = 0.0;                   // No valid current reading
+    }
+    
     char buf[160];
     snprintf(buf, sizeof(buf),
              "{\"pressure\":%.2f,\"current\":%.2f,\"overfill\":%d,\"sdcard\":\"%s\","
              "\"relayMode\":%d,\"failsafe\":%d,\"shutdown\":%d}",
-             adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
+             sendPressure, sendCurrent, overfillAlarmActive ? 1 : 0,
              isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
              failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1);
     Serial1.println(buf);
@@ -4338,10 +4554,11 @@ void sendFastSensorPacket() {
     // Expect ~200ms between each line. Look for consistent spacing in the millis() values.
     // REV 10.9: Only prints when debug mode ON — this fires 5x/second and floods the monitor
     if (serialDebugMode) {
-        Serial.printf("[FAST-TX @%lums] P=%.2f C=%.2f OV=%d SD=%s M=%d FS=%d SD=%d\r\n",
-                      millis(), adcPressure, adcCurrent, overfillAlarmActive ? 1 : 0,
+        Serial.printf("[FAST-TX @%lums] P=%.2f C=%.2f OV=%d SD=%s M=%d FS=%d SD=%d%s\r\n",
+                      millis(), sendPressure, sendCurrent, overfillAlarmActive ? 1 : 0,
                       isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
-                      failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1);
+                      failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1,
+                      adcDataStale ? " **STALE**" : "");
     }
 }
 
@@ -4652,16 +4869,16 @@ void readSerialData() {
                     String cmdType = getJsonValue(jsonBuffer.c_str(), "command");
                     
                     if (cmdType == "passthrough") {
-                        int timeoutIdx = jsonBuffer.indexOf("\"timeout\":");
+                    int timeoutIdx = jsonBuffer.indexOf("\"timeout\":");
                         unsigned long timeout = 60;
-                        if (timeoutIdx >= 0) {
-                            String timeoutStr = jsonBuffer.substring(timeoutIdx + 10);
-                            timeout = timeoutStr.toInt();
-                            if (timeout < 1) timeout = 60;
-                        }
+                    if (timeoutIdx >= 0) {
+                        String timeoutStr = jsonBuffer.substring(timeoutIdx + 10);
+                        timeout = timeoutStr.toInt();
+                        if (timeout < 1) timeout = 60;
+                    }
                         Serial.printf("[SERIAL] Passthrough command - %lu min\r\n", timeout);
-                        enterPassthroughMode(timeout);
-                        jsonBuffer = "";
+                    enterPassthroughMode(timeout);
+                    jsonBuffer = "";
                         return;
                     }
                     else if (cmdType == "set_profile") {
@@ -5069,11 +5286,18 @@ bool lteConnected() {
 bool lteConnect() {
     Serial.println("Starting LTE connection process...");
     
+    // REV 10.10: All delay() calls replaced with serial-sending delay loops.
+    // Previously, each delay() blocked the main loop completely — no serial data
+    // was sent to Linux during the entire LTE reconnection process (up to 5+ min).
+    // Now: checkAndSendStatusToSerial() is called every 200ms during each wait,
+    // so pressure, current, and overfill data keep flowing to the Linux device.
+    
     if (!modem.setOpState(WALTER_MODEM_OPSTATE_MINIMUM)) {
         Serial.println("Failed to set operational state to minimum");
         return false;
     }
-    delay(2000);
+    // 2000ms wait — send serial data during delay
+    for (int d = 0; d < 10; d++) { delay(200); checkAndSendStatusToSerial(); }
 	
     Serial.printf("Defining PDP context with APN: %s\n", CELLULAR_APN);
     if (!modem.definePDPContext(1, CELLULAR_APN)) {
@@ -5084,7 +5308,8 @@ bool lteConnect() {
         Serial.println("3. SIM card issues");
         return false;
     }
-    delay(1000);
+    // 1000ms wait — send serial data during delay
+    for (int d = 0; d < 5; d++) { delay(200); checkAndSendStatusToSerial(); }
     
     Serial.printf("Setting PDP authentication: Protocol=%d, User=%s\n", 
                   CELLULAR_AUTH_PROTOCOL, CELLULAR_USERNAME);
@@ -5092,25 +5317,29 @@ bool lteConnect() {
         Serial.println("Failed to set PDP authentication parameters");
         Serial.println("Note: Some providers don't require authentication");
     }
-    delay(1000);
+    // 1000ms wait — send serial data during delay
+    for (int d = 0; d < 5; d++) { delay(200); checkAndSendStatusToSerial(); }
     
     if (!modem.setOpState(WALTER_MODEM_OPSTATE_FULL)) {
         Serial.println("Failed to set operational state to full");
         return false;
     }
-    delay(2000);
+    // 2000ms wait — send serial data during delay
+    for (int d = 0; d < 10; d++) { delay(200); checkAndSendStatusToSerial(); }
 	
     if (!modem.setNetworkSelectionMode(WALTER_MODEM_NETWORK_SEL_MODE_AUTOMATIC)) {
         Serial.println("Failed to set network selection mode");
         return false;
     }
-    delay(1000);
+    // 1000ms wait — send serial data during delay
+    for (int d = 0; d < 5; d++) { delay(200); checkAndSendStatusToSerial(); }
     
     Serial.println("Waiting for network registration...");
     unsigned short timeout = 300, i = 0;
     while (!lteConnected() && i < timeout) {
         i++;
-        delay(1000);
+        // 1000ms wait — send serial data every 200ms during registration wait
+        for (int d = 0; d < 5; d++) { delay(200); checkAndSendStatusToSerial(); }
         if (i % 10 == 0) {
             Serial.printf("Still waiting for network registration... (%d/%d)\n", i, timeout);
         }
@@ -5142,15 +5371,15 @@ bool lteConnect() {
         modemNC = rsp.data.cellInformation.nc;                    // Network Code (e.g. 260)
         modemCID = rsp.data.cellInformation.cid;                  // Cell Tower ID
         modemTAC = rsp.data.cellInformation.tac;
-        
+ 
         // REV 10.5: Mark modem data as fresh for serial status output
         modemDataFresh = true;
  
         if (serialDebugMode) {
-            Serial.printf("[CELL] Band=%s, Op=%s, RSRP=%s, RSRQ=%s, MCC=%u, MNC=%02u, CID=%u, TAC=%u\r\n",
+        Serial.printf("[CELL] Band=%s, Op=%s, RSRP=%s, RSRQ=%s, MCC=%u, MNC=%02u, CID=%u, TAC=%u\r\n",
                       modemBand.c_str(), modemNetName.c_str(), modemRSRP.c_str(), modemRSRQ.c_str(),
                       modemCC, modemNC, modemCID, modemTAC);
-        }
+    }
     }  // end if (modem.getCellInformation)
     
     Serial.println("LTE connection established successfully");
@@ -5364,6 +5593,11 @@ size_t buildCborFromReadings(uint8_t* buf, size_t bufSize, int data[][10], size_
  * Usage: refreshCellSignalInfo();  // Updates globals, no return value
  */
 void refreshCellSignalInfo() {
+    // REV 10.10: Send serial data BEFORE the modem call, which can block for seconds.
+    // This ensures the Linux device gets at least one fresh packet before we stall.
+    checkAndSendStatusToSerial();
+    
+    unsigned long cellStart = millis();
     if (modem.getCellInformation(WALTER_MODEM_SQNMONI_REPORTS_SERVING_CELL, &rsp)) {
         modemBand = String(rsp.data.cellInformation.band);
         modemNetName = String(rsp.data.cellInformation.netName);
@@ -5386,6 +5620,15 @@ void refreshCellSignalInfo() {
     }
     // On failure, keep previous values rather than overwriting with "Unknown"
     // This prevents dashboard from flickering between real data and "Unknown"
+    
+    // REV 10.10: Log how long the modem call took (helps diagnose stalls)
+    unsigned long cellDuration = millis() - cellStart;
+    if (cellDuration > 1000) {
+        Serial.printf("[CELL] WARNING: getCellInformation() took %lu ms (>1s stall)\r\n", cellDuration);
+    }
+    
+    // Send serial data immediately AFTER the modem call to minimize gap
+    checkAndSendStatusToSerial();
 }
 
 size_t buildErrorCbor(uint8_t* cborBuf, size_t bufSize, int errorCode) {
@@ -5648,8 +5891,8 @@ void runPassthroughBootMode(unsigned long timeoutMinutes) {
     pinMode(CR1, OUTPUT);
     pinMode(CR2, OUTPUT);
     pinMode(CR5, OUTPUT);
-    pinMode(DISP_SHUTDN, OUTPUT);
-    digitalWrite(DISP_SHUTDN, HIGH);  // CRITICAL: DISP_SHUTDN ON (safety)
+    // REV 10.11: DISP_SHUTDN initialized with hold — use the hold-aware function
+    initializeDispShutdownPinWithHold();  // CRITICAL: DISP_SHUTDN ON with pull-up + hold
     
     // Read saved relay state from preferences (written by enterPassthroughMode)
     preferences.begin("RMS", true);  // Read-only
@@ -5720,6 +5963,7 @@ void runPassthroughBootMode(unsigned long timeoutMinutes) {
     );
     
     // Initialize Serial1 for host (Linux device)
+    Serial1.setTxBufferSize(512);   // REV 10.10: Double TX buffer to prevent blocking writes during loop stalls
     Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
     
     Serial.println("[PASSTHROUGH] Bridge ready - Serial1 <-> ModemSerial");
@@ -5827,6 +6071,16 @@ void setup() {
     pinMode(ESP_POWER_EN, OUTPUT);
     digitalWrite(ESP_POWER_EN, LOW);
     
+    // =====================================================================
+    // REV 10.11: DISP_SHUTDN (GPIO13 / CR6) — initialize with pull-up + hold IMMEDIATELY.
+    // This MUST happen before Serial.begin or any other initialization.
+    // gpio_hold_en() latches the pin state through software resets (ESP.restart, OTA).
+    // The internal pull-up provides backup protection during full power-on resets.
+    // Without this, GPIO13 floats LOW for ~100-500ms during reboot, causing
+    // an unwanted site shutdown on the relay board.
+    // =====================================================================
+    initializeDispShutdownPinWithHold();
+    
     Serial.begin(115200);
     delay(100);  // Brief delay for serial to stabilize
     
@@ -5891,7 +6145,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.10                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.11                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -5957,6 +6211,7 @@ void setup() {
     else Serial.println("**** SD Card Mounted (CS=40)");
     
     // Initialize RS-232 Serial data
+    Serial1.setTxBufferSize(512);   // REV 10.10: Double TX buffer to prevent blocking writes during loop stalls
     Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
 
     if (!modem.begin(&ModemSerial)) {
@@ -6123,7 +6378,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.10 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.11 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
@@ -6142,6 +6397,22 @@ void setup() {
 // MAIN LOOP
 // =====================================================================
 void loop() {
+    // REV 10.10: Loop stall detector — prints if the loop takes >2 seconds between iterations
+    // This catches any blocking operation (modem calls, I2C hangs, SD card retries, etc.)
+    // that prevents serial data from being sent to the Linux device.
+    static unsigned long lastLoopTime = 0;
+    if (lastLoopTime > 0) {
+        unsigned long loopDelta = millis() - lastLoopTime;
+        if (loopDelta > 2000) {
+            Serial.println("####################################################################");
+            Serial.printf("## LOOP STALL DETECTED: %lu ms since last iteration\r\n", loopDelta);
+            Serial.printf("## Serial data was NOT sent to Linux for %.1f seconds!\r\n", loopDelta / 1000.0);
+            Serial.printf("## Free heap: %lu bytes  |  @%lums\r\n", (unsigned long)ESP.getFreeHeap(), millis());
+            Serial.println("####################################################################");
+        }
+    }
+    lastLoopTime = millis();
+    
     // Debug: confirm loop is running
     static unsigned long lastLoopDebug = 0;
     static bool firstLoop = true;
@@ -6169,11 +6440,42 @@ void loop() {
         return;
     }
     
-    // LTE connection check - only runs in normal mode (not passthrough)
-    if (!lteConnected() && !lteConnect()) {
-        Serial.println("Unable to connect to cellular network, restarting in 10 seconds");
-        delay(10000);
+    // =====================================================================
+    // REV 10.10: LTE CONNECTION CHECK — SCHEDULED (every 60 seconds)
+    // Previously this ran EVERY loop iteration. If LTE dropped temporarily
+    // (normal tower handoff), lteConnect() blocked the main loop for 5+ min
+    // with delays + 300s registration timeout. During the block, ZERO serial
+    // data was sent to Linux (pressure, current, overfill all froze).
+    //
+    // Now: check every 60 seconds. If LTE drops, serial data keeps flowing.
+    // Reconnection is attempted on the next scheduled check. After 5 consecutive
+    // failures, ESP restarts (but serial data flows for ~5 minutes first).
+    // =====================================================================
+    if (currentTime - lastLteCheckTime >= LTE_CHECK_INTERVAL) {
+        lastLteCheckTime = currentTime;
+        if (!lteConnected()) {
+            Serial.println("####################################################################");
+            Serial.printf("## LTE CONNECTION LOST — attempting reconnect (failure #%d)\r\n",
+                          lteReconnectFailures + 1);
+            Serial.println("## Serial data to Linux continues during reconnection attempt");
+            Serial.println("####################################################################");
+            if (!lteConnect()) {
+                lteReconnectFailures++;
+                Serial.printf("[LTE] Reconnect FAILED — will retry in 60 seconds (failures: %d/5)\r\n",
+                              lteReconnectFailures);
+                if (lteReconnectFailures >= 5) {
+                    Serial.println("[LTE] 5 consecutive failures — restarting ESP32");
+                    delay(1000);
         ESP.restart();
+                }
+                // Do NOT restart yet — continue sending serial data to Linux
+            } else {
+                lteReconnectFailures = 0;
+                Serial.println("[LTE] Reconnection successful — resuming normal operation");
+            }
+        } else {
+            lteReconnectFailures = 0;  // Connected — reset failure counter
+        }
     }
     
     // =====================================================================

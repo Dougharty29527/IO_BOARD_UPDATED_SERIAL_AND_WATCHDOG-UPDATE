@@ -1,7 +1,7 @@
 # Walter IO Board Firmware
 
-**Version:** Rev 10.10  
-**Date:** February 10, 2026  
+**Version:** Rev 10.11  
+**Date:** February 11, 2026  
 **Authors:** Todd Adams & Doug Harty
 
 ESP32-based IO board firmware for the Walter cellular modem platform. Provides relay control, sensor monitoring, web configuration portal, CBOR cellular data transmission, and PPP passthrough for remote access.
@@ -295,7 +295,8 @@ These codes are **added** to any existing fault codes from the Linux device.
 
 | Version | Date | Description |
 |---------|------|-------------|
-| **Rev 10.10** | **2/10/2026** | **ADC I2C error diagnostics: loud ###-bordered Serial Monitor alerts for pressure/current read failures. Three-tier current validation (NACK, full-scale rail, abnormal). Invalid reads skipped to protect rolling average. Reinit and reconnect attempts now logged. Always-on (not gated by debug mode).** |
+| **Rev 10.11** | **2/11/2026** | **ADC stale data detection: if no successful ADC read for 60 seconds, sends pressure=-99.9 (fault sentinel) and current=0.0 to Linux. Previously stale values persisted indefinitely after I2C failures. Auto-recovers when ADC responds. DISP_SHUTDN (GPIO13/CR6): internal pull-up + ESP-IDF gpio_hold_en() keeps pin HIGH through reboots and OTA firmware updates — prevents momentary LOW glitch during reset.** |
+| Rev 10.10 | 2/10/2026 | ADC I2C error diagnostics: loud ###-bordered Serial Monitor alerts for pressure/current read failures. Three-tier current validation (NACK, full-scale rail, abnormal). Invalid reads skipped to protect rolling average. Reinit and reconnect attempts now logged. Always-on (not gated by debug mode). |
 | Rev 10.9 | 2/10/2026 | Serial debug mode (toggle via web portal, EEPROM-persisted). IMEI/IMSI/ICCID/Technology added to cellular JSON. Cellular packet now 10-second timer. Datetime split into own packet. Calibration safety: middle 20% ADC range. EEPROM validates on boot. ADC outlier rejection. |
 | Rev 10.8 | 2/10/2026 | Mode confirmation: 15-second relay state refresh re-applies currentRelayMode to GPIO pins. Fast sensor packet extended with failsafe and shutdown fields. Three-layer mode delivery redundancy (immediate + 15s payload + relay refresh). Zero Python changes required. |
 | Rev 10.7 | 2/9/2026 | Pressure sensor calibration via serial or web portal. Instant non-blocking zero point adjustment using existing 60-sample rolling average. EEPROM persistence. ESP32 sends ps_cal result to Linux for database save. New "type":"cmd" message type. |

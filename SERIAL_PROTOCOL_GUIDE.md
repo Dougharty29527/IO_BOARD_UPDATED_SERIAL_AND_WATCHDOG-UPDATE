@@ -1,6 +1,6 @@
 # ESP32 IO Board Serial Protocol Guide
 
-**Firmware:** IO_BOARD_FIRMWARE9 Rev 10.10  
+**Firmware:** IO_BOARD_FIRMWARE9 Rev 10.11  
 **Date:** February 10, 2026  
 **Audience:** Anyone writing software that talks to this ESP32 over serial
 
@@ -82,8 +82,8 @@ This is the critical real-time data path. The Linux device uses these values for
 
 | Field | Type | Range | Description |
 |-------|------|-------|-------------|
-| `pressure` | float | Typically -20.0 to +5.0 | Vacuum pressure in inches of water column (IWC). Read from ADS1015 ADC channel 0 at 60Hz with 1-second rolling average. **Negative = vacuum** (normal operation), 0.0 = atmospheric, positive = above atmospheric. Uses Python `pressure_sensor.py` two-point linear formula: `(raw - adcZero) / slope`. |
-| `current` | float | 0.0 to ~15.0 | Motor current in amps. Read from ADS1015 ADC channels 2-3 using **hardware differential** (`readADC_Differential_2_3()`) at GAIN_TWO (1mV/count) for full 12-bit precision on the difference. Reports **windowed peak** (max after removing highest outlier, 60-sample window) to match Python's approach. 0.0 when motor is off. Pin 1 (AIN1) is unused. |
+| `pressure` | float | Typically -20.0 to +5.0, or **-99.9** | Vacuum pressure in inches of water column (IWC). Read from ADS1015 ADC channel 0 at 60Hz with 1-second rolling average. **Negative = vacuum** (normal operation), 0.0 = atmospheric, positive = above atmospheric. Uses Python `pressure_sensor.py` two-point linear formula: `(raw - adcZero) / slope`. **Rev 10.11: A value of -99.9 means the ADC has failed to read for 60+ continuous seconds — this is a sensor fault sentinel.** Python should treat -99.9 as "sensor unavailable" and NOT use it for alarm calculations. |
+| `current` | float | 0.0 to ~15.0 | Motor current in amps. Read from ADS1015 ADC channels 2-3 using **hardware differential** (`readADC_Differential_2_3()`) at GAIN_TWO (1mV/count) for full 12-bit precision on the difference. Reports **windowed peak** (max after removing highest outlier, 60-sample window) to match Python's approach. 0.0 when motor is off. Pin 1 (AIN1) is unused. **Rev 10.11: Sent as 0.0 during sensor fault (when pressure is -99.9).** |
 | `overfill` | int | 0 or 1 | Overfill alarm state. 0 = normal, 1 = alarm active. Read from GPIO38 with 8-of-5 hysteresis (must read LOW 8 out of last 5 checks to trigger). Has internal pull-up. |
 | `sdcard` | string | `"OK"` or `"FAULT"` | SD card status. Reads cached card type, no disk I/O. |
 | `relayMode` | int | 0-9 | Current relay mode the ESP32 has applied. Useful for confirming the relay state matches what Linux requested. |
