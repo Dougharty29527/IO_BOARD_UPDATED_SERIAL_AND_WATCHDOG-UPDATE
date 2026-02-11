@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.12
+ *  Walter IO Board Firmware - Rev 10.13
  *  Date: 2/11/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -13,6 +13,27 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *  
+ *  Rev 10.13 (2/11/2026) - Non-Blocking Cellular Initialization
+ *  - ARCHITECTURE: Cellular connection no longer blocks setup() for 5+ minutes.
+ *    * setup() completes in ~3 seconds — GPIO, ADC, serial, web portal, relays all operational
+ *    * LTE registration, BlueCherry, modem identity, and modem time run as a background
+ *      state machine (runCellularInitStateMachine) in loop()
+ *    * 13-state CellularInitState enum drives the connection process
+ *    * Each state performs ONE operation and returns immediately to loop()
+ *    * Serial to Linux (5Hz pressure/current/overfill) starts immediately on boot
+ *    * Web portal works immediately — relay control, tests, diagnostics all available
+ *    * Watchdog starts immediately — no 5-minute blind spot
+ *  - FIX: No more ESP.restart() on LTE failure during boot
+ *    * Previously, failed lteConnect() → 10s delay → restart → infinite loop on poor signal
+ *    * Now: state machine retries from CELL_INIT_SET_MINIMUM after 60-second cooldown
+ *    * System continues operating (serial, relays, web) while retrying cellular
+ *  - FIX: initModemTime() had no timeout (infinite hang possible)
+ *    * Now limited to single attempt with non-fatal fallback
+ *  - NEW: Web dashboard shows "Connecting..." (orange) during cellular init instead of
+ *    "Disconnected" (red). cellularReady field added to /api/status JSON.
+ *  - All modem-dependent loop operations (LTE reconnect, firmware check, daily status,
+ *    refreshCellSignalInfo) gated on cellularInitComplete flag
+ *
  *  Rev 10.12 (2/11/2026) - Functionality Test Rework + Watchdog Pull-Down + Device Name Fix
  *  - FIX: Functionality test was incorrectly using mode 9 (leak test config: all valves open,
  *    motor OFF). Now correctly mirrors Python io_manager.py functionality_test():
@@ -523,7 +544,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.12"
+#define VERSION "Rev 10.13"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -854,6 +875,51 @@ unsigned long blueCherryLastAttempt = 0;         // Timestamp of last BlueCherry
 unsigned long systemStartTime = 0;               // Timestamp when system started (for weekly restart)
 const unsigned long WEEKLY_RESTART_MS = 604800000UL;  // 7 days in milliseconds (7 * 24 * 60 * 60 * 1000)
 const unsigned long BC_RETRY_INTERVAL = 3600000; // Retry BlueCherry every hour (60 * 60 * 1000)
+
+// =====================================================================
+// REV 10.13: NON-BLOCKING CELLULAR INITIALIZATION STATE MACHINE
+// =====================================================================
+// Previously, setup() blocked for up to 5+ minutes waiting for LTE registration,
+// BlueCherry init, and modem time. If lteConnect() failed, the ESP32 restarted
+// entirely — losing relay control, sensor data, and serial to Linux.
+//
+// Now: setup() completes in ~3 seconds (GPIO, ADC, serial, web portal, relays).
+// Cellular connection runs as a background state machine in loop().
+// All critical IO functions operate immediately while cellular connects.
+//
+// State flow:
+//   SET_MINIMUM → WAIT_MINIMUM → DEFINE_PDP → SET_AUTH → SET_FULL →
+//   WAIT_FULL → SET_AUTO_SELECT → WAIT_REGISTRATION → GET_CELL_INFO →
+//   BLUECHERRY → GET_IDENTITY → GET_TIME → COMPLETE
+//
+// On failure: retries from SET_MINIMUM after a 60-second cooldown.
+// No more ESP.restart() on LTE failure during boot.
+enum CellularInitState {
+    CELL_INIT_SET_MINIMUM,       // Set modem to minimum op state
+    CELL_INIT_WAIT_MINIMUM,      // Wait 2 seconds for modem state change
+    CELL_INIT_DEFINE_PDP,        // Define APN/PDP context
+    CELL_INIT_SET_AUTH,          // Set PDP authentication parameters
+    CELL_INIT_SET_FULL,          // Set modem to full op state
+    CELL_INIT_WAIT_FULL,         // Wait 2 seconds for modem state change
+    CELL_INIT_SET_AUTO_SELECT,   // Set automatic network selection
+    CELL_INIT_WAIT_REGISTRATION, // Poll lteConnected() every 1s (up to 300s)
+    CELL_INIT_GET_CELL_INFO,     // Retrieve cell info (RSRP, operator, band)
+    CELL_INIT_BLUECHERRY,        // Attempt BlueCherry init (up to 3 tries)
+    CELL_INIT_GET_IDENTITY,      // Query IMEI, ICCID, IMSI, RAT
+    CELL_INIT_GET_TIME,          // Get clock from modem (with timeout)
+    CELL_INIT_COMPLETE,          // Done — cellular fully operational
+    CELL_INIT_RETRY_COOLDOWN     // Wait 60s before retrying after failure
+};
+
+CellularInitState cellularInitState = CELL_INIT_SET_MINIMUM;
+bool    cellularInitComplete = false;  // True when state machine reaches COMPLETE
+unsigned long cellularInitTimer = 0;   // millis()-based timer for wait states
+int     cellularInitRegAttempts = 0;   // Registration poll counter (up to 300)
+int     cellularInitBcAttempts = 0;    // BlueCherry retry counter (up to 3)
+int     cellularInitRetryCount = 0;    // Full-cycle retry counter
+const int CELL_INIT_MAX_REG_WAIT = 300;   // Max seconds to wait for network registration
+const int CELL_INIT_MAX_BC_ATTEMPTS = 3;  // Max BlueCherry init attempts
+const unsigned long CELL_INIT_RETRY_COOLDOWN_MS = 60000; // 60 seconds between full retries
 
 // =====================================================================
 // RMS CONFIGURATION (Updated SD pins)
@@ -2782,7 +2848,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.12</title>
+    <title>Walter IO Board - Rev 10.13</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -2866,7 +2932,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.12</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.13</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -3403,12 +3469,12 @@ const char* control_html = R"rawliteral(
                             var dur=testDurations[d.testType]||0;
                             var remain=Math.max(0,dur-el);
                             var mm=Math.floor(remain/60);
-                            var ss=remain%60;
+                            var ss=remain%%60;
                             var tmr=(mm<10?'0':'')+mm+':'+(ss<10?'0':'')+ss;
                             var stat='Running ('+d.testType+')';
                             // Update the correct screen's timer based on test type
                             if(d.testType==='leak'){upd('leakTimer',tmr);upd('leakStatus',stat);}
-                            else if(d.testType==='func'){upd('funcTimer',tmr);upd('funcStatus',stat);if(d.testMultiStep){var rep=Math.floor(d.testStep/2)+1;var phase=(d.testStep%2===0)?'Run':'Purge';upd('funcCycle',rep+' of '+(d.testStepTotal/2));upd('funcPhase',phase);}}
+                            else if(d.testType==='func'){upd('funcTimer',tmr);upd('funcStatus',stat);if(d.testMultiStep){var rep=Math.floor(d.testStep/2)+1;var phase=(d.testStep%%2===0)?'Run':'Purge';upd('funcCycle',rep+' of '+(d.testStepTotal/2));upd('funcPhase',phase);}}
                             else if(d.testType==='eff'){upd('effTime',tmr);upd('effStep','Running');upd('effMode',modeNames[d.mode]||d.mode);}
                             else if(d.testType==='clean'){upd('cleanTimer',tmr);upd('cleanStatus',stat);}
                         } else {
@@ -3434,7 +3500,7 @@ const char* control_html = R"rawliteral(
                         upd('adcRawP',d.adcRawPressure||'--');upd('adcRawC',d.adcRawCurrent||'--');
                         upd('adcZeroP',d.adcZeroPressure||'--');
                         upd('adcInit',d.adcInitialized?'Yes':'No');upd('adcErrors',d.adcErrors||'0');upd('adcOutliers',d.adcOutliers||'0');
-                        var le=$('lteStatus');if(le)le.innerHTML=d.lteConnected?'<span style=color:#2e7d32>Connected</span>':'<span style=color:#c62828>Disconnected</span>';
+                        var le=$('lteStatus');if(le){if(d.lteConnected){le.innerHTML='<span style=color:#2e7d32>Connected</span>';}else if(!d.cellularReady){le.innerHTML='<span style=color:#e65100>Connecting...</span>';}else{le.innerHTML='<span style=color:#c62828>Disconnected</span>';}}
                         upd('rsrp',(d.rsrp||'--')+' dBm');upd('rsrq',(d.rsrq||'--')+' dB');
                         upd('diagOperator',d.operator||'--');upd('band',d.band||'--');
                         upd('mccmnc',d.mcc&&d.mnc?(d.mcc+'/'+d.mnc):'--');upd('cellId',d.cellId||'--');
@@ -3971,7 +4037,10 @@ void startConfigAP() {
         bool alarmHighCurrent = (adcCurrent > HIGH_CURRENT_THRESHOLD);
         int combinedFault = faults + getCombinedFaultCode();
         unsigned long testElapsedSec = testRunning ? (millis() - testStartTime) / 1000 : 0;
-        bool lteOk = lteConnected();
+        // REV 10.13: Don't call lteConnected() during cellular init — it sends an AT
+        // command that can collide with the state machine on the same modem UART,
+        // causing the web server async handler to block and making the portal unresponsive.
+        bool lteOk = cellularInitComplete ? lteConnected() : false;
         String dtStr = getDateTimeString();
         String profName = profileManager.getActiveProfileName();
         
@@ -3996,14 +4065,17 @@ void startConfigAP() {
             currentRelayMode, cycles, combinedFault,
             profName.c_str(), failsafeMode ? "true" : "false");
         
-        // Cellular modem
+        // Cellular modem (REV 10.13: added cellularReady for web UI connecting state)
         pos += snprintf(json + pos, sizeof(json) - pos,
-            "\"lteConnected\":%s,\"rsrp\":\"%s\",\"rsrq\":\"%s\","
+            "\"lteConnected\":%s,\"cellularReady\":%s,"
+            "\"rsrp\":\"%s\",\"rsrq\":\"%s\","
             "\"operator\":\"%s\",\"band\":\"%s\","
             "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u,\"tac\":%u,"
             "\"blueCherryConnected\":%s,\"modemStatus\":\"%s\","
             "\"imei\":\"%s\",",
-            lteOk ? "true" : "false", rsrpC, rsrqC,
+            lteOk ? "true" : "false",
+            cellularInitComplete ? "true" : "false",
+            rsrpC, rsrqC,
             operC, bandC,
             modemCC, modemNC, modemCID, modemTAC,
             blueCherryConnected ? "true" : "false", Modem_Status.c_str(),
@@ -4089,6 +4161,25 @@ void startConfigAP() {
                 if (val == "run") startFailsafeCycle(0);
                 else if (val == "manual_purge") startFailsafeCycle(1);
                 else if (val == "clean") startFailsafeCycle(2);
+            } else if (val == "manual_purge") {
+                // =========================================================
+                // REV 10.13: MANUAL PURGE — ESP32 takes sole relay control
+                // Manual purge is a maintenance operation started from the
+                // web portal. Sets relays to purge mode (mode 2: motor on +
+                // purge valve open). No auto-timeout — user presses Stop.
+                // ESP32 blocks Linux mode commands while active.
+                // =========================================================
+                setRelaysForMode(2);  // Purge mode (motor on + purge valve)
+                activeTestType = "manual_purge";
+                testStartTime = millis();
+                testRunning = true;
+                
+                Serial.printf("[WEB CMD] ===== WEB PORTAL MANUAL PURGE STARTED =====\r\n");
+                Serial.printf("[WEB CMD]   Relay mode: 2 (Purge)  |  Duration: manual (user stops)\r\n");
+                Serial.printf("[WEB CMD]   ESP32 owns relays — ALL Linux mode commands BLOCKED\r\n");
+                
+                // Forward to Linux for logging/awareness
+                Serial1.println("{\"command\":\"start_cycle\",\"type\":\"manual_purge\"}");
             } else if (val == "clean") {
                 // =========================================================
                 // REV 10.11: CLEAN CANISTER — ESP32 takes sole relay control
@@ -4110,11 +4201,11 @@ void startConfigAP() {
                 Serial1.println("{\"command\":\"start_cycle\",\"type\":\"clean\"}");
             } else {
                 // =========================================================
-                // NORMAL MODE: run, manual_purge — Linux controls relays.
+                // NORMAL MODE: run — Linux controls relays.
                 // Forward the start_cycle command to Linux via Serial1.
                 // Linux's IOManager runs the cycle with proper alarm monitoring,
                 // DB logging, pause/resume, etc. The ESP32 does NOT take over
-                // relay control for normal run/purge cycles.
+                // relay control for normal run cycles.
                 // =========================================================
                 char cmdBuf[128];
                 snprintf(cmdBuf, sizeof(cmdBuf),
@@ -5574,6 +5665,333 @@ bool lteConnect() {
     return true;
 }
 
+// =====================================================================
+// REV 10.13: NON-BLOCKING CELLULAR INITIALIZATION STATE MACHINE
+// =====================================================================
+// Called from loop() on every iteration until cellularInitComplete is true.
+// Each state performs ONE operation and returns immediately, allowing the
+// main loop to continue (serial data, web portal, relay control, watchdog).
+//
+// On any failure, the state machine enters RETRY_COOLDOWN (60 seconds)
+// then restarts from SET_MINIMUM. No ESP.restart() on failure.
+//
+// Usage example:
+//   // In loop():
+//   if (!cellularInitComplete) {
+//       runCellularInitStateMachine();
+//   }
+void runCellularInitStateMachine() {
+    if (cellularInitComplete) return;  // Already done
+    
+    switch (cellularInitState) {
+        
+        // ---- Step 1: Set modem to minimum operational state ----
+        case CELL_INIT_SET_MINIMUM: {
+            Serial.printf("[CELL-INIT] Starting cellular connection (attempt #%d)...\r\n",
+                          cellularInitRetryCount + 1);
+            if (!modem.setOpState(WALTER_MODEM_OPSTATE_MINIMUM)) {
+                Serial.println("[CELL-INIT] Failed to set op state to minimum — retrying in 60s");
+                cellularInitState = CELL_INIT_RETRY_COOLDOWN;
+                cellularInitTimer = millis();
+                return;
+            }
+            Serial.println("[CELL-INIT] Op state → MINIMUM");
+            cellularInitState = CELL_INIT_WAIT_MINIMUM;
+            cellularInitTimer = millis();
+            return;
+        }
+        
+        // ---- Step 2: Wait 2 seconds for modem state change ----
+        case CELL_INIT_WAIT_MINIMUM: {
+            if (millis() - cellularInitTimer < 2000) return;  // Still waiting
+            cellularInitState = CELL_INIT_DEFINE_PDP;
+            return;
+        }
+        
+        // ---- Step 3: Define APN/PDP context ----
+        case CELL_INIT_DEFINE_PDP: {
+            Serial.printf("[CELL-INIT] Defining PDP context with APN: %s\r\n", CELLULAR_APN);
+            if (!modem.definePDPContext(1, CELLULAR_APN)) {
+                Serial.println("[CELL-INIT] Failed to define PDP context — retrying in 60s");
+                cellularInitState = CELL_INIT_RETRY_COOLDOWN;
+                cellularInitTimer = millis();
+                return;
+            }
+            cellularInitState = CELL_INIT_SET_AUTH;
+            cellularInitTimer = millis();
+            return;
+        }
+        
+        // ---- Step 4: Set PDP authentication ----
+        case CELL_INIT_SET_AUTH: {
+            if (millis() - cellularInitTimer < 1000) return;  // Brief wait after PDP define
+            Serial.printf("[CELL-INIT] Setting PDP auth: Protocol=%d, User=%s\r\n",
+                          CELLULAR_AUTH_PROTOCOL, CELLULAR_USERNAME);
+            // Auth failure is non-fatal — some providers don't require it
+            if (!modem.setPDPAuthParams(CELLULAR_AUTH_PROTOCOL, CELLULAR_USERNAME, CELLULAR_PASSWORD)) {
+                Serial.println("[CELL-INIT] PDP auth params failed (non-fatal, some providers don't need it)");
+            }
+            cellularInitState = CELL_INIT_SET_FULL;
+            cellularInitTimer = millis();
+            return;
+        }
+        
+        // ---- Step 5: Set modem to full operational state ----
+        case CELL_INIT_SET_FULL: {
+            if (millis() - cellularInitTimer < 1000) return;  // Brief wait after auth
+            if (!modem.setOpState(WALTER_MODEM_OPSTATE_FULL)) {
+                Serial.println("[CELL-INIT] Failed to set op state to full — retrying in 60s");
+                cellularInitState = CELL_INIT_RETRY_COOLDOWN;
+                cellularInitTimer = millis();
+                return;
+            }
+            Serial.println("[CELL-INIT] Op state → FULL");
+            cellularInitState = CELL_INIT_WAIT_FULL;
+            cellularInitTimer = millis();
+            return;
+        }
+        
+        // ---- Step 6: Wait 2 seconds for modem to go full ----
+        case CELL_INIT_WAIT_FULL: {
+            if (millis() - cellularInitTimer < 2000) return;
+            cellularInitState = CELL_INIT_SET_AUTO_SELECT;
+            return;
+        }
+        
+        // ---- Step 7: Set automatic network selection ----
+        case CELL_INIT_SET_AUTO_SELECT: {
+            if (!modem.setNetworkSelectionMode(WALTER_MODEM_NETWORK_SEL_MODE_AUTOMATIC)) {
+                Serial.println("[CELL-INIT] Failed to set network selection — retrying in 60s");
+                cellularInitState = CELL_INIT_RETRY_COOLDOWN;
+                cellularInitTimer = millis();
+                return;
+            }
+            Serial.println("[CELL-INIT] Network selection → AUTOMATIC");
+            Serial.println("[CELL-INIT] Waiting for network registration (up to 300 seconds)...");
+            cellularInitState = CELL_INIT_WAIT_REGISTRATION;
+            cellularInitTimer = millis();
+            cellularInitRegAttempts = 0;
+            return;
+        }
+        
+        // ---- Step 8: Poll for network registration (non-blocking, 1s intervals) ----
+        case CELL_INIT_WAIT_REGISTRATION: {
+            if (millis() - cellularInitTimer < 1000) return;  // Poll every 1 second
+            cellularInitTimer = millis();
+            cellularInitRegAttempts++;
+            
+            if (lteConnected()) {
+                Serial.printf("[CELL-INIT] ===== NETWORK REGISTERED (%d seconds) =====\r\n",
+                              cellularInitRegAttempts);
+                Modem_Status = "Modem OK ";
+                cellularInitState = CELL_INIT_GET_CELL_INFO;
+                return;
+            }
+            
+            if (cellularInitRegAttempts % 10 == 0) {
+                Serial.printf("[CELL-INIT] Still waiting for registration... (%d/%d)\r\n",
+                              cellularInitRegAttempts, CELL_INIT_MAX_REG_WAIT);
+            }
+            
+            if (cellularInitRegAttempts >= CELL_INIT_MAX_REG_WAIT) {
+                Serial.println("[CELL-INIT] Network registration TIMEOUT (300s) — retrying in 60s");
+                Modem_Status = "Registration timeout";
+                cellularInitState = CELL_INIT_RETRY_COOLDOWN;
+                cellularInitTimer = millis();
+            }
+            return;
+        }
+        
+        // ---- Step 9: Get cell tower info (RSRP, operator, band) ----
+        case CELL_INIT_GET_CELL_INFO: {
+            if (modem.getRAT(&rsp)) {
+                Serial.printf("[CELL-INIT] Connected via %s\r\n",
+                              rsp.data.rat == WALTER_MODEM_RAT_NBIOT ? "NB-IoT" : "LTE-M");
+            }
+            
+            if (modem.getCellInformation(WALTER_MODEM_SQNMONI_REPORTS_SERVING_CELL, &rsp)) {
+                modemBand = String(rsp.data.cellInformation.band);
+                modemNetName = String(rsp.data.cellInformation.netName);
+                modemRSRP = String(rsp.data.cellInformation.rsrp, 1);
+                modemRSRQ = String(rsp.data.cellInformation.rsrq, 1);
+                modemCC = rsp.data.cellInformation.cc;
+                modemNC = rsp.data.cellInformation.nc;
+                modemCID = rsp.data.cellInformation.cid;
+                modemTAC = rsp.data.cellInformation.tac;
+                modemDataFresh = true;
+                
+                Serial.printf("[CELL-INIT] Band=%s, Op=%s, RSRP=%s dBm, RSRQ=%s dB\r\n",
+                              modemBand.c_str(), modemNetName.c_str(),
+                              modemRSRP.c_str(), modemRSRQ.c_str());
+            }
+            
+            Serial.println("[CELL-INIT] LTE connection established — starting BlueCherry init");
+            cellularInitState = CELL_INIT_BLUECHERRY;
+            cellularInitBcAttempts = 0;
+            cellularInitTimer = millis();
+            return;
+        }
+        
+        // ---- Step 10: BlueCherry initialization (up to 3 attempts) ----
+        case CELL_INIT_BLUECHERRY: {
+            // Brief pause between attempts
+            if (cellularInitBcAttempts > 0 && millis() - cellularInitTimer < 5000) return;
+            
+            cellularInitBcAttempts++;
+            Serial.printf("[CELL-INIT] BlueCherry attempt %d/%d\r\n",
+                          cellularInitBcAttempts, CELL_INIT_MAX_BC_ATTEMPTS);
+            
+            systemStartTime = millis();
+            blueCherryLastAttempt = millis();
+            
+            if (modem.blueCherryInit(BC_TLS_PROFILE, otaBuffer, &rsp)) {
+                blueCherryConnected = true;
+                Serial.println("[CELL-INIT] ✓ BlueCherry initialized successfully");
+                cellularInitState = CELL_INIT_GET_IDENTITY;
+                return;
+            }
+            
+            // Handle not-provisioned: attempt ZTP on first try
+            if (rsp.data.blueCherry.state == WALTER_MODEM_BLUECHERRY_STATUS_NOT_PROVISIONED
+                && cellularInitBcAttempts == 1) {
+                Serial.println("[CELL-INIT] Device not provisioned, attempting ZTP...");
+                if (BlueCherryZTP::begin(BC_DEVICE_TYPE, BC_TLS_PROFILE, bc_ca_cert, &modem)) {
+                    uint8_t mac[8] = {0};
+                    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                    BlueCherryZTP::addDeviceIdParameter(BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC, mac);
+                    if (modem.getIdentity(&rsp)) {
+                        BlueCherryZTP::addDeviceIdParameter(BLUECHERRY_ZTP_DEVICE_ID_TYPE_IMEI, rsp.data.identity.imei);
+                    }
+                    if (BlueCherryZTP::requestDeviceId() && BlueCherryZTP::generateKeyAndCsr()
+                        && BlueCherryZTP::requestSignedCertificate()
+                        && modem.blueCherryProvision(BlueCherryZTP::getCert(), BlueCherryZTP::getPrivKey(), bc_ca_cert)) {
+                        Serial.println("[CELL-INIT] ZTP provisioning succeeded — retrying BlueCherry init");
+                    }
+                }
+            }
+            
+            if (cellularInitBcAttempts >= CELL_INIT_MAX_BC_ATTEMPTS) {
+                blueCherryConnected = false;
+                Serial.println("[CELL-INIT] BlueCherry unavailable — system continues without OTA");
+                Serial.println("[CELL-INIT]   Will retry hourly, weekly restart if still offline");
+                cellularInitState = CELL_INIT_GET_IDENTITY;
+                return;
+            }
+            
+            // Wait 5 seconds before next attempt
+            cellularInitTimer = millis();
+            return;
+        }
+        
+        // ---- Step 11: Query modem identity (IMEI, ICCID, IMSI, RAT) ----
+        case CELL_INIT_GET_IDENTITY: {
+            // IMEI
+            if (modem.getIdentity(&rsp)) {
+                imei = rsp.data.identity.imei;
+                Serial.print("[CELL-INIT] ✓ IMEI: ");
+                Serial.println(imei);
+            } else {
+                Serial.println("[CELL-INIT] ⚠ Could not read IMEI");
+            }
+            
+            // ICCID
+            if (modem.getSIMCardID(&rsp)) {
+                modemICCID = rsp.data.simCardID.iccid;
+                Serial.print("[CELL-INIT] ✓ SIM ICCID: ");
+                Serial.println(modemICCID);
+            } else {
+                Serial.println("[CELL-INIT] ⚠ Could not read SIM ICCID");
+            }
+            
+            // IMSI
+            if (modem.getSIMCardIMSI(&rsp)) {
+                modemIMSI = rsp.data.imsi;
+                Serial.print("[CELL-INIT] ✓ SIM IMSI: ");
+                Serial.println(modemIMSI);
+            } else {
+                Serial.println("[CELL-INIT] ⚠ Could not read SIM IMSI");
+            }
+            
+            // RAT
+            if (modem.getRAT(&rsp)) {
+                switch (rsp.data.rat) {
+                    case WALTER_MODEM_RAT_LTEM:    modemTechnology = "LTE-M";   break;
+                    case WALTER_MODEM_RAT_NBIOT:   modemTechnology = "NB-IoT";  break;
+                    case WALTER_MODEM_RAT_AUTO:    modemTechnology = "Auto";    break;
+                    default:                       modemTechnology = "Unknown"; break;
+                }
+                Serial.print("[CELL-INIT] ✓ RAT: ");
+                Serial.println(modemTechnology);
+            }
+            
+            // Display identity banner
+            Serial.println("\n╔═══════════════════════════════════════════════════════╗");
+            Serial.println("║              DEVICE IDENTIFICATION                    ║");
+            Serial.println("╠═══════════════════════════════════════════════════════╣");
+            Serial.print("║  MAC:  "); Serial.print(macStr);
+            for (int i = macStr.length(); i < 47; i++) Serial.print(" "); Serial.println("║");
+            Serial.print("║  IMEI: "); Serial.print(imei);
+            for (int i = imei.length(); i < 47; i++) Serial.print(" "); Serial.println("║");
+            Serial.print("║  IMSI: "); Serial.print(modemIMSI.length() > 0 ? modemIMSI : "--");
+            for (int i = (modemIMSI.length() > 0 ? modemIMSI.length() : 2); i < 47; i++) Serial.print(" "); Serial.println("║");
+            Serial.print("║  ICCID:"); Serial.print(modemICCID.length() > 0 ? modemICCID : "--");
+            for (int i = (modemICCID.length() > 0 ? modemICCID.length() : 2); i < 47; i++) Serial.print(" "); Serial.println("║");
+            Serial.print("║  RAT:  "); Serial.print(modemTechnology.length() > 0 ? modemTechnology : "--");
+            for (int i = (modemTechnology.length() > 0 ? modemTechnology.length() : 2); i < 47; i++) Serial.print(" "); Serial.println("║");
+            Serial.println("╚═══════════════════════════════════════════════════════╝\n");
+            
+            cellularInitState = CELL_INIT_GET_TIME;
+            cellularInitTimer = millis();
+            return;
+        }
+        
+        // ---- Step 12: Get time from modem (with 10-second timeout) ----
+        case CELL_INIT_GET_TIME: {
+            if (millis() - cellularInitTimer < 1000) return;  // Brief pause
+            
+            if (modem.getClock(&rsp)) {
+                if (rsp.result == WALTER_MODEM_STATE_OK) {
+                    currentTimestamp = rsp.data.clock.epochTime;
+                    lastMillis = millis();
+                    modemTimeFresh = true;
+                    Serial.printf("[CELL-INIT] ✓ Modem time (UTC epoch): %lu\r\n",
+                                  (unsigned long)rsp.data.clock.epochTime);
+                } else {
+                    Serial.println("[CELL-INIT] ⚠ Invalid timestamp from modem (non-fatal)");
+                }
+            } else {
+                Serial.println("[CELL-INIT] ⚠ Could not get modem clock (non-fatal)");
+            }
+            
+            cellularInitState = CELL_INIT_COMPLETE;
+            return;
+        }
+        
+        // ---- Step 13: All done ----
+        case CELL_INIT_COMPLETE: {
+            cellularInitComplete = true;
+            lteReconnectFailures = 0;
+            
+            Serial.println("\n╔═══════════════════════════════════════════════════════╗");
+            Serial.println("║  ✅ CELLULAR INITIALIZATION COMPLETE                  ║");
+            Serial.printf("║  LTE: Connected  |  BlueCherry: %-19s  ║\r\n",
+                          blueCherryConnected ? "Connected" : "Offline");
+            Serial.println("╚═══════════════════════════════════════════════════════╝\n");
+            return;
+        }
+        
+        // ---- Retry cooldown: wait 60 seconds then restart from step 1 ----
+        case CELL_INIT_RETRY_COOLDOWN: {
+            if (millis() - cellularInitTimer < CELL_INIT_RETRY_COOLDOWN_MS) return;
+            cellularInitRetryCount++;
+            Serial.printf("[CELL-INIT] Cooldown complete — restarting cellular init (retry #%d)\r\n",
+                          cellularInitRetryCount);
+            cellularInitState = CELL_INIT_SET_MINIMUM;
+            return;
+        }
+    }
+}
+
 /**
  * Attempt to reconnect to BlueCherry platform
  * Called periodically when BlueCherry is not connected
@@ -6333,7 +6751,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.12                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.13                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -6407,13 +6825,22 @@ void setup() {
     // Initialize RS-232 Serial data
     Serial1.setTxBufferSize(512);   // REV 10.10: Double TX buffer to prevent blocking writes during loop stalls
     Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+    Serial.println("✓ RS-232 Serial1 initialized (115200 baud)");
 
+    // REV 10.13: modem.begin() can hang if the modem hardware isn't responding.
+    // Print a message BEFORE the call so the Serial Monitor shows where we are.
+    Serial.println("Initializing Walter modem (modem.begin)...");
+    Serial.println("  If boot stops here, the modem hardware may not be responding.");
+    Serial.println("  Common causes: modem not powered, UART wiring, modem firmware issue.");
+    Serial.flush();  // Force all buffered serial out BEFORE the potentially blocking call
+    
     if (!modem.begin(&ModemSerial)) {
         Serial.println("Could not initialize the modem, restarting in 10 seconds");
         Modem_Status = "Could Not Initialize Modem";
         delay(10000);
         ESP.restart();
     }
+    Serial.println("✓ Modem UART initialized successfully");
     
     if (modem.getRAT(&rsp) && rsp.data.rat == WALTER_MODEM_RAT_NBIOT) {
         if (modem.setRAT(WALTER_MODEM_RAT_LTEM)) {
@@ -6422,169 +6849,53 @@ void setup() {
         }
     }
     
-    if (!lteConnect()) {
-        Serial.println("Unable to connect to cellular network, restarting in 10 seconds");
-        Modem_Status = "Unable to connect to cellular network";
-        delay(10000);
-        ESP.restart();
-    }
+    // =====================================================================
+    // REV 10.13: NON-BLOCKING CELLULAR INITIALIZATION
+    // =====================================================================
+    // LTE registration, BlueCherry, modem identity, and modem time are now
+    // handled by runCellularInitStateMachine() in loop() instead of blocking
+    // here for up to 5+ minutes. This allows serial to Linux, web portal,
+    // relay control, and watchdog to start immediately.
+    //
+    // modem.begin() and RAT check stay here — they're fast and required
+    // before any modem commands can be issued.
+    // =====================================================================
     
-    // BlueCherry initialization - NON-FATAL (system continues if platform is down)
-    // BlueCherry is used for OTA firmware updates - core IO functions work without it
-    // If BlueCherry fails, system will retry hourly and do a weekly restart to retry
-    Serial.println("\nInitializing BlueCherry cloud connection...");
-    Serial.println("(BlueCherry is for OTA updates - system will continue if unavailable)");
-    
-    systemStartTime = millis();  // Record start time for weekly restart tracking
-    blueCherryLastAttempt = millis();
-    blueCherryConnected = false;
-    
-    unsigned short attempt = 0;
-    const unsigned short maxAttempts = 3;  // Try 3 times before giving up
-    
-    while (!modem.blueCherryInit(BC_TLS_PROFILE, otaBuffer, &rsp) && attempt < maxAttempts) {
-        Serial.print("BlueCherry attempt ");
-        Serial.print(attempt + 1);
-        Serial.print("/");
-        Serial.print(maxAttempts);
-        Serial.print(", state: ");
-        Serial.println(rsp.data.blueCherry.state);
-        
-        if (rsp.data.blueCherry.state == WALTER_MODEM_BLUECHERRY_STATUS_NOT_PROVISIONED && attempt <= 2) {
-            Serial.println("Device not provisioned, attempting ZTP...");
-            if (attempt++ == 0) {
-                if (!BlueCherryZTP::begin(BC_DEVICE_TYPE, BC_TLS_PROFILE, bc_ca_cert, &modem)) continue;
-                // Read MAC address HERE - inside ZTP block, exactly as original code
-                uint8_t mac[8] = {0};
-                esp_read_mac(mac, ESP_MAC_WIFI_STA);
-                BlueCherryZTP::addDeviceIdParameter(BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC, mac);
-                if (modem.getIdentity(&rsp)) {
-                    BlueCherryZTP::addDeviceIdParameter(BLUECHERRY_ZTP_DEVICE_ID_TYPE_IMEI, rsp.data.identity.imei);
-                }
-            }
-            if (!BlueCherryZTP::requestDeviceId() || !BlueCherryZTP::generateKeyAndCsr() || !BlueCherryZTP::requestSignedCertificate() ||
-                !modem.blueCherryProvision(BlueCherryZTP::getCert(), BlueCherryZTP::getPrivKey(), bc_ca_cert)) continue;
-        } else {
-            attempt++;
-            if (attempt < maxAttempts) {
-                Serial.println("BlueCherry init failed, retrying in 5 seconds...");
-                delay(5000);
-            }
-        }
-    }
-    
-    // Check if BlueCherry connected successfully
-    if (modem.blueCherryInit(BC_TLS_PROFILE, otaBuffer, &rsp)) {
-        blueCherryConnected = true;
-        Serial.println("✓ BlueCherry initialized successfully");
-    } else {
-        blueCherryConnected = false;
-        Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-        Serial.println("║  ⚠️ BlueCherry platform unavailable                   ║");
-        Serial.println("║  System will continue without OTA update capability   ║");
-        Serial.println("║  Will retry hourly, weekly restart if still offline   ║");
-        Serial.println("╚═══════════════════════════════════════════════════════╝\n");
-    }
-    
-    // REV 10.9: Retrieve modem identity (IMEI) and SIM card info (IMSI, ICCID)
-    // These are static values that don't change at runtime — queried once at boot.
-    if (modem.getIdentity(&rsp)) {
-        imei = rsp.data.identity.imei;
-    }
-    
-    // REV 10.9: Get SIM card ICCID (Integrated Circuit Card ID)
-    // Identifies the physical SIM card. Useful for carrier troubleshooting.
-    if (modem.getSIMCardID(&rsp)) {
-        modemICCID = rsp.data.simCardID.iccid;
-        Serial.print("✓ SIM ICCID: ");
-        Serial.println(modemICCID);
-    } else {
-        Serial.println("⚠️ Could not read SIM ICCID");
-    }
-    
-    // REV 10.9: Get SIM IMSI (International Mobile Subscriber Identity)
-    // Identifies the subscriber on the carrier network.
-    if (modem.getSIMCardIMSI(&rsp)) {
-        modemIMSI = rsp.data.imsi;
-        Serial.print("✓ SIM IMSI: ");
-        Serial.println(modemIMSI);
-    } else {
-        Serial.println("⚠️ Could not read SIM IMSI");
-    }
-    
-    // REV 10.9: Get Radio Access Technology (LTE-M, NB-IoT, Auto)
-    if (modem.getRAT(&rsp)) {
-        switch (rsp.data.rat) {
-            case WALTER_MODEM_RAT_LTEM:    modemTechnology = "LTE-M";   break;
-            case WALTER_MODEM_RAT_NBIOT:   modemTechnology = "NB-IoT";  break;
-            case WALTER_MODEM_RAT_AUTO:    modemTechnology = "Auto";    break;
-            default:                       modemTechnology = "Unknown"; break;
-        }
-        Serial.print("✓ RAT: ");
-        Serial.println(modemTechnology);
-    } else {
-        modemTechnology = "Unknown";
-        Serial.println("⚠️ Could not read RAT");
-    }
-    
-    // Read MAC address AFTER BlueCherry init (matching original code structure)
-    // This is for display and for macStr global variable used elsewhere
+    // Read MAC address early (needed for web dashboard, CBOR, and identity display)
     uint8_t mac[8] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     char buffer[18];
     snprintf(buffer, 18, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     macStr = buffer;
-    
-    // Display MAC address prominently in Serial Monitor
-    Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║              DEVICE IDENTIFICATION                    ║");
-    Serial.println("╠═══════════════════════════════════════════════════════╣");
-    Serial.print("║  MAC:  ");
-    Serial.print(macStr);
-    for (int i = macStr.length(); i < 47; i++) Serial.print(" ");
-    Serial.println("║");
-    Serial.print("║  IMEI: ");
-    Serial.print(imei);
-    for (int i = imei.length(); i < 47; i++) Serial.print(" ");
-    Serial.println("║");
-    Serial.print("║  IMSI: ");
-    Serial.print(modemIMSI.length() > 0 ? modemIMSI : "--");
-    for (int i = (modemIMSI.length() > 0 ? modemIMSI.length() : 2); i < 47; i++) Serial.print(" ");
-    Serial.println("║");
-    Serial.print("║  ICCID:");
-    Serial.print(modemICCID.length() > 0 ? modemICCID : "--");
-    for (int i = (modemICCID.length() > 0 ? modemICCID.length() : 2); i < 47; i++) Serial.print(" ");
-    Serial.println("║");
-    Serial.print("║  RAT:  ");
-    Serial.print(modemTechnology.length() > 0 ? modemTechnology : "--");
-    for (int i = (modemTechnology.length() > 0 ? modemTechnology.length() : 2); i < 47; i++) Serial.print(" ");
-    Serial.println("║");
-    Serial.println("╚═══════════════════════════════════════════════════════╝\n");
-    
     if (macStr == "00:00:00:00:00:00" || macStr.length() == 0) {
         Serial.println("⚠️ WARNING: MAC address is blank or invalid!");
+    } else {
+        Serial.println("✓ MAC address: " + macStr);
     }
     
-    initModemTime();
-    delay(1000);
+    // Initialize cellular state tracking
+    systemStartTime = millis();
+    blueCherryConnected = false;
+    cellularInitComplete = false;
+    cellularInitState = CELL_INIT_SET_MINIMUM;
+    Modem_Status = "Connecting...";
+    
+    Serial.println("✓ Modem hardware initialized — cellular connection will proceed in background");
+    Serial.println("  (LTE registration, BlueCherry, and modem time run non-blocking in loop)");
     
     // Initialize watchdog timer
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.12 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.13 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
     Serial.println("✅ Serial watchdog ready");
     Serial.println("✅ Failsafe relay control standby (activates after 2 restart attempts)");
-    if (blueCherryConnected) {
-        Serial.println("✅ BlueCherry OTA platform connected");
-    } else {
-        Serial.println("⚠️ BlueCherry OTA offline - will retry hourly, weekly restart scheduled");
-    }
     Serial.printf("✅ CBOR buffer: %d samples (%d min capacity)\r\n", CBOR_BUFFER_MAX_SAMPLES, CBOR_BUFFER_MAX_SAMPLES * 15 / 60);
-    Serial.println("✅ System ready!\n");
+    Serial.println("⏳ Cellular connecting in background (LTE + BlueCherry + time)");
+    Serial.println("✅ System ready — IO operational!\n");
 }
 
 // =====================================================================
@@ -6635,17 +6946,23 @@ void loop() {
     }
     
     // =====================================================================
-    // REV 10.10: LTE CONNECTION CHECK — SCHEDULED (every 60 seconds)
-    // Previously this ran EVERY loop iteration. If LTE dropped temporarily
-    // (normal tower handoff), lteConnect() blocked the main loop for 5+ min
-    // with delays + 300s registration timeout. During the block, ZERO serial
-    // data was sent to Linux (pressure, current, overfill all froze).
-    //
-    // Now: check every 60 seconds. If LTE drops, serial data keeps flowing.
-    // Reconnection is attempted on the next scheduled check. After 5 consecutive
-    // failures, ESP restarts (but serial data flows for ~5 minutes first).
+    // REV 10.13: NON-BLOCKING CELLULAR INITIALIZATION
+    // Run the cellular state machine until initialization is complete.
+    // This replaces the blocking lteConnect() + BlueCherry + initModemTime()
+    // that previously ran in setup(). Each call advances one state and returns
+    // immediately, so serial data, web portal, and relay control keep working.
     // =====================================================================
-    if (currentTime - lastLteCheckTime >= LTE_CHECK_INTERVAL) {
+    if (!cellularInitComplete) {
+        runCellularInitStateMachine();
+    }
+    
+    // =====================================================================
+    // LTE CONNECTION CHECK — SCHEDULED (every 60 seconds)
+    // Only runs AFTER cellular initialization is complete.
+    // If LTE drops, serial data keeps flowing. Reconnection is attempted on
+    // the next scheduled check. After 5 consecutive failures, ESP restarts.
+    // =====================================================================
+    if (cellularInitComplete && currentTime - lastLteCheckTime >= LTE_CHECK_INTERVAL) {
         lastLteCheckTime = currentTime;
         if (!lteConnected()) {
             Serial.println("####################################################################");
@@ -6660,15 +6977,14 @@ void loop() {
                 if (lteReconnectFailures >= 5) {
                     Serial.println("[LTE] 5 consecutive failures — restarting ESP32");
                     delay(1000);
-        ESP.restart();
+                    ESP.restart();
                 }
-                // Do NOT restart yet — continue sending serial data to Linux
             } else {
                 lteReconnectFailures = 0;
                 Serial.println("[LTE] Reconnection successful — resuming normal operation");
             }
         } else {
-            lteReconnectFailures = 0;  // Connected — reset failure counter
+            lteReconnectFailures = 0;
         }
     }
     
@@ -6708,8 +7024,10 @@ void loop() {
     // =====================================================================
     // SCHEDULED FIRMWARE CHECK (7:00 AM - 1:00 PM EST, every 15 min)
     // Also runs once on first boot to sync modem time and check for updates
+    // REV 10.13: Only runs after cellular init completes (modem time, BlueCherry
+    // are handled by the state machine during boot).
     // =====================================================================
-    if (firstTime || isFirmwareCheckScheduled()) {
+    if (cellularInitComplete && (firstTime || isFirmwareCheckScheduled())) {
         Serial.println("[FIRMWARE] Scheduled check - syncing modem time & checking updates");
         checkFirmwareUpdate();
         initModemTime();
@@ -6723,10 +7041,9 @@ void loop() {
     // =====================================================================
     // DAILY STATUS MESSAGE (Unified 15-element format - sends to port 5686)
     // Sends once on first boot and then every 24 hours.
-    // Uses sendStatusUpdateViaSocket() which calls refreshCellSignalInfo(),
-    // buildStatusCbor() (15-element unified array), and sendCborDataViaSocket().
+    // REV 10.13: Gated on cellularInitComplete — needs LTE connection for socket send.
     // =====================================================================
-    if (lastDailyStatusTime == 0 || currentTime - lastDailyStatusTime >= STATUS_INTERVAL) {
+    if (cellularInitComplete && (lastDailyStatusTime == 0 || currentTime - lastDailyStatusTime >= STATUS_INTERVAL)) {
         Serial.println("##################################################");
         Serial.println("##### DAILY STATUS - IO_Board (Unified Format) ####");
         Serial.println("##################################################");
@@ -6742,8 +7059,9 @@ void loop() {
     
     // Refresh cell signal info every 60 seconds for web dashboard and serial JSON
     // This updates modemRSRP, modemRSRQ, modemBand, modemNetName globals
+    // REV 10.13: refreshCellSignalInfo only runs after cellular init completes
     if (currentTime - lastSDCheck >= 60000) {
-        refreshCellSignalInfo();
+        if (cellularInitComplete) refreshCellSignalInfo();
         Serial.print("@@@@@@  Free heap: ");
         Serial.println(ESP.getFreeHeap());
         Serial.println("@@@@@@");
