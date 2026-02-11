@@ -4891,12 +4891,11 @@ void sendFastSensorPacket() {
     // Expect ~200ms between each line. Look for consistent spacing in the millis() values.
     // REV 10.9: Only prints when debug mode ON — this fires 5x/second and floods the monitor
     if (serialDebugMode) {
-        Serial.printf("[FAST-TX @%lums] P=%.2f rawP=%d C=%.2f rawC=%d OV=%d SD=%s M=%d FailSafe=%d ShtDn=%d%s\r\n",
+        Serial.printf("[FAST-TX @%lums] P=%.2f rawP=%d zero=%.2f C=%.2f rawC=%d OV=%d M=%d%s\r\n",
                       millis(), sendPressure, (int)adcRawPressure,
+                      adcZeroPressure,
                       sendCurrent, (int)adcRawCurrent,
-                      overfillAlarmActive ? 1 : 0,
-                      isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
-                      failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1,
+                      overfillAlarmActive ? 1 : 0, currentRelayMode,
                       adcDataStale ? " **STALE**" : "");
     }
 }
