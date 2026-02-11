@@ -683,6 +683,16 @@ volatile bool adcDataStale = false;                   // True when no good read 
 // Set by Core 1 (SaveToSD) before SPI writes, cleared after. Checked by Core 0 (adcReaderTask).
 volatile bool sdWriteActive = false;
 
+// REV 10.14: Relay/solenoid noise gate for ADC reads.
+// When a relay GPIO changes state, the solenoid coil generates EMI that can couple into
+// the ADS1015 analog input, biasing pressure readings for ~1ms after the switch event.
+// setRelaysForMode() sets this flag before GPIO writes, delays 1ms for noise to settle,
+// then clears it. The adcReaderTask (Core 0) holds previous good values while this is true.
+//
+// Set by Core 1 (setRelaysForMode) before relay GPIO writes, cleared after 1ms settling.
+// Checked by Core 0 (adcReaderTask).
+volatile bool relayWriteActive = false;
+
 // ADC calibration constants (matched to Python pressure_sensor.py two-point formula)
 // Calibration data: ADC 4080 = -31.35 IWC, ADC 26496 = +30.0 IWC (16-bit ADS1115)
 // Slope m = (26496 - 4080) / (30.0 - (-31.35)) = 365.44 ADC(16-bit) per IWC
@@ -1526,6 +1536,12 @@ void resetSerialWatchdog() {
  */
 void setRelaysForMode(uint8_t modeNum) {
     if (relayMutex != NULL && xSemaphoreTake(relayMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // REV 10.14: Gate ADC reads during relay GPIO writes.
+        // Solenoid coils generate EMI on switch events that can couple into
+        // the ADS1015 analog input, biasing pressure readings.
+        // The adcReaderTask (Core 0) holds previous good values while this flag is set.
+        relayWriteActive = true;
+        
         switch (modeNum) {
             case 0:  // IDLE - All relay outputs OFF
                 digitalWrite(CR0_MOTOR, LOW);
@@ -1571,6 +1587,16 @@ void setRelaysForMode(uint8_t modeNum) {
                 digitalWrite(CR5, LOW);
                 break;
         }
+        
+        // REV 10.14: Wait 1ms for relay/solenoid switching noise to dissipate.
+        // Solenoid coil back-EMF and relay contact bounce generate broadband EMI
+        // that couples into the ADS1015 analog inputs via the shared PCB ground plane.
+        // 1ms is sufficient for the snubber circuit to damp the transient.
+        delay(1);
+        
+        // REV 10.14: Clear relay noise gate — ADC reader can resume normal reads.
+        relayWriteActive = false;
+        
         currentRelayMode = modeNum;
         // REV 10.11: Test state is now managed by the auto-stop timer in loop()
         // and by the stop_test/stop_cycle web handlers. No auto-clear here.
@@ -1581,6 +1607,7 @@ void setRelaysForMode(uint8_t modeNum) {
         xSemaphoreGive(relayMutex);
     } else {
         // Mutex unavailable - write directly (safety fallback)
+        relayWriteActive = true;
         switch (modeNum) {
             case 0: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, LOW); break;
             case 1: digitalWrite(CR0_MOTOR, HIGH); digitalWrite(CR1, HIGH); digitalWrite(CR2, LOW); digitalWrite(CR5, HIGH); break;
@@ -1588,6 +1615,8 @@ void setRelaysForMode(uint8_t modeNum) {
             case 3: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, HIGH); break;
             default: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, LOW); break;
         }
+        delay(1);  // REV 10.14: 1ms settling time for relay/solenoid noise
+        relayWriteActive = false;
         currentRelayMode = modeNum;
         if (modeNum <= 3) current_mode = (RunMode)modeNum;
     }
@@ -2333,13 +2362,19 @@ void adcReaderTask(void *parameter) {
         if (now - lastAdcRead >= ADC_POLL_INTERVAL) {
             lastAdcRead = now;
             
-            // REV 10.14: Skip ADC reads during SD card writes.
+            // REV 10.14: Skip ADC reads during SD card writes or relay switching.
+            //
             // SD card SPI traffic causes ~32mV analog interference on the ADS1015,
             // biasing pressure readings by -0.71 IWC for the full write duration
             // (~500-800ms). While sdWriteActive is true, we hold the previous good
             // values in the rolling average instead of feeding in biased samples.
             // The flag is set/cleared by SaveToSD() on Core 1.
-            if (sdWriteActive) {
+            //
+            // Relay/solenoid switching generates back-EMF that couples into the
+            // ADS1015 via the shared PCB ground plane. relayWriteActive is set by
+            // setRelaysForMode() on Core 1 before GPIO writes and cleared after a
+            // 1ms settling delay. Holds previous good values during the transient.
+            if (sdWriteActive || relayWriteActive) {
                 vTaskDelay(1 / portTICK_PERIOD_MS);  // Yield briefly, check again next cycle
                 continue;
             }
@@ -5423,6 +5458,14 @@ void parsedSerialData() {
     //
     // Note: We still parse and store the mode value from Linux (for CBOR, etc.)
     // — we just don't apply it to the relay GPIOs while a test is active.
+    //
+    // REV 10.14: Skip redundant relay writes when mode hasn't changed.
+    // Linux sends a data packet with "mode" every ~7 seconds. Previously, every
+    // packet triggered setRelaysForMode() even if the mode was identical, causing
+    // unnecessary GPIO writes that generate relay driver switching transients.
+    // These transients couple EMI into the ADS1015 analog input, biasing pressure
+    // readings. Now we only call setRelaysForMode() when the mode actually changes.
+    // The 15-second relay refresh (loop) still force-writes as a safety net.
     if (modeStr.length() > 0 && !failsafeMode) {
         if (testRunning) {
             // Web portal test in progress — BLOCK all Linux mode commands
@@ -5430,10 +5473,13 @@ void parsedSerialData() {
                           "(ESP32 owns relays, elapsed %lus)\r\n",
                           mode, activeTestType.c_str(),
                           (millis() - testStartTime) / 1000);
-        } else {
-            // No web portal test — apply mode from Linux normally
+        } else if ((uint8_t)mode != currentRelayMode) {
+            // Mode changed — apply new relay state from Linux
+            Serial.printf("[Serial] Mode change: %d → %d — applying to relays\r\n",
+                          currentRelayMode, mode);
             setRelaysForMode((uint8_t)mode);
         }
+        // else: same mode already active — skip redundant relay write to avoid EMI transient
     }
     
     // Display Linux device name (informational only — does NOT overwrite ESP32's stored name)
