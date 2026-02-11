@@ -683,16 +683,6 @@ volatile bool adcDataStale = false;                   // True when no good read 
 // Set by Core 1 (SaveToSD) before SPI writes, cleared after. Checked by Core 0 (adcReaderTask).
 volatile bool sdWriteActive = false;
 
-// REV 10.14: Relay/solenoid noise gate for ADC reads.
-// When a relay GPIO changes state, the solenoid coil generates EMI that can couple into
-// the ADS1015 analog input, biasing pressure readings for ~1ms after the switch event.
-// setRelaysForMode() sets this flag before GPIO writes, delays 1ms for noise to settle,
-// then clears it. The adcReaderTask (Core 0) holds previous good values while this is true.
-//
-// Set by Core 1 (setRelaysForMode) before relay GPIO writes, cleared after 1ms settling.
-// Checked by Core 0 (adcReaderTask).
-volatile bool relayWriteActive = false;
-
 // ADC calibration constants (matched to Python pressure_sensor.py two-point formula)
 // Calibration data: ADC 4080 = -31.35 IWC, ADC 26496 = +30.0 IWC (16-bit ADS1115)
 // Slope m = (26496 - 4080) / (30.0 - (-31.35)) = 365.44 ADC(16-bit) per IWC
@@ -1536,12 +1526,6 @@ void resetSerialWatchdog() {
  */
 void setRelaysForMode(uint8_t modeNum) {
     if (relayMutex != NULL && xSemaphoreTake(relayMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        // REV 10.14: Gate ADC reads during relay GPIO writes.
-        // Solenoid coils generate EMI on switch events that can couple into
-        // the ADS1015 analog input, biasing pressure readings.
-        // The adcReaderTask (Core 0) holds previous good values while this flag is set.
-        relayWriteActive = true;
-        
         switch (modeNum) {
             case 0:  // IDLE - All relay outputs OFF
                 digitalWrite(CR0_MOTOR, LOW);
@@ -1594,9 +1578,6 @@ void setRelaysForMode(uint8_t modeNum) {
         // 1ms is sufficient for the snubber circuit to damp the transient.
         delay(1);
         
-        // REV 10.14: Clear relay noise gate — ADC reader can resume normal reads.
-        relayWriteActive = false;
-        
         currentRelayMode = modeNum;
         // REV 10.11: Test state is now managed by the auto-stop timer in loop()
         // and by the stop_test/stop_cycle web handlers. No auto-clear here.
@@ -1607,7 +1588,6 @@ void setRelaysForMode(uint8_t modeNum) {
         xSemaphoreGive(relayMutex);
     } else {
         // Mutex unavailable - write directly (safety fallback)
-        relayWriteActive = true;
         switch (modeNum) {
             case 0: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, LOW); break;
             case 1: digitalWrite(CR0_MOTOR, HIGH); digitalWrite(CR1, HIGH); digitalWrite(CR2, LOW); digitalWrite(CR5, HIGH); break;
@@ -1616,7 +1596,6 @@ void setRelaysForMode(uint8_t modeNum) {
             default: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, LOW); break;
         }
         delay(1);  // REV 10.14: 1ms settling time for relay/solenoid noise
-        relayWriteActive = false;
         currentRelayMode = modeNum;
         if (modeNum <= 3) current_mode = (RunMode)modeNum;
     }
@@ -2362,19 +2341,17 @@ void adcReaderTask(void *parameter) {
         if (now - lastAdcRead >= ADC_POLL_INTERVAL) {
             lastAdcRead = now;
             
-            // REV 10.14: Skip ADC reads during SD card writes or relay switching.
-            //
+            // REV 10.14: Skip ADC reads during SD card writes.
             // SD card SPI traffic causes ~32mV analog interference on the ADS1015,
             // biasing pressure readings by -0.71 IWC for the full write duration
             // (~500-800ms). While sdWriteActive is true, we hold the previous good
             // values in the rolling average instead of feeding in biased samples.
             // The flag is set/cleared by SaveToSD() on Core 1.
             //
-            // Relay/solenoid switching generates back-EMF that couples into the
-            // ADS1015 via the shared PCB ground plane. relayWriteActive is set by
-            // setRelaysForMode() on Core 1 before GPIO writes and cleared after a
-            // 1ms settling delay. Holds previous good values during the transient.
-            if (sdWriteActive || relayWriteActive) {
+            // Note: Relay switching noise is handled by the 1ms delay() inside
+            // setRelaysForMode() itself, which lets the transient settle before
+            // returning. No ADC gating needed — the delay provides sufficient margin.
+            if (sdWriteActive) {
                 vTaskDelay(1 / portTICK_PERIOD_MS);  // Yield briefly, check again next cycle
                 continue;
             }
