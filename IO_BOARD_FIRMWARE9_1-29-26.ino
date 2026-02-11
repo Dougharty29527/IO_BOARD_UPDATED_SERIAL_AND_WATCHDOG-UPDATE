@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.11
+ *  Walter IO Board Firmware - Rev 10.12
  *  Date: 2/11/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -13,6 +13,25 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *  
+ *  Rev 10.12 (2/11/2026) - Functionality Test Rework + Watchdog Pull-Down + Device Name Fix
+ *  - FIX: Functionality test was incorrectly using mode 9 (leak test config: all valves open,
+ *    motor OFF). Now correctly mirrors Python io_manager.py functionality_test():
+ *    * 10 repetitions of Run (60s) → Purge (60s) = 20 steps, 1200 seconds (20 min)
+ *    * Motor runs during BOTH Run (mode 1) and Purge (mode 2), only off when test completes
+ *    * New FUNCTIONALITY_TEST_CYCLE[] CycleStep array (20 steps)
+ *    * Multi-step web test engine in loop() steps through sequence automatically
+ *    * Web UI shows Cycle (e.g., "3 of 10") and Phase (Run/Purge) during func test
+ *    * /api/status includes testMultiStep, testStep, testStepTotal fields
+ *  - NEW: Watchdog pin (GPIO39) internal pull-down resistor enabled via ESP-IDF
+ *    * gpio_pulldown_en() keeps pin LOW during reboots/firmware updates
+ *    * Prevents floating pin from triggering unwanted watchdog pulse
+ *    * Complements the DISP_SHUTDN (GPIO13) pull-up from Rev 10.11
+ *  - FIX: Device name set via web portal was overwritten by Linux every 15 seconds
+ *    * Root cause: Linux sends gmid in periodic JSON; ESP32 accepted it and overwrote EEPROM
+ *    * Fix: ESP32 device name is now exclusively set via web portal /setdevicename endpoint
+ *    * Linux gmid is logged for diagnostics but never overwrites the stored device name
+ *    * Also removed legacy HTTP response device name overwrite
+ *
  *  Rev 10.11 (2/11/2026) - ADC Stale Data Detection & DISP_SHUTDN GPIO Hold
  *  - BUG FIX: FAST-TX packets sent stale pressure/current when ADC failed silently
  *    * Previously: adcPressure and adcCurrent globals retained last good values forever
@@ -47,6 +66,21 @@
  *      temporarily disables hold, writes the pin, then re-enables hold
  *    * Includes driver/gpio.h for ESP-IDF gpio_hold_en/dis, gpio_pullup_en
  *    * Ref: https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html
+ *  - REWORK: Web portal tests (leak, func, eff, clean) — ESP32 owns relays entirely
+ *    * Previously: ESP32 forwarded test commands to Linux and relied on Linux to set
+ *      relay modes. The testRunning guard blocked Linux's mode response, causing tests
+ *      to not start or have long delays.
+ *    * Now: ESP32 takes SOLE control of relays when a web portal test starts.
+ *      ALL Linux mode commands are BLOCKED for the duration of the test.
+ *      Relay control returns to Linux when the test completes or is stopped.
+ *    * ESP32 sets relays IMMEDIATELY when Start button is pressed (no round-trip delay)
+ *    * Auto-stop: loop() checks test timer and auto-completes when duration expires
+ *      - leak: 30 min (mode 9), func: 20 min (10x run/purge cycle), eff: 2 min (mode 1)
+ *      - clean canister: 2 hours (mode 1) — now uses same testRunning mechanism
+ *    * Manual stop: Stop button on web portal sets relays to idle, clears testRunning
+ *    * Linux still receives start/stop commands for logging/awareness
+ *    * Linux stop_cycle command does NOT end a web portal test — only the web portal can
+ *    * Helper functions: getTestDurationSeconds(), getTestRelayMode()
  *
  *  Rev 10.10 (2/10/2026) - ADC I2C Error Diagnostics
  *  - NEW: Loud, obnoxious Serial Monitor error logging for ALL ADC read failures
@@ -489,7 +523,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.11"
+#define VERSION "Rev 10.12"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -732,6 +766,24 @@ const CycleStep CLEAN_CANISTER_CYCLE[] = {
 };
 const int CLEAN_CANISTER_CYCLE_STEPS = 1;
 
+// REV 10.11: Functionality test — mirrors Python io_manager.py functionality_test()
+// Sequence: 10 repetitions of (Run 60s, Purge 60s) = 20 steps, 1200 seconds total (20 min)
+// Run = mode 1 (Motor + CR1 + CR5 ON), Purge = mode 2 (Motor + CR2 ON)
+// Motor runs during BOTH run and purge; only off when test completes.
+const CycleStep FUNCTIONALITY_TEST_CYCLE[] = {
+    {1, 60}, {2, 60},   // Rep 1:  Run 60s, Purge 60s
+    {1, 60}, {2, 60},   // Rep 2:  Run 60s, Purge 60s
+    {1, 60}, {2, 60},   // Rep 3:  Run 60s, Purge 60s
+    {1, 60}, {2, 60},   // Rep 4:  Run 60s, Purge 60s
+    {1, 60}, {2, 60},   // Rep 5:  Run 60s, Purge 60s
+    {1, 60}, {2, 60},   // Rep 6:  Run 60s, Purge 60s
+    {1, 60}, {2, 60},   // Rep 7:  Run 60s, Purge 60s
+    {1, 60}, {2, 60},   // Rep 8:  Run 60s, Purge 60s
+    {1, 60}, {2, 60},   // Rep 9:  Run 60s, Purge 60s
+    {1, 60}, {2, 60}    // Rep 10: Run 60s, Purge 60s
+};
+const int FUNCTIONALITY_TEST_CYCLE_STEPS = 20;
+
 // Pointer to current active cycle sequence
 const CycleStep* activeCycleSequence = NORMAL_RUN_CYCLE;
 int activeCycleLength = NORMAL_RUN_CYCLE_STEPS;
@@ -928,14 +980,82 @@ String apSuffix = "";             // Stores the current suffix (random or device
 bool apNameFromSerial = false;    // True if AP name was set from serial device ID
 
 // =====================================================================
-// WEB PORTAL TEST STATE TRACKING
+// WEB PORTAL TEST STATE TRACKING (Rev 10.11: ESP32 owns relays during tests)
 // =====================================================================
-// Tracks which test (if any) is running so the web UI can display
-// elapsed time and status. Set by start_test/stop_test web commands.
-// Auto-cleared when relay mode returns to 0 (idle = test finished).
-String  activeTestType = "";          // "leak", "func", "eff", "" (empty = no test)
+// When a test is started from the Web Config Portal, the ESP32 takes SOLE
+// control of the relays. ALL mode commands from the Linux device are BLOCKED
+// until the test completes (timer expires) or is manually stopped from the
+// web portal. This ensures tests run reliably regardless of what Linux sends.
+//
+// The ESP32:
+//   1. Sets relays immediately when the Start button is pressed
+//   2. Blocks ALL Linux mode commands for the duration of the test
+//   3. Auto-stops the test when the timer expires (relays → idle, control → Linux)
+//   4. Still forwards the command to Linux for logging/awareness
+//
+// Supported test types and their configurations:
+//   "leak"  — Mode 9 (all valves open, motor OFF) for 30 minutes [SINGLE-MODE]
+//   "func"  — 10x (Run 60s → Purge 60s) = 20 min  [MULTI-STEP cycle]
+//             Mirrors Python io_manager.py functionality_test()
+//             Motor runs during both Run (mode 1) and Purge (mode 2)
+//   "eff"   — Mode 1 (run mode) for 2 minutes [SINGLE-MODE]
+//   "clean" — Mode 1 (run mode) for 120 minutes (2 hours) [SINGLE-MODE]
+//
+// Usage example (single-mode):
+//   testRunning = true; activeTestType = "leak"; testStartTime = millis();
+//   setRelaysForMode(9);  // ESP32 owns the relays now
+//   // ... 30 minutes later, auto-stop fires in loop()
+//
+// Usage example (multi-step):
+//   testRunning = true; activeTestType = "func"; webTestMultiStep = true;
+//   webTestCycleSequence = FUNCTIONALITY_TEST_CYCLE; webTestCycleLength = 20;
+//   // ... runWebPortalTestCycleLogic() in loop() steps through all 20 steps
+//   // ... auto-completes when last step finishes
+String  activeTestType = "";          // "leak", "func", "eff", "clean", "" (empty = no test)
 unsigned long testStartTime = 0;      // millis() when test started
-bool    testRunning = false;          // True while a test is in progress
+bool    testRunning = false;          // True while a web portal test is in progress
+
+// REV 10.11: Web portal multi-step test cycle state (for functionality test)
+// Functionality test is a 20-step sequence (10x run-purge) that requires stepping
+// through modes, unlike leak/eff/clean which hold a single mode for the duration.
+// These variables track the web portal cycle separately from the failsafe cycle.
+bool    webTestMultiStep = false;               // True when running a multi-step test (func)
+const CycleStep* webTestCycleSequence = NULL;   // Pointer to step array
+int     webTestCycleLength = 0;                 // Number of steps in the sequence
+int     webTestCycleStep = 0;                   // Current step index
+unsigned long webTestCycleStepTimer = 0;        // millis() when current step started
+
+// REV 10.11: Test duration lookup (in seconds) — matches web UI JavaScript durations
+// Used by auto-stop in loop() to complete tests. Func test is multi-step, but
+// total duration is still 1200s for the web UI countdown timer.
+// Returns 0 for unknown test types (no auto-stop).
+unsigned long getTestDurationSeconds(const String& testType) {
+    if (testType == "leak")  return 1800;   // 30 minutes
+    if (testType == "func")  return 1200;   // 20 minutes (10x run 60s + purge 60s)
+    if (testType == "eff")   return 120;    // 2 minutes
+    if (testType == "clean") return 7200;   // 120 minutes (2 hours)
+    return 0;  // Unknown — no auto-stop
+}
+
+// REV 10.11: Get the INITIAL relay mode for a given test type.
+// For single-mode tests (leak, eff, clean), this is the only mode used.
+// For multi-step tests (func), this returns the FIRST step mode — subsequent
+// steps are driven by runWebPortalTestCycleLogic().
+// Returns 0 (idle) for unknown test types.
+uint8_t getTestRelayMode(const String& testType) {
+    if (testType == "leak")  return 9;   // All valves open, motor OFF
+    if (testType == "func")  return 1;   // First step is Run (multi-step cycle handles the rest)
+    if (testType == "eff")   return 1;   // Run mode
+    if (testType == "clean") return 1;   // Run mode (motor on for 2 hours)
+    return 0;  // Unknown
+}
+
+// REV 10.11: Check if a test type uses a multi-step cycle sequence.
+// Multi-step tests are driven by runWebPortalTestCycleLogic() in loop(),
+// NOT by the simple timer-based auto-stop.
+bool isMultiStepTest(const String& testType) {
+    return (testType == "func");
+}
 
 // REV 10.5/10.9: Serial JSON output to Python device (via Serial1/RS-232)
 // Three sending mechanisms (Rev 10.9):
@@ -1361,12 +1481,8 @@ void setRelaysForMode(uint8_t modeNum) {
                 break;
         }
         currentRelayMode = modeNum;
-        // Auto-clear test state when relays return to idle (test finished)
-        if (modeNum == 0 && testRunning) {
-            testRunning = false;
-            activeTestType = "";
-            Serial.println("[TEST] Auto-cleared — relays returned to idle");
-        }
+        // REV 10.11: Test state is now managed by the auto-stop timer in loop()
+        // and by the stop_test/stop_cycle web handlers. No auto-clear here.
         // Update current_mode enum for LED color display
         if (modeNum <= 3) {
             current_mode = (RunMode)modeNum;
@@ -2666,7 +2782,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.11</title>
+    <title>Walter IO Board - Rev 10.12</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -2750,7 +2866,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.11</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.12</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -2851,11 +2967,14 @@ const char* control_html = R"rawliteral(
     </div>
 
     <!-- ============ FUNCTIONALITY TEST SCREEN ============ -->
+    <!-- 10x (Run 60s → Purge 60s) = 20 steps, 20 minutes total -->
     <div class="screen" id="scr-func">
         <div class="hdr"><h1>Functionality Test</h1></div>
         <div class="card"><div class="card-body">
             <div class="countdown" id="funcTimer">--</div>
             <div class="test-status" id="funcStatus">Ready</div>
+            <div class="row" style="margin-top:8px"><span class="lbl">Cycle</span><span class="val" id="funcCycle">--</span></div>
+            <div class="row"><span class="lbl">Phase</span><span class="val" id="funcPhase">--</span></div>
         </div></div>
         <div style="display:flex;gap:8px;margin:10px 0">
             <button class="btn" style="flex:1;padding:12px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-weight:700" onclick="sendCmd('start_test','func')">Start</button>
@@ -3289,15 +3408,15 @@ const char* control_html = R"rawliteral(
                             var stat='Running ('+d.testType+')';
                             // Update the correct screen's timer based on test type
                             if(d.testType==='leak'){upd('leakTimer',tmr);upd('leakStatus',stat);}
-                            else if(d.testType==='func'){upd('funcTimer',tmr);upd('funcStatus',stat);}
+                            else if(d.testType==='func'){upd('funcTimer',tmr);upd('funcStatus',stat);if(d.testMultiStep){var rep=Math.floor(d.testStep/2)+1;var phase=(d.testStep%2===0)?'Run':'Purge';upd('funcCycle',rep+' of '+(d.testStepTotal/2));upd('funcPhase',phase);}}
                             else if(d.testType==='eff'){upd('effTime',tmr);upd('effStep','Running');upd('effMode',modeNames[d.mode]||d.mode);}
                             else if(d.testType==='clean'){upd('cleanTimer',tmr);upd('cleanStatus',stat);}
                         } else {
                             // No test running — only reset to defaults if they were showing active
                             var lt=$('leakStatus');if(lt&&lt.textContent.indexOf('Running')>=0){upd('leakTimer','--:--');upd('leakStatus','Ready');}
-                            var ft=$('funcStatus');if(ft&&ft.textContent.indexOf('Running')>=0){upd('funcTimer','--');upd('funcStatus','Ready');}
+                            var ft=$('funcStatus');if(ft&&ft.textContent.indexOf('Running')>=0){upd('funcTimer','--');upd('funcStatus','Ready');upd('funcCycle','--');upd('funcPhase','--');}
                             var es=$('effStep');if(es&&es.textContent.indexOf('Running')>=0){upd('effTime','--');upd('effStep','--');upd('effMode','--');}
-                            var cs=$('cleanStatus');if(cs&&cs.textContent.indexOf('Running')>=0){upd('cleanTimer','15:00');upd('cleanStatus','Ready');}
+                            var cs=$('cleanStatus');if(cs&&cs.textContent.indexOf('Running')>=0){upd('cleanTimer','120:00');upd('cleanStatus','Ready');}
                         }
                         // Profiles
                         upd('profCurrent',d.profile);
@@ -3931,13 +4050,16 @@ void startConfigAP() {
             serialDebugMode ? "true" : "false");
         
         // Test state, datetime, uptime, mac
+        // Include multi-step test progress (step/total) when running functionality test
         pos += snprintf(json + pos, sizeof(json) - pos,
             "\"testRunning\":%s,\"testType\":\"%s\","
             "\"testElapsed\":%lu,"
+            "\"testMultiStep\":%s,\"testStep\":%d,\"testStepTotal\":%d,"
             "\"datetime\":\"%s\",\"uptime\":\"%s\","
             "\"macAddress\":\"%s\"}",
             testRunning ? "true" : "false", activeTestType.c_str(),
             testElapsedSec,
+            webTestMultiStep ? "true" : "false", webTestCycleStep, webTestCycleLength,
             dtStr.c_str(), uptimeStr,
             macStr.c_str());
         
@@ -3967,16 +4089,32 @@ void startConfigAP() {
                 if (val == "run") startFailsafeCycle(0);
                 else if (val == "manual_purge") startFailsafeCycle(1);
                 else if (val == "clean") startFailsafeCycle(2);
+            } else if (val == "clean") {
+                // =========================================================
+                // REV 10.11: CLEAN CANISTER — ESP32 takes sole relay control
+                // Clean canister is a maintenance operation started from the
+                // web portal. Like leak/func/eff tests, the ESP32 owns the
+                // relays for the duration (2 hours) and blocks Linux mode
+                // commands. Uses the same testRunning mechanism as start_test.
+                // =========================================================
+                setRelaysForMode(1);  // Run mode (motor on for cleaning)
+                activeTestType = "clean";
+                testStartTime = millis();
+                testRunning = true;
+                
+                Serial.printf("[WEB CMD] ===== WEB PORTAL CLEAN CANISTER STARTED =====\r\n");
+                Serial.printf("[WEB CMD]   Relay mode: 1 (Run)  |  Duration: 7200 sec (2 hours)\r\n");
+                Serial.printf("[WEB CMD]   ESP32 owns relays — ALL Linux mode commands BLOCKED\r\n");
+                
+                // Forward to Linux for logging/awareness
+                Serial1.println("{\"command\":\"start_cycle\",\"type\":\"clean\"}");
             } else {
                 // =========================================================
-                // NORMAL MODE: Linux is connected and controls relays.
+                // NORMAL MODE: run, manual_purge — Linux controls relays.
                 // Forward the start_cycle command to Linux via Serial1.
-                // Linux's IOManager will run the cycle through its normal
-                // cycle management (alarms, DB logging, pause/resume, etc.)
-                //
-                // Previously this called startFailsafeCycle() which would
-                // set relays, but Linux would override them within 500ms
-                // because its ModeManager was still in rest mode.
+                // Linux's IOManager runs the cycle with proper alarm monitoring,
+                // DB logging, pause/resume, etc. The ESP32 does NOT take over
+                // relay control for normal run/purge cycles.
                 // =========================================================
                 char cmdBuf[128];
                 snprintf(cmdBuf, sizeof(cmdBuf),
@@ -3994,44 +4132,108 @@ void startConfigAP() {
                 Serial1.println("{\"command\":\"stop_cycle\"}");
                 Serial.println("[WEB CMD] Forwarded stop_cycle to Linux");
             }
-            // Clear test state if a test was running (stop_cycle stops tests too)
+            // REV 10.11: If a web portal test was running, release relay control
+            // Set relays to idle and clear test state — Linux resumes relay control
             if (testRunning) {
+                Serial.printf("[WEB CMD] ===== WEB PORTAL TEST STOPPED (manual) =====\r\n");
+                Serial.printf("[WEB CMD]   Was: %s  |  Elapsed: %lu sec\r\n",
+                              activeTestType.c_str(), (millis() - testStartTime) / 1000);
+                Serial.printf("[WEB CMD]   Relays → idle (mode 0)  |  Linux resumes relay control\r\n");
+                setRelaysForMode(0);  // Idle — all relays OFF
                 testRunning = false;
                 activeTestType = "";
-                Serial.println("[WEB CMD] Test cleared by stop_cycle");
+                webTestMultiStep = false;  // Clear multi-step state
             }
             request->send(200, "application/json", "{\"ok\":true}");
         }
         // =========================================================
-        // START TEST — Forwards test commands to Linux via Serial1
-        // Tests: "leak" (30 min), "func" (20 min), "eff" (varies)
-        // ESP32 tracks state for timer display; Linux runs the actual test.
+        // START TEST — ESP32 takes SOLE control of relays (Rev 10.11)
+        //
+        // Single-mode tests (leak, eff): Set one relay mode for the duration.
+        // Multi-step tests (func): Step through a CycleStep sequence
+        //   driven by runWebPortalTestCycleLogic() in loop().
+        //
+        // The ESP32 blocks ALL Linux mode commands until the test
+        // auto-completes or user presses Stop.
         // =========================================================
         else if (cmd == "start_test") {
-            if (!failsafeMode) {
-                // Forward to Linux — Python IOManager has the test functions
+            uint8_t testMode = getTestRelayMode(val);
+            unsigned long testDur = getTestDurationSeconds(val);
+            
+            if (testMode == 0 || testDur == 0) {
+                Serial.printf("[WEB CMD] Unknown test type: %s\r\n", val.c_str());
+                request->send(400, "application/json", "{\"ok\":false,\"error\":\"Unknown test type\"}");
+            } else {
+                // Track test state for timer, auto-stop, and Linux mode blocking
+                activeTestType = val;
+                testStartTime = millis();
+                testRunning = true;
+                
+                // Check if this is a multi-step test (functionality test)
+                if (isMultiStepTest(val)) {
+                    // MULTI-STEP: Functionality test = 10x (Run 60s → Purge 60s)
+                    // Set up the cycle sequence — runWebPortalTestCycleLogic() in loop()
+                    // will advance through the steps automatically.
+                    webTestMultiStep = true;
+                    webTestCycleSequence = FUNCTIONALITY_TEST_CYCLE;
+                    webTestCycleLength = FUNCTIONALITY_TEST_CYCLE_STEPS;
+                    webTestCycleStep = 0;
+                    webTestCycleStepTimer = millis();
+                    
+                    // Start the first step
+                    setRelaysForMode(webTestCycleSequence[0].mode);
+                    
+                    Serial.printf("[WEB CMD] ===== WEB PORTAL MULTI-STEP TEST STARTED =====\r\n");
+                    Serial.printf("[WEB CMD]   Type: %s  |  Steps: %d  |  Total duration: %lu sec\r\n",
+                                  val.c_str(), webTestCycleLength, testDur);
+                    Serial.printf("[WEB CMD]   Step 0: mode %d for %d sec (Run)\r\n",
+                                  webTestCycleSequence[0].mode,
+                                  webTestCycleSequence[0].durationSeconds);
+                    Serial.printf("[WEB CMD]   Sequence: 10x (Run 60s → Purge 60s)\r\n");
+                } else {
+                    // SINGLE-MODE: Leak, Eff — hold one relay mode for the duration
+                    webTestMultiStep = false;
+                    setRelaysForMode(testMode);
+                    
+                    Serial.printf("[WEB CMD] ===== WEB PORTAL TEST STARTED =====\r\n");
+                    Serial.printf("[WEB CMD]   Type: %s  |  Relay mode: %d  |  Duration: %lu sec\r\n",
+                                  val.c_str(), testMode, testDur);
+                }
+                
+                Serial.printf("[WEB CMD]   ESP32 owns relays — ALL Linux mode commands BLOCKED\r\n");
+                
+                // Forward to Linux for logging/awareness (Linux does NOT control relays)
                 char cmdBuf[128];
                 snprintf(cmdBuf, sizeof(cmdBuf),
                          "{\"command\":\"start_test\",\"type\":\"%s\"}", val.c_str());
                 Serial1.println(cmdBuf);
-                Serial.printf("[WEB CMD] Forwarded test to Linux: %s\r\n", cmdBuf);
-                // Track test state for web UI timer display
-                activeTestType = val;
-                testStartTime = millis();
-                testRunning = true;
-            } else {
-                Serial.println("[WEB CMD] start_test ignored — failsafe mode active");
+                
+                request->send(200, "application/json", "{\"ok\":true}");
             }
-            request->send(200, "application/json", "{\"ok\":true}");
         }
-        // STOP TEST — same as stop_cycle (Python stop_cycle() stops all processes)
+        // STOP TEST — ESP32 releases relay control, returns to idle
+        // REV 10.11: Sets relays to idle and clears testRunning so Linux
+        // resumes relay control on its next mode command.
         else if (cmd == "stop_test") {
+            if (testRunning) {
+                Serial.printf("[WEB CMD] ===== WEB PORTAL TEST STOPPED (manual) =====\r\n");
+                Serial.printf("[WEB CMD]   Was: %s  |  Elapsed: %lu sec\r\n",
+                              activeTestType.c_str(), (millis() - testStartTime) / 1000);
+                if (webTestMultiStep) {
+                    Serial.printf("[WEB CMD]   Was on step %d of %d\r\n",
+                                  webTestCycleStep, webTestCycleLength);
+                }
+                Serial.printf("[WEB CMD]   Relays → idle (mode 0)  |  Linux resumes relay control\r\n");
+                setRelaysForMode(0);  // Idle — all relays OFF
+                testRunning = false;
+                activeTestType = "";
+                webTestMultiStep = false;  // Clear multi-step state
+            }
+            // Notify Linux the test was stopped
             if (!failsafeMode) {
                 Serial1.println("{\"command\":\"stop_cycle\"}");
                 Serial.println("[WEB CMD] Forwarded stop_test as stop_cycle to Linux");
             }
-            testRunning = false;
-            activeTestType = "";
             request->send(200, "application/json", "{\"ok\":true}");
         }
         // =========================================================
@@ -4219,14 +4421,11 @@ void getHTTPinfo() {
                     String timingString = String(timing);
                     timing *= 1000;
                     String newId = String(idBuf);
+                    // Display server device ID (informational only — does NOT overwrite ESP32's stored name)
+                    // The ESP32 device name is set exclusively via the web portal.
                     if (DeviceName != newId) {
-                        DeviceName = newId;
-                        strncpy(deviceName, DeviceName.c_str(), sizeof(deviceName) - 1);
-                        deviceName[sizeof(deviceName) - 1] = '\0';
-                        preferences.begin("RMS", false);
-                        preferences.putString("DeviceName", DeviceName);
-                        preferences.putString("DeviceNameBackup", DeviceName);
-                        preferences.end();
+                        Serial.println("[HTTP] Server device ID: '" + newId + 
+                                       "' (ESP32 name: '" + DeviceName + "' — NOT overwriting)");
                     }
                     if (sendInterval != timing) {
                         sendInterval = timing;
@@ -4899,11 +5098,14 @@ void readSerialData() {
                     }
                     else if (cmdType == "stop_cycle") {
                         stopFailsafeCycle("Serial command");
-                        // REV 10.5: Clear web test state so serial mode control resumes
+                        // REV 10.11: Linux stop_cycle does NOT clear web portal tests.
+                        // The ESP32 owns relays during web portal tests — only the web
+                        // portal Stop button or the auto-stop timer can end a test.
+                        // Linux stop_cycle only stops failsafe cycles.
                         if (testRunning) {
-                            testRunning = false;
-                            activeTestType = "";
-                            Serial.println("[Serial] Test cleared by stop_cycle from Linux");
+                            Serial.printf("[Serial] stop_cycle from Linux IGNORED for web test '%s' "
+                                          "— only web portal Stop or timer can end it\r\n",
+                                          activeTestType.c_str());
                         }
                         jsonBuffer = "";
                         return;
@@ -5069,52 +5271,38 @@ void parsedSerialData() {
     // Rev 10: Set relay outputs based on mode field from Linux
     // This replaces the old I2C register write approach
     //
-    // REV 10.5 FIX: When a web portal test is running, protect it from
-    // being overridden by non-zero serial mode commands (e.g. periodic
-    // Linux payload sending "mode":1 during a leak test).
+    // REV 10.11: Web Portal Test Relay Override
+    // When a web portal test is running (leak, func, eff, clean), the ESP32
+    // has SOLE control of the relays. ALL mode commands from Linux are BLOCKED
+    // — including mode 0. The web portal test can ONLY be stopped by:
+    //   1. The user pressing Stop on the web portal
+    //   2. The test auto-completing when its timer expires
     //
-    // EXCEPTION: Mode 0 (rest/idle) ALWAYS passes through — it is the
-    // universal "stop everything" signal. Without this exception, the
-    // testRunning flag could get permanently stuck: serial mode commands
-    // are blocked, so setRelaysForMode(0) never fires, so the auto-clear
-    // inside setRelaysForMode() never runs. Mode 0 from Linux means
-    // "go to rest" — if Linux says stop, we stop.
+    // This prevents Linux's periodic mode messages (e.g. "mode":1 every 15s)
+    // from interfering with maintenance tests. The ESP32 releases relay control
+    // back to Linux when testRunning is cleared.
+    //
+    // Note: We still parse and store the mode value from Linux (for CBOR, etc.)
+    // — we just don't apply it to the relay GPIOs while a test is active.
     if (modeStr.length() > 0 && !failsafeMode) {
-        if (testRunning && mode != 0) {
-            // Web portal test in progress and Linux sent a non-zero mode
-            // — do NOT let serial mode override the active test
-            Serial.printf("[Serial] Mode %d from Linux IGNORED — web test '%s' in progress\r\n",
-                          mode, activeTestType.c_str());
+        if (testRunning) {
+            // Web portal test in progress — BLOCK all Linux mode commands
+            Serial.printf("[Serial] Mode %d from Linux BLOCKED — web test '%s' in progress "
+                          "(ESP32 owns relays, elapsed %lus)\r\n",
+                          mode, activeTestType.c_str(),
+                          (millis() - testStartTime) / 1000);
         } else {
-            // Normal mode apply — either no test running, or mode is 0 (rest)
-            if (testRunning && mode == 0) {
-                Serial.printf("[Serial] Mode 0 from Linux — clearing web test '%s'\r\n",
-                              activeTestType.c_str());
-                testRunning = false;
-                activeTestType = "";
-            }
+            // No web portal test — apply mode from Linux normally
             setRelaysForMode((uint8_t)mode);
         }
     }
     
-    // Update device name if provided and different
+    // Display Linux device name (informational only — does NOT overwrite ESP32's stored name)
+    // The ESP32 device name is set exclusively via the web portal /setdevicename endpoint.
+    // Previously, Linux's gmid would overwrite web portal changes every 15 seconds.
     if (gmidStr.length() > 0 && gmidStr != String(deviceName)) {
-        Serial.println("[Serial] Updating device name from '" + String(deviceName) + "' to '" + gmidStr + "'");
-        DeviceName = gmidStr;
-        strncpy(deviceName, gmidStr.c_str(), sizeof(deviceName) - 1);
-        deviceName[sizeof(deviceName) - 1] = '\0';
-        
-        // Save to preferences/EPROM
-        preferences.begin("RMS", false);
-        preferences.putString("DeviceName", DeviceName);
-        preferences.putString("APSuffix", DeviceName);  // Also update AP suffix
-        preferences.end();
-        Serial.println("✓ Device name saved to EPROM: " + DeviceName);
-        
-        // Update WiFi AP name with the new device ID
-        updateAPName(DeviceName, true);  // Restart AP with new name
-        apNameFromSerial = true;  // Mark as received from serial
-        Serial.println("[Serial] WiFi AP name updated to: " + String(apSSID));
+        Serial.println("[Serial] Linux device name: '" + gmidStr + 
+                       "' (ESP32 name: '" + String(deviceName) + "' — NOT overwriting)");
     }
     
     // Log received data from Linux (cycles, faults, GMID are used; pressure/current are informational only)
@@ -6145,7 +6333,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.11                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.12                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -6155,10 +6343,16 @@ void setup() {
     // Allocate CBOR passthrough buffer
     allocateCborPassthroughBuffer();
     
-    // Initialize watchdog pin
+    // Initialize watchdog pin with internal pull-down
+    // The pull-down ensures GPIO39 stays LOW during reboots/firmware updates,
+    // preventing a floating pin from triggering an unwanted watchdog pulse.
+    // Same approach as the DISP_SHUTDN pull-up — uses ESP-IDF GPIO functions.
     pinMode(ESP_WATCHDOG_PIN, OUTPUT);
     digitalWrite(ESP_WATCHDOG_PIN, LOW);
+    gpio_pulldown_en((gpio_num_t)ESP_WATCHDOG_PIN);   // Internal pull-down (~45kΩ) keeps pin LOW
+    gpio_pullup_dis((gpio_num_t)ESP_WATCHDOG_PIN);    // Disable pull-up (conflicting with pull-down)
     Serial.println("✓ Serial watchdog pin (GPIO39) initialized");
+    Serial.println("  Internal pull-down: ENABLED (prevents floating during resets)");
     
     delay(500);
     
@@ -6378,7 +6572,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.11 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.12 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
@@ -6611,6 +6805,87 @@ void loop() {
                           currentRelayMode, RELAY_REFRESH_INTERVAL / 1000);
         }
         lastRelayRefreshTime = currentTime;
+    }
+    
+    // =====================================================================
+    // REV 10.11: WEB PORTAL TEST ENGINE
+    // When a web portal test is running, the ESP32 owns the relays.
+    //
+    // Two types of tests:
+    //   1. Single-mode (leak, eff, clean): Hold one relay mode, auto-stop on timer.
+    //   2. Multi-step (func): Step through a CycleStep sequence, auto-stop on completion.
+    //
+    // Both types block ALL Linux mode commands via the testRunning guard.
+    // =====================================================================
+    if (testRunning) {
+        if (webTestMultiStep && webTestCycleSequence != NULL) {
+            // --- MULTI-STEP TEST (functionality test) ---
+            // Step through the CycleStep sequence, advancing when each step's timer expires.
+            // Mirrors the failsafe cycle engine but runs independently.
+            unsigned long stepDurationMs = (unsigned long)webTestCycleSequence[webTestCycleStep].durationSeconds * 1000UL;
+            
+            if (millis() - webTestCycleStepTimer >= stepDurationMs) {
+                // Current step complete — advance to next
+                webTestCycleStep++;
+                
+                if (webTestCycleStep >= webTestCycleLength) {
+                    // All steps complete — test finished
+                    Serial.printf("[WEB TEST] ===== MULTI-STEP TEST AUTO-COMPLETED =====\r\n");
+                    Serial.printf("[WEB TEST]   Type: %s  |  Steps: %d  |  COMPLETED\r\n",
+                                  activeTestType.c_str(), webTestCycleLength);
+                    Serial.printf("[WEB TEST]   Relays → idle (mode 0)  |  Linux resumes relay control\r\n");
+                    
+                    setRelaysForMode(0);
+                    
+                    // Notify Linux
+                    char notifyBuf[128];
+                    snprintf(notifyBuf, sizeof(notifyBuf),
+                             "{\"command\":\"test_complete\",\"type\":\"%s\"}", activeTestType.c_str());
+                    Serial1.println(notifyBuf);
+                    
+                    testRunning = false;
+                    activeTestType = "";
+                    webTestMultiStep = false;
+                } else {
+                    // Start the next step
+                    uint8_t nextMode = webTestCycleSequence[webTestCycleStep].mode;
+                    uint16_t nextDur = webTestCycleSequence[webTestCycleStep].durationSeconds;
+                    setRelaysForMode(nextMode);
+                    webTestCycleStepTimer = millis();
+                    
+                    // Log step transition
+                    const char* modeName = (nextMode == 1) ? "Run" : (nextMode == 2) ? "Purge" : 
+                                           (nextMode == 3) ? "Burp" : "?";
+                    Serial.printf("[WEB TEST] Step %d/%d: mode %d (%s) for %d sec  [rep %d of %d]\r\n",
+                                  webTestCycleStep, webTestCycleLength,
+                                  nextMode, modeName, nextDur,
+                                  (webTestCycleStep / 2) + 1, webTestCycleLength / 2);
+                }
+            }
+        } else {
+            // --- SINGLE-MODE TEST (leak, eff, clean) ---
+            // Hold one relay mode, auto-stop when the timer expires.
+            unsigned long testDuration = getTestDurationSeconds(activeTestType);
+            unsigned long testElapsed = (millis() - testStartTime) / 1000;
+            
+            if (testDuration > 0 && testElapsed >= testDuration) {
+                Serial.printf("[WEB TEST] ===== WEB PORTAL TEST AUTO-COMPLETED =====\r\n");
+                Serial.printf("[WEB TEST]   Type: %s  |  Duration: %lu sec  |  COMPLETED\r\n",
+                              activeTestType.c_str(), testDuration);
+                Serial.printf("[WEB TEST]   Relays → idle (mode 0)  |  Linux resumes relay control\r\n");
+                
+                setRelaysForMode(0);
+                
+                // Notify Linux
+                char notifyBuf[128];
+                snprintf(notifyBuf, sizeof(notifyBuf),
+                         "{\"command\":\"test_complete\",\"type\":\"%s\"}", activeTestType.c_str());
+                Serial1.println(notifyBuf);
+                
+                testRunning = false;
+                activeTestType = "";
+            }
+        }
     }
     
     // =====================================================================

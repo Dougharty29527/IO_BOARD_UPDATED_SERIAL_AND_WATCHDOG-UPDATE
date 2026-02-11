@@ -1,6 +1,6 @@
 # Walter IO Board Firmware
 
-**Version:** Rev 10.11  
+**Version:** Rev 10.12  
 **Date:** February 11, 2026  
 **Authors:** Todd Adams & Doug Harty
 
@@ -295,7 +295,8 @@ These codes are **added** to any existing fault codes from the Linux device.
 
 | Version | Date | Description |
 |---------|------|-------------|
-| **Rev 10.11** | **2/11/2026** | **ADC stale data detection: if no successful ADC read for 60 seconds, sends pressure=-99.9 (fault sentinel) and current=0.0 to Linux. Previously stale values persisted indefinitely after I2C failures. Auto-recovers when ADC responds. DISP_SHUTDN (GPIO13/CR6): internal pull-up + ESP-IDF gpio_hold_en() keeps pin HIGH through reboots and OTA firmware updates — prevents momentary LOW glitch during reset.** |
+| **Rev 10.12** | **2/11/2026** | **Functionality test reworked from incorrect mode 9 to proper 10x (Run 60s → Purge 60s) multi-step cycle mirroring Python io_manager.py. Web UI shows cycle/phase progress. Watchdog pin (GPIO39) internal pull-down prevents floating during resets. Device name fix: web portal name no longer overwritten by Linux gmid every 15 seconds.** |
+| Rev 10.11 | 2/11/2026 | ADC stale data detection: sends pressure=-99.9 sentinel after 60s of failed reads. DISP_SHUTDN GPIO hold survives reboots/OTA. Web portal tests: ESP32 takes sole relay control, blocks Linux mode commands. |
 | Rev 10.10 | 2/10/2026 | ADC I2C error diagnostics: loud ###-bordered Serial Monitor alerts for pressure/current read failures. Three-tier current validation (NACK, full-scale rail, abnormal). Invalid reads skipped to protect rolling average. Reinit and reconnect attempts now logged. Always-on (not gated by debug mode). |
 | Rev 10.9 | 2/10/2026 | Serial debug mode (toggle via web portal, EEPROM-persisted). IMEI/IMSI/ICCID/Technology added to cellular JSON. Cellular packet now 10-second timer. Datetime split into own packet. Calibration safety: middle 20% ADC range. EEPROM validates on boot. ADC outlier rejection. |
 | Rev 10.8 | 2/10/2026 | Mode confirmation: 15-second relay state refresh re-applies currentRelayMode to GPIO pins. Fast sensor packet extended with failsafe and shutdown fields. Three-layer mode delivery redundancy (immediate + 15s payload + relay refresh). Zero Python changes required. |
