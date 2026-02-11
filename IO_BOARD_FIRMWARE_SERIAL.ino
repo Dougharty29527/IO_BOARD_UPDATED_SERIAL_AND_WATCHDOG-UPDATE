@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.13
+ *  Walter IO Board Firmware - Rev 10.14
  *  Date: 2/11/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -13,6 +13,21 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *  
+ *  Rev 10.14 (2/11/2026) - ADC/SD Card SPI Interference Fix
+ *  - BUG FIX: Pressure reading showed spurious -0.71 IWC every ~7 seconds
+ *    * Root cause: SD card SPI write traffic (~500-800ms) couples ~32mV analog
+ *      interference into ADS1015, biasing raw ADC by ~16 counts below true value
+ *    * Affected readings entered 60-sample rolling average, contaminating it
+ *    * Pattern: P=0.00 → P=-0.71 for ~800ms → P=0.00 (repeats on each SD write)
+ *  - FIX: Cross-core SD write gate (sdWriteActive flag)
+ *    * SaveToSD() sets sdWriteActive=true before SPI operations, clears after
+ *    * ADC reader task (Core 0) checks flag — skips I2C reads while SPI is active
+ *    * Rolling average holds last good values during SD writes (no contamination)
+ *    * Zero-latency recovery: ADC resumes reading instantly when SPI completes
+ *  - NOTE: ~50 ADC samples (~800ms at 60Hz) are skipped per SD write cycle.
+ *    The rolling average uses the previous 60 good samples during this window,
+ *    so pressure output remains stable and accurate.
+ *
  *  Rev 10.13 (2/11/2026) - Non-Blocking Cellular Initialization
  *  - ARCHITECTURE: Cellular connection no longer blocks setup() for 5+ minutes.
  *    * setup() completes in ~3 seconds — GPIO, ADC, serial, web portal, relays all operational
@@ -544,7 +559,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.13"
+#define VERSION "Rev 10.14"
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -657,6 +672,16 @@ volatile unsigned long lastSuccessfulAdcRead = 0;    // millis() of last good AD
 const unsigned long ADC_STALE_TIMEOUT_MS = 60000;    // 60 seconds — data considered stale after this
 const float ADC_FAULT_PRESSURE = -99.9;              // Sentinel value: "pressure sensor fault"
 volatile bool adcDataStale = false;                   // True when no good read for > 60 seconds
+
+// REV 10.14: SD card SPI write gate for ADC reader
+// SD card writes generate sustained SPI bus traffic (clock + data) that causes electrical
+// interference on the ADS1015 I2C bus or analog input. This biases the ADC reading by
+// ~16 counts (≈ -0.71 IWC) for the full 500-800ms duration of the SPI activity.
+// When sdWriteActive is true, the ADC reader task holds its previous good values instead
+// of reading the ADC, preventing the biased samples from entering the rolling average.
+//
+// Set by Core 1 (SaveToSD) before SPI writes, cleared after. Checked by Core 0 (adcReaderTask).
+volatile bool sdWriteActive = false;
 
 // ADC calibration constants (matched to Python pressure_sensor.py two-point formula)
 // Calibration data: ADC 4080 = -31.35 IWC, ADC 26496 = +30.0 IWC (16-bit ADS1115)
@@ -2308,6 +2333,17 @@ void adcReaderTask(void *parameter) {
         if (now - lastAdcRead >= ADC_POLL_INTERVAL) {
             lastAdcRead = now;
             
+            // REV 10.14: Skip ADC reads during SD card writes.
+            // SD card SPI traffic causes ~32mV analog interference on the ADS1015,
+            // biasing pressure readings by -0.71 IWC for the full write duration
+            // (~500-800ms). While sdWriteActive is true, we hold the previous good
+            // values in the rolling average instead of feeding in biased samples.
+            // The flag is set/cleared by SaveToSD() on Core 1.
+            if (sdWriteActive) {
+                vTaskDelay(1 / portTICK_PERIOD_MS);  // Yield briefly, check again next cycle
+                continue;
+            }
+            
             if (adcInitialized) {
                 // Read Channel 0: Pressure sensor (single-ended)
                 int16_t rawPressure = ads.readADC_SingleEnded(0);
@@ -2848,7 +2884,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.13</title>
+    <title>Walter IO Board - Rev 10.14</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -2932,7 +2968,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.13</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.14</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -3683,6 +3719,13 @@ void SaveToSD(String id, unsigned long seq, int pres, int cycles, int fault, int
     
     Serial.print("Writing to SD: ");
     Serial.println(line);
+    
+    // REV 10.14: Gate ADC reads during SD card SPI activity.
+    // SD card writes generate sustained SPI traffic that causes ~32mV analog interference
+    // on the ADS1015, biasing pressure readings by -0.71 IWC for the full write duration.
+    // The ADC reader task (Core 0) checks this flag and holds previous good values.
+    sdWriteActive = true;
+    
     if (logFile.println(line) == 0) {
         Serial.println(F("Error: SD write failed"));
         logFile.close();
@@ -3730,6 +3773,10 @@ void SaveToSD(String id, unsigned long seq, int pres, int cycles, int fault, int
         lastYear = currentYear;
         cleanupOldLogFiles(currentYear);
     }
+    
+    // REV 10.14: Clear the SD write gate — ADC reader can resume normal reads.
+    // This must be the LAST line before return, after all SD/SPI operations complete.
+    sdWriteActive = false;
 }
 
 /**
@@ -6751,7 +6798,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.13                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.14                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -6887,7 +6934,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.13 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.14 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
