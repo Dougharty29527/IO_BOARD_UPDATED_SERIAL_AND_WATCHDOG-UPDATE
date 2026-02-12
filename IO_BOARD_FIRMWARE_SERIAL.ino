@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.14
+ *  Walter IO Board Firmware - Rev 10.16
  *  Date: 2/11/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -13,6 +13,30 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *  
+ *  Rev 10.16 (2/12/2026) - Staggered Relay Pin Switching for Noise Reduction
+ *  - NEW: RELAY_DELAY define (default 1ms) — easily adjustable for testing
+ *    * Controls delay between each individual relay GPIO pin change
+ *    * Simultaneous activation of CR0_MOTOR, CR1, CR2, CR5 caused electrical
+ *      noise coupling into ADS1015 analog inputs during mode transitions
+ *  - IMPROVED: Relay pin changes now staggered by RELAY_DELAY ms between each pin
+ *    * setRelaysForMode() mutex path: all 7 mode cases (0,1,2,3,8,9,default)
+ *    * setRelaysForMode() fallback path: all 5 mode cases
+ *    * Boot-time relay init in adcReaderTask(): 4 pins set LOW at startup
+ *    * Total time per mode change: ~3 × RELAY_DELAY ms (3 gaps between 4 pins)
+ *    * Replaces single post-switch delay with per-pin staggering
+ *
+ *  Rev 10.15 (2/11/2026) - Relay Noise Settling + Skip Redundant Relay Writes
+ *  - NEW: 1ms delay after relay GPIO writes in setRelaysForMode()
+ *    * Allows solenoid coil back-EMF and relay contact bounce to settle
+ *    * Applied in both mutex and fallback (safety) code paths
+ *    * Prevents EMI transients from coupling into ADS1015 analog inputs
+ *  - IMPROVED: Serial data handler skips redundant setRelaysForMode() calls
+ *    * Linux sends mode in every JSON data packet (~every 7 seconds)
+ *    * Previously, every packet triggered full GPIO writes even if mode unchanged
+ *    * Now only calls setRelaysForMode() when mode actually changes
+ *    * 15-second relay refresh still force-writes as a safety net against pin drift
+ *    * Eliminates unnecessary relay driver activity during steady-state operation
+ *
  *  Rev 10.14 (2/11/2026) - ADC/SD Card SPI Interference Fix
  *  - BUG FIX: Pressure reading showed spurious -0.71 IWC every ~7 seconds
  *    * Root cause: SD card SPI write traffic (~500-800ms) couples ~32mV analog
@@ -559,7 +583,17 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.14"
+#define VERSION "Rev 10.16"
+
+// REV 10.16: Delay between individual relay GPIO pin changes (milliseconds).
+// Simultaneous activation of CR0_MOTOR, CR1, CR2, CR5 causes electrical noise
+// that couples into the ADS1015 analog inputs. Staggering each pin change by
+// RELAY_DELAY ms reduces the combined inrush/back-EMF transient.
+// Adjust this value to tune the trade-off between switching speed and noise.
+//
+// Usage: Used in setRelaysForMode() and boot-time relay init (adcReaderTask).
+//   Example: with RELAY_DELAY=1, a 4-pin mode change takes ~3ms (3 gaps × 1ms).
+#define RELAY_DELAY 1
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
@@ -1526,57 +1560,77 @@ void resetSerialWatchdog() {
  */
 void setRelaysForMode(uint8_t modeNum) {
     if (relayMutex != NULL && xSemaphoreTake(relayMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // REV 10.16: Stagger each relay pin change by RELAY_DELAY ms.
+        // Simultaneous switching of multiple solenoids causes combined inrush
+        // current and back-EMF transients that couple noise into the ADS1015.
+        // Staggering each pin change reduces the peak transient amplitude.
+        // Total switching time per mode change: ~3 × RELAY_DELAY ms (3 gaps between 4 pins).
         switch (modeNum) {
             case 0:  // IDLE - All relay outputs OFF
                 digitalWrite(CR0_MOTOR, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR1, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR2, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR5, LOW);
                 break;
             case 1:  // RUN - Motor + CR1 + CR5 ON, CR2 OFF
                 digitalWrite(CR0_MOTOR, HIGH);
+                delay(RELAY_DELAY);
                 digitalWrite(CR1, HIGH);
+                delay(RELAY_DELAY);
                 digitalWrite(CR2, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR5, HIGH);
                 break;
             case 2:  // PURGE - Motor + CR2 ON, CR1 + CR5 OFF
                 digitalWrite(CR0_MOTOR, HIGH);
+                delay(RELAY_DELAY);
                 digitalWrite(CR1, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR2, HIGH);
+                delay(RELAY_DELAY);
                 digitalWrite(CR5, LOW);
                 break;
             case 3:  // BURP - Only CR5 ON, everything else OFF
                 digitalWrite(CR0_MOTOR, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR1, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR2, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR5, HIGH);
                 break;
             case 8:  // FRESH AIR / SPECIAL BURP - CR2 + CR5 ON
                 digitalWrite(CR0_MOTOR, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR1, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR2, HIGH);
+                delay(RELAY_DELAY);
                 digitalWrite(CR5, HIGH);
                 break;
             case 9:  // LEAK TEST - CR1 + CR2 + CR5 ON (no motor)
                 digitalWrite(CR0_MOTOR, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR1, HIGH);
+                delay(RELAY_DELAY);
                 digitalWrite(CR2, HIGH);
+                delay(RELAY_DELAY);
                 digitalWrite(CR5, HIGH);
                 break;
             default:
                 // Unknown mode - safe state (all off)
                 digitalWrite(CR0_MOTOR, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR1, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR2, LOW);
+                delay(RELAY_DELAY);
                 digitalWrite(CR5, LOW);
                 break;
         }
-        
-        // REV 10.14: Wait 1ms for relay/solenoid switching noise to dissipate.
-        // Solenoid coil back-EMF and relay contact bounce generate broadband EMI
-        // that couples into the ADS1015 analog inputs via the shared PCB ground plane.
-        // 1ms is sufficient for the snubber circuit to damp the transient.
-        delay(1);
         
         currentRelayMode = modeNum;
         // REV 10.11: Test state is now managed by the auto-stop timer in loop()
@@ -1588,14 +1642,39 @@ void setRelaysForMode(uint8_t modeNum) {
         xSemaphoreGive(relayMutex);
     } else {
         // Mutex unavailable - write directly (safety fallback)
+        // REV 10.16: Stagger pin changes by RELAY_DELAY ms (same as mutex path)
         switch (modeNum) {
-            case 0: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, LOW); break;
-            case 1: digitalWrite(CR0_MOTOR, HIGH); digitalWrite(CR1, HIGH); digitalWrite(CR2, LOW); digitalWrite(CR5, HIGH); break;
-            case 2: digitalWrite(CR0_MOTOR, HIGH); digitalWrite(CR1, LOW); digitalWrite(CR2, HIGH); digitalWrite(CR5, LOW); break;
-            case 3: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, HIGH); break;
-            default: digitalWrite(CR0_MOTOR, LOW); digitalWrite(CR1, LOW); digitalWrite(CR2, LOW); digitalWrite(CR5, LOW); break;
+            case 0:  // IDLE
+                digitalWrite(CR0_MOTOR, LOW);  delay(RELAY_DELAY);
+                digitalWrite(CR1, LOW);        delay(RELAY_DELAY);
+                digitalWrite(CR2, LOW);        delay(RELAY_DELAY);
+                digitalWrite(CR5, LOW);
+                break;
+            case 1:  // RUN
+                digitalWrite(CR0_MOTOR, HIGH); delay(RELAY_DELAY);
+                digitalWrite(CR1, HIGH);       delay(RELAY_DELAY);
+                digitalWrite(CR2, LOW);        delay(RELAY_DELAY);
+                digitalWrite(CR5, HIGH);
+                break;
+            case 2:  // PURGE
+                digitalWrite(CR0_MOTOR, HIGH); delay(RELAY_DELAY);
+                digitalWrite(CR1, LOW);        delay(RELAY_DELAY);
+                digitalWrite(CR2, HIGH);       delay(RELAY_DELAY);
+                digitalWrite(CR5, LOW);
+                break;
+            case 3:  // BURP
+                digitalWrite(CR0_MOTOR, LOW);  delay(RELAY_DELAY);
+                digitalWrite(CR1, LOW);        delay(RELAY_DELAY);
+                digitalWrite(CR2, LOW);        delay(RELAY_DELAY);
+                digitalWrite(CR5, HIGH);
+                break;
+            default:  // Safe state (all off)
+                digitalWrite(CR0_MOTOR, LOW);  delay(RELAY_DELAY);
+                digitalWrite(CR1, LOW);        delay(RELAY_DELAY);
+                digitalWrite(CR2, LOW);        delay(RELAY_DELAY);
+                digitalWrite(CR5, LOW);
+                break;
         }
-        delay(1);  // REV 10.14: 1ms settling time for relay/solenoid noise
         currentRelayMode = modeNum;
         if (modeNum <= 3) current_mode = (RunMode)modeNum;
     }
@@ -2305,9 +2384,15 @@ void adcReaderTask(void *parameter) {
     pinMode(CR2, OUTPUT);
     pinMode(CR5, OUTPUT);
     
+    // REV 10.16: Stagger boot-time relay init by RELAY_DELAY ms between each pin.
+    // Same noise reduction strategy as setRelaysForMode() — prevents combined
+    // inrush transients when all relay drivers initialize simultaneously.
     digitalWrite(CR0_MOTOR, LOW);     // Motor OFF
+    delay(RELAY_DELAY);
     digitalWrite(CR1, LOW);           // Relay 1 OFF
+    delay(RELAY_DELAY);
     digitalWrite(CR2, LOW);           // Relay 2 OFF
+    delay(RELAY_DELAY);
     digitalWrite(CR5, LOW);           // Relay 5 OFF
     // REV 10.11: DISP_SHUTDN is initialized with hold in setup() via initializeDispShutdownPinWithHold()
     // Do NOT reconfigure it here — the hold is already active and the pin is HIGH
@@ -2896,7 +2981,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.14</title>
+    <title>Walter IO Board - Rev 10.16</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -2980,7 +3065,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.14</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.16</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -5436,7 +5521,7 @@ void parsedSerialData() {
     // Note: We still parse and store the mode value from Linux (for CBOR, etc.)
     // — we just don't apply it to the relay GPIOs while a test is active.
     //
-    // REV 10.14: Skip redundant relay writes when mode hasn't changed.
+    // REV 10.15: Skip redundant relay writes when mode hasn't changed.
     // Linux sends a data packet with "mode" every ~7 seconds. Previously, every
     // packet triggered setRelaysForMode() even if the mode was identical, causing
     // unnecessary GPIO writes that generate relay driver switching transients.
@@ -6822,7 +6907,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.14                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.16                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -6958,7 +7043,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.14 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.16 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
