@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.16
+ *  Walter IO Board Firmware - Rev 10.17
  *  Date: 2/11/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -13,6 +13,19 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *  
+ *  Rev 10.17 (2/12/2026) - Fault Code Reassignment + SD Card Fault
+ *  - BREAKING: Fault codes reassigned (coordinate with Linux/server if parsing these)
+ *    * 1024: SD card failure (NEW — previously used for watchdog)
+ *    * 2048: Serial watchdog activated (was 1024)
+ *    * 4096: Failsafe mode (was 8192)
+ *    * 8192: BlueCherry connection failed (was 4096)
+ *  - NEW: SD card fault detection via getSDCardFaultCode()
+ *    * Returns 1024 when SD card is not mounted or inaccessible
+ *    * Uses existing isSDCardOK() check (SD.cardType() != CARD_NONE)
+ *  - IMPROVED: getCombinedFaultCode() now includes all 4 fault sources
+ *  - IMPROVED: buildSendDataArray() uses getCombinedFaultCode() instead of
+ *    only getBlueCherryFaultCode(), so all ESP32 faults are sent to BlueCherry
+ *
  *  Rev 10.16 (2/12/2026) - Staggered Relay Pin Switching for Noise Reduction
  *  - NEW: RELAY_DELAY define (default 1ms) — easily adjustable for testing
  *    * Controls delay between each individual relay GPIO pin change
@@ -357,7 +370,7 @@
  *  - NEW: Failsafe relay control when Comfile is down (after 2 restart attempts)
  *    * Full autonomous cycle logic: pressure auto-start, run/purge/burp sequences
  *    * Current monitoring: low (<3A for 9 readings), high (>25A for 2s) protection
- *    * Adds 8192 to fault code when in failsafe mode
+ *    * Adds 4096 to fault code when in failsafe mode (REV 10.17: was 8192)
  *  - NEW: ProfileManager class with 6 profiles (CS2, CS3, CS8, CS9, CS12, CS13)
  *    * Per-profile alarm thresholds, fault code maps, cycle sequences
  *    * Stored in EEPROM, selectable via serial command or web portal
@@ -530,8 +543,8 @@
  *  Rev 9.1d (1/30/2026) - BlueCherry Stability Fix
  *  - CRITICAL: Removed modem.reset() on BlueCherry sync failure
  *  - This was causing LTE disconnect -> ESP.restart() loop
- *  - Added fault code 4096 when BlueCherry is offline
- *  - Fault codes: 1024=watchdog, 4096=BlueCherry, 5120=both
+ *  - Added fault code for BlueCherry offline (originally 4096, now 8192 per REV 10.17)
+ *  - See REV 10.17 for current fault code assignments
  *  - System now stays running during BlueCherry platform outages
  *  - Weekly restart still occurs if BlueCherry never connects
  *  
@@ -572,18 +585,19 @@
  *  - Thread-safe operation across Core 0 (ADC) and Core 1 (Main/Web)
  *  
  *  =====================================================================
- *  FAULT CODES
+ *  FAULT CODES (REV 10.17 — reassigned)
  *  =====================================================================
- *  - 1024: Serial watchdog triggered (no serial data for 30+ minutes)
- *  - 4096: BlueCherry platform offline (OTA updates unavailable)
- *  - 5120: Both watchdog AND BlueCherry faults active
- *  - 8192: Panel down - ESP32 in failsafe mode (Comfile not responding)
- *  - Note: These are ADDED to any existing fault codes from the device
+ *  - 1024: SD card failure (card not mounted or inaccessible)
+ *  - 2048: Serial watchdog activated (no serial data for 30+ minutes)
+ *  - 4096: Failsafe mode (ESP32 autonomous relay control, Comfile down)
+ *  - 8192: BlueCherry connection failed (OTA updates unavailable)
+ *  - Note: These are bit flags ADDED to any existing fault codes from Linux.
+ *    Multiple faults stack: e.g., SD fail + watchdog = 1024 + 2048 = 3072
  *  
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.16"
+#define VERSION "Rev 10.17"
 
 // REV 10.16: Delay between individual relay GPIO pin changes (milliseconds).
 // Simultaneous activation of CR0_MOTOR, CR1, CR2, CR5 causes electrical noise
@@ -801,7 +815,7 @@ const uint8_t OVERFILL_CLEAR_COUNT = 5;     // Consecutive HIGH readings to clea
 // FAILSAFE MODE GLOBALS (Rev 10 - autonomous relay control when Comfile is down)
 // =====================================================================
 bool failsafeMode = false;                  // True when ESP32 controls relays autonomously
-const int FAILSAFE_FAULT_CODE = 8192;       // Added to fault code when in failsafe
+const int FAILSAFE_FAULT_CODE = 4096;       // REV 10.17: Added to fault code when in failsafe (was 8192)
 const int MAX_WATCHDOG_ATTEMPTS_BEFORE_FAILSAFE = 2;  // Enter failsafe after 2 restart attempts
 
 // Failsafe run cycle state
@@ -912,8 +926,9 @@ unsigned long lastWatchdogPulseTime = 0;         // Timestamp of last watchdog p
 const unsigned long WATCHDOG_TIMEOUT = 1800000;  // 30 minutes in milliseconds (30 * 60 * 1000)
 const unsigned long WATCHDOG_FIRST_PULSE = 1000; // First reboot attempt: 1 second pulse
 const unsigned long WATCHDOG_LONG_PULSE = 30000; // Subsequent attempts: 30 second pulse
-const int WATCHDOG_FAULT_CODE = 1024;            // Fault code to send when no serial data
-const int BLUECHERRY_FAULT_CODE = 4096;          // Fault code to send when BlueCherry is disconnected
+const int SD_CARD_FAULT_CODE = 1024;             // REV 10.17: Fault code for SD card failure
+const int WATCHDOG_FAULT_CODE = 2048;            // REV 10.17: Fault code for serial watchdog (was 1024)
+const int BLUECHERRY_FAULT_CODE = 8192;          // REV 10.17: Fault code for BlueCherry disconnected (was 4096)
 
 // REV 10.10: LTE connection check interval
 // Previously: lteConnected() was checked EVERY loop iteration. If the cellular modem
@@ -1415,7 +1430,7 @@ void pulseWatchdogPin(unsigned long pulseDuration) {
  * First attempt: 1 second pulse
  * All subsequent attempts: 30 second pulse (every 30 minutes)
  * 
- * During no-serial state, data is sent with zeroed values and fault code 1024
+ * During no-serial state, data is sent with zeroed values and fault code 2048
  * 
  * The watchdog automatically resets when serial data resumes.
  * 
@@ -1438,7 +1453,7 @@ void checkSerialWatchdog() {
         if (!watchdogTriggered) {
             watchdogTriggered = true;
             lastWatchdogPulseTime = 0;  // Force immediate first pulse
-            Serial.printf("[WATCHDOG] ACTIVATED - no data for %lu min, fault code 1024\r\n", 
+            Serial.printf("[WATCHDOG] ACTIVATED - no data for %lu min, fault code 2048\r\n", 
                           timeSinceLastData / 60000);
         }
         
@@ -1475,7 +1490,7 @@ void checkSerialWatchdog() {
  * 
  * Usage example:
  *   if (isInWatchdogState()) {
- *       // Send zeroed data with fault code 1024
+ *       // Send zeroed data with fault code 2048
  *   }
  */
 bool isInWatchdogState() {
@@ -1483,23 +1498,34 @@ bool isInWatchdogState() {
 }
 
 /**
- * Get the watchdog fault code (1024) for use in data packets
- * Returns 0 if not in watchdog state
+ * Get the SD card fault code (1024) for use in data packets.
+ * Returns 1024 if SD card is not mounted/accessible, 0 if OK.
  * 
  * Usage example:
- *   int fault = getWatchdogFaultCode();  // Returns 1024 if in watchdog state
+ *   int fault = getSDCardFaultCode();  // Returns 1024 if SD card failed
+ */
+int getSDCardFaultCode() {
+    return isSDCardOK() ? 0 : SD_CARD_FAULT_CODE;
+}
+
+/**
+ * Get the watchdog fault code (2048) for use in data packets.
+ * Returns 0 if not in watchdog state.
+ * 
+ * Usage example:
+ *   int fault = getWatchdogFaultCode();  // Returns 2048 if in watchdog state
  */
 int getWatchdogFaultCode() {
     return isInWatchdogState() ? WATCHDOG_FAULT_CODE : 0;
 }
 
 /**
- * Get the BlueCherry fault code (4096) for use in data packets
- * Returns 4096 if BlueCherry is not connected, 0 if connected
- * This alerts the user that OTA updates are unavailable
+ * Get the BlueCherry fault code (8192) for use in data packets.
+ * Returns 8192 if BlueCherry is not connected, 0 if connected.
+ * This alerts the user that OTA updates are unavailable.
  * 
  * Usage example:
- *   int fault = getBlueCherryFaultCode();  // Returns 4096 if BC disconnected
+ *   int fault = getBlueCherryFaultCode();  // Returns 8192 if BC disconnected
  */
 int getBlueCherryFaultCode() {
     return blueCherryConnected ? 0 : BLUECHERRY_FAULT_CODE;
@@ -2828,17 +2854,24 @@ void runFailsafeCycleLogic() {
 }
 
 /**
- * Get combined fault code including failsafe indicator.
- * Returns base faults + 8192 if in failsafe mode.
+ * Get combined fault code from all fault sources.
+ * Each fault code is a unique power-of-2 bit flag, so they can be OR'd together.
+ * 
+ * REV 10.17 fault code assignments:
+ *   1024  = SD card failure
+ *   2048  = Serial watchdog activated (no serial data for 30+ min)
+ *   4096  = Failsafe mode (ESP32 autonomous relay control)
+ *   8192  = BlueCherry connection failed (OTA unavailable)
  * 
  * Usage example:
- *   int faultCode = getCombinedFaultCode();  // e.g., 1024 + 4096 + 8192 = 13312
+ *   int faultCode = getCombinedFaultCode();  // e.g., 1024 + 2048 + 8192 = 11264
  */
 int getCombinedFaultCode() {
     int code = 0;
+    if (!isSDCardOK())       code += SD_CARD_FAULT_CODE;
     if (isInWatchdogState()) code += WATCHDOG_FAULT_CODE;
+    if (failsafeMode)        code += FAILSAFE_FAULT_CODE;
     if (!blueCherryConnected) code += BLUECHERRY_FAULT_CODE;
-    if (failsafeMode) code += FAILSAFE_FAULT_CODE;
     return code;
 }
 
@@ -2981,7 +3014,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.16</title>
+    <title>Walter IO Board - Rev 10.17</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -3065,7 +3098,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.16</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.17</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -5658,22 +5691,24 @@ void buildSendDataArray(){
         Serial.print(", Mode: ");
         Serial.println(currentRelayMode);
         
-        // Add BlueCherry fault code (4096) to existing faults if BC is offline
-        int totalFaults = faults + getBlueCherryFaultCode();
+        // REV 10.17: Add all ESP32-detected fault codes to existing faults from Linux
+        // SD card (1024) + Watchdog (2048) + Failsafe (4096) + BlueCherry (8192)
+        int totalFaults = faults + getCombinedFaultCode();
         
         readings[readingCount-1][0] = id;
         readings[readingCount-1][1] = static_cast<int>(seq);
         readings[readingCount-1][2] = pres_scaled;
         readings[readingCount-1][3] = cycles;
-        readings[readingCount-1][4] = totalFaults;  // Device faults + 4096 if BC offline
+        readings[readingCount-1][4] = totalFaults;  // Device faults + ESP32 fault codes (1024/2048/4096/8192)
         readings[readingCount-1][5] = currentRelayMode;  // Use ESP32's own mode, not round-tripped
         readings[readingCount-1][6] = temp_scaled;
         readings[readingCount-1][7] = current_scaled;
         
-        // Log if BlueCherry fault code is active
-        if (!blueCherryConnected) {
-            Serial.print("📤 Data includes BlueCherry fault (4096): total fault=");
-            Serial.println(totalFaults);
+        // Log if any ESP32 fault codes are active
+        int espFaults = getCombinedFaultCode();
+        if (espFaults > 0) {
+            Serial.printf("📤 Data includes ESP32 fault codes (%d): total fault=%d\r\n",
+                          espFaults, totalFaults);
         }
     }
     
@@ -6907,7 +6942,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.16                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.17                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -7043,7 +7078,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.16 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.17 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
