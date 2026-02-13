@@ -3884,19 +3884,33 @@ const char* control_html = R"rawliteral(
 
         // SPA navigation: show one screen, hide others
         window.nav=function(scr){
+            // Don't navigate to the same screen
+            if(scr === curScr) return;
+
             var screens=document.querySelectorAll('.screen');
             for(var i=0;i<screens.length;i++)screens[i].classList.remove('active');
             var target=$('scr-'+scr);if(target)target.classList.add('active');
+
+            // Push current screen to navigation stack before changing
+            if(curScr && curScr !== scr) {
+                navStack.push(curScr);
+            }
             curScr=scr;
 
             // Update footer button based on current screen
             var btn=$('footerBtn');
             if(scr==='main'){
+                // Clear navigation stack when returning to main
+                navStack=['main'];
                 btn.textContent='Maintenance';
                 btn.onclick=function(){nav('maint');};
             } else {
                 btn.textContent='Back';
-                btn.onclick=function(){nav('main');};
+                btn.onclick=function(){
+                    // Go back to previous screen in stack, or main if stack is empty
+                    var prevScr = navStack.length > 0 ? navStack.pop() : 'main';
+                    nav(prevScr);
+                };
             }
         };
 
