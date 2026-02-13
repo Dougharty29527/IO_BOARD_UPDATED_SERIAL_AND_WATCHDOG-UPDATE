@@ -3607,6 +3607,14 @@ const char* control_html = R"rawliteral(
             <button class="menu-btn" onclick="nav('func')">Functionality Test</button>
             <button class="menu-btn" onclick="nav('eff')">Efficiency Test</button>
         </div>
+        <!-- Individual Relay Control -->
+        <div class="card"><div class="card-title bg-orange">Relay Control</div><div class="card-body">
+            <div style="display:flex;gap:8px;margin:10px 0">
+                <button class="menu-btn" id="relayCR1" onclick="toggleRelay('CR1')" style="flex:1;background:#e8eaf6">CR1 OFF</button>
+                <button class="menu-btn" id="relayCR2" onclick="toggleRelay('CR2')" style="flex:1;background:#e8eaf6">CR2 OFF</button>
+                <button class="menu-btn" id="relayCR5" onclick="toggleRelay('CR5')" style="flex:1;background:#e8eaf6">CR5 OFF</button>
+            </div>
+        </div></div>
     </div>
 
     <!-- ============ LEAK TEST SCREEN ============ -->
@@ -3901,6 +3909,16 @@ const char* control_html = R"rawliteral(
             x.send(body);
         };
 
+        // Toggle individual relays
+        window.toggleRelay=function(relay){
+            var cmd = 'toggle_relay';
+            var val = relay;
+            var x=new XMLHttpRequest();
+            x.open('POST','http://'+IP+'/api/command',true);
+            x.setRequestHeader('Content-Type','application/json');
+            x.send(JSON.stringify({command:cmd,value:val}));
+        };
+
         // ---- CALIBRATE PRESSURE SENSOR ZERO POINT ----
         // Sends calibrate_pressure command to ESP32. Takes ~1 second (60 samples).
         // Shows result (new zero point) on the Maintenance screen.
@@ -4059,6 +4077,20 @@ const char* control_html = R"rawliteral(
         // Mode name lookup
         var modeNames={0:'Idle',1:'Run',2:'Purge',3:'Burp',8:'Fresh Air',9:'Leak Test'};
 
+        // Update relay button states
+        function updateRelayButtons(d){
+            var relays = ['CR1', 'CR2', 'CR5'];
+            relays.forEach(function(relay){
+                var btn = $('relay' + relay);
+                if(btn){
+                    var isOn = d['relay' + relay] || false;
+                    btn.textContent = relay + ' ' + (isOn ? 'ON' : 'OFF');
+                    btn.style.background = isOn ? '#4CAF50' : '#e8eaf6';
+                    btn.style.color = isOn ? '#fff' : '#1a1a2e';
+                }
+            });
+        }
+
         function poll(){
             var x=new XMLHttpRequest();
             x.timeout=4000;
@@ -4177,6 +4209,8 @@ const char* control_html = R"rawliteral(
                         var ft=$('fsToggle'),fl=$('fsLabel');if(ft)ft.checked=d.failsafeEnabled;if(fl){fl.textContent=d.failsafeEnabled?'ENABLED':'DISABLED';fl.style.color=d.failsafeEnabled?'#2e7d32':'#999';}
                         var dt=$('dbgToggle'),dl=$('dbgLabel');if(dt)dt.checked=d.serialDebugMode;if(dl){dl.textContent=d.serialDebugMode?'ON':'OFF';dl.style.color=d.serialDebugMode?'#e65100':'#999';}
                         upd('uptime',d.uptime);upd('mac',d.macAddress);
+                        // Update relay button states
+                        updateRelayButtons(d);
                     }catch(e){errs++;if(errs>=3)conn(false);}
                 }else{errs++;if(errs>=3)conn(false);}
             };
