@@ -670,6 +670,7 @@ String ver = VERSION;
 // the function definition and has no prototype to match.
 // =====================================================================
 size_t buildCborFromReadings(uint8_t* buf, size_t bufSize, int data[][10], size_t rowCount);
+String buildCborPayloadHistoryJson();
 bool   sendCborArrayViaSocket(uint8_t* buffer, size_t size);
 void   cleanupOldLogFiles(int currentYear);
 String formatTimestamp(int64_t seconds);
