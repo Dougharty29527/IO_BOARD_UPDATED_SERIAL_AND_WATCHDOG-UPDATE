@@ -5233,7 +5233,7 @@ void startConfigAP() {
                 manualRelayOverride = true;
                 String relayName = val.substring(2);
                 relayName.toLowerCase();
-                notifyPythonOfCommand(relayName, String(newState).c_str());
+                notifyPythonOfCommand(relayName.c_str(), String(newState).c_str());
                 Serial.printf("[WEB CMD] %s toggled to %d\r\n", val.c_str(), newState);
             }
             request->send(200, "application/json", "{\"ok\":true}");
