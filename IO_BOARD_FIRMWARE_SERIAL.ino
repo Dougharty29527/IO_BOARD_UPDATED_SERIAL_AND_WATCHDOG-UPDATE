@@ -5215,10 +5215,25 @@ void startConfigAP() {
             request->send(200, "application/json", resp);
         }
         else if (cmd == "toggle_relay") {
-            // Convert web relay names (CR1, CR2, CR5) to ESP32 commands (cr1, cr2, cr5)
-            String relayCmd = "cr" + val.substring(2); // CR1 -> cr1, CR2 -> cr2, CR5 -> cr5
-            relayCmd.toLowerCase();
-            executeRemoteCommand(relayCmd, "");
+            // Convert web relay names (CR1, CR2, CR5) to ESP32 GPIO pins and toggle them
+            int pin = -1;
+            if (val == "CR1") pin = CR1;
+            else if (val == "CR2") pin = CR2;
+            else if (val == "CR5") pin = CR5;
+
+            if (pin != -1) {
+                // Read current state and toggle it
+                int currentState = digitalRead(pin);
+                int newState = (currentState == HIGH) ? LOW : HIGH;
+
+                // Set the new state directly on GPIO
+                digitalWrite(pin, newState);
+
+                // Also notify Python and set manual override flag
+                manualRelayOverride = true;
+                notifyPythonOfCommand(val.substring(2).toLowerCase(), String(newState).c_str());
+                Serial.printf("[WEB CMD] %s toggled to %d\r\n", val.c_str(), newState);
+            }
             request->send(200, "application/json", "{\"ok\":true}");
         }
         else if (cmd == "restart") {
