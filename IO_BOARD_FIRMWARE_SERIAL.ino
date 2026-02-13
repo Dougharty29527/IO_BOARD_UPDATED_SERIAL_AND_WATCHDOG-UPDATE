@@ -938,6 +938,16 @@ CborBufferSample* cborPassthroughBuffer = NULL;  // Allocated in setup()
 int cborBufferWriteIdx = 0;           // Next write position
 int cborBufferCount = 0;              // Number of valid samples in buffer
 bool cborBufferingActive = false;     // True during passthrough mode
+
+// Web diagnostics: Store last 5 CBOR payloads for diagnostics page
+#define CBOR_PAYLOAD_HISTORY_SIZE 5
+struct CborPayloadHistory {
+    unsigned long timestamp;
+    uint8_t data[1024];
+    size_t size;
+};
+CborPayloadHistory cborPayloadHistory[CBOR_PAYLOAD_HISTORY_SIZE];
+int cborPayloadHistoryIdx = 0;
 unsigned long lastCborBufferTime = 0; // Last time a sample was buffered
 
 // Thread safety
@@ -3837,7 +3847,14 @@ const char* control_html = R"rawliteral(
             <div class="row"><span class="lbl">Overfill Sensor</span><span class="val" id="overfill">--</span></div>
             <div class="row"><span class="lbl">GPIO38 Raw</span><span class="val" id="overfillDebug" style="font-size:0.78em;color:#888">--</span></div>
             <div class="row"><span class="lbl">Watchdog</span><span class="val" id="watchdog">--</span></div>
-            <div class="row"><span class="lbl">Uptime</span><span class="val" id="uptime">--</span></div>
+            <div class="row"><span class="lbl">Uptime</span><span class="val" id="uptime">--</span>            </div>
+        </div></div>
+
+        <!-- CBOR Payload History -->
+        <div class="card"><div class="card-title bg-gray">CBOR Payload History</div><div class="card-body">
+            <div id="cborPayloadHistory" style="font-family:monospace;font-size:0.75em;max-height:200px;overflow-y:auto;">
+                <div style="color:#999;text-align:center;padding:20px">Waiting for CBOR transmissions...</div>
+            </div>
         </div></div>
     </div><!-- end scr-diagnostics -->
 
@@ -4105,6 +4122,41 @@ const char* control_html = R"rawliteral(
             });
         }
 
+        // Update CBOR payload history display
+        function updateCborPayloadHistory(d){
+            var historyDiv = $('cborPayloadHistory');
+            if(!historyDiv || !d.cborPayloadHistory) return;
+
+            var history = d.cborPayloadHistory;
+            if(history.length === 0){
+                historyDiv.innerHTML = '<div style="color:#999;text-align:center;padding:20px">Waiting for CBOR transmissions...</div>';
+                return;
+            }
+
+            var html = '';
+            history.forEach(function(payload, idx){
+                if(payload.timestamp && payload.data){
+                    var date = new Date(payload.timestamp);
+                    var timeStr = date.toLocaleTimeString();
+                    html += '<div style="border-bottom:1px solid #eee;padding:8px 0">';
+                    html += '<div style="color:#666;font-weight:bold">#' + (history.length - idx) + ' - ' + timeStr + '</div>';
+                    html += '<div style="margin-top:4px;color:#333">CBOR Data: [' + payload.data.join(', ') + ']</div>';
+
+                    // Try to decode the CBOR array elements for readability
+                    if(payload.data.length >= 15){
+                        html += '<div style="margin-top:4px;color:#666;font-size:0.9em">';
+                        html += 'Device ID: ' + payload.data[0] + ', ';
+                        html += 'Type: IO_Board, ';
+                        html += 'LTE Band: ' + payload.data[3] + ', ';
+                        html += 'RSRP: ' + payload.data[5] + ' dBm';
+                        html += '</div>';
+                    }
+                    html += '</div>';
+                }
+            });
+            historyDiv.innerHTML = html;
+        }
+
         function poll(){
             var x=new XMLHttpRequest();
             x.timeout=4000;
@@ -4225,6 +4277,8 @@ const char* control_html = R"rawliteral(
                         upd('uptime',d.uptime);upd('mac',d.macAddress);
                         // Update relay button states
                         updateRelayButtons(d);
+                        // Update CBOR payload history
+                        updateCborPayloadHistory(d);
                     }catch(e){errs++;if(errs>=3)conn(false);}
                 }else{errs++;if(errs>=3)conn(false);}
             };
@@ -4962,12 +5016,14 @@ void startConfigAP() {
             "\"testElapsed\":%lu,"
             "\"testMultiStep\":%s,\"testStep\":%d,\"testStepTotal\":%d,"
             "\"datetime\":\"%s\",\"uptime\":\"%s\","
-            "\"macAddress\":\"%s\"}",
+            "\"macAddress\":\"%s\","
+            "\"cborPayloadHistory\":%s}",
             testRunning ? "true" : "false", activeTestType.c_str(),
             testElapsedSec,
             webTestMultiStep ? "true" : "false", webTestCycleStep, webTestCycleLength,
             dtStr.c_str(), uptimeStr,
-            macStr.c_str());
+            macStr.c_str(),
+            buildCborPayloadHistoryJson().c_str());
         
         request->send(200, "application/json", json);
     });
@@ -7342,6 +7398,31 @@ size_t buildStatusCbor(uint8_t* cborBuf, size_t bufSize) {
     return cbor_encoder_get_buffer_size(&encoder, cborBuf);
 }
 
+// Build JSON array of last 5 CBOR payloads for web diagnostics
+String buildCborPayloadHistoryJson() {
+    String json = "[";
+
+    for (int i = 0; i < CBOR_PAYLOAD_HISTORY_SIZE; i++) {
+        int idx = (cborPayloadHistoryIdx - 1 - i + CBOR_PAYLOAD_HISTORY_SIZE) % CBOR_PAYLOAD_HISTORY_SIZE;
+
+        if (cborPayloadHistory[idx].size > 0) {
+            if (i > 0) json += ",";
+            json += "{\"timestamp\":" + String(cborPayloadHistory[idx].timestamp) + ",";
+            json += "\"data\":[";
+
+            // Convert CBOR data to array of integers for JSON
+            for (size_t j = 0; j < cborPayloadHistory[idx].size; j++) {
+                if (j > 0) json += ",";
+                json += String(cborPayloadHistory[idx].data[j]);
+            }
+            json += "]}";
+        }
+    }
+
+    json += "]";
+    return json;
+}
+
 bool sendCborArrayViaSocket(uint8_t* buffer, size_t size) {
     int retries = 3;
     int socketId = -1;
@@ -7473,6 +7554,13 @@ bool sendStatusUpdateViaSocket() {
         Serial.println("Failed to build status CBOR message");
         return false;
     }
+
+    // Store CBOR payload in history for web diagnostics
+    cborPayloadHistory[cborPayloadHistoryIdx].timestamp = millis();
+    memcpy(cborPayloadHistory[cborPayloadHistoryIdx].data, cborBuffer, cborSize);
+    cborPayloadHistory[cborPayloadHistoryIdx].size = cborSize;
+    cborPayloadHistoryIdx = (cborPayloadHistoryIdx + 1) % CBOR_PAYLOAD_HISTORY_SIZE;
+
     return sendCborDataViaSocket(cborBuffer, cborSize);
 }
 
