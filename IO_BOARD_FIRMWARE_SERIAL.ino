@@ -4903,12 +4903,16 @@ void startConfigAP() {
             "\"sdCardOK\":%s,"
             "\"overfillAlarm\":%s,\"gpio38Raw\":%d,"
             "\"overfillLowCnt\":%d,\"overfillHighCnt\":%d,"
-            "\"overfillValidated\":%s,",
+            "\"overfillValidated\":%s,"
+            "\"relayCR1\":%s,\"relayCR2\":%s,\"relayCR5\":%s,",
             ver.c_str(), fahrenheit,
             isSDCardOK() ? "true" : "false",
             overfillAlarmActive ? "true" : "false", digitalRead(ESP_OVERFILL),
             (int)overfillLowCount, (int)overfillHighCount,
-            overfillValidationComplete ? "true" : "false");
+            overfillValidationComplete ? "true" : "false",
+            digitalRead(CR1) ? "true" : "false",
+            digitalRead(CR2) ? "true" : "false",
+            digitalRead(CR5) ? "true" : "false");
         
         // ADC debug — REV 10.10: Added adcDataStale and adcLastGoodMs fields
         // adcDataStale: true when no successful read for > 60 seconds (FAST-TX sends -99.9)
@@ -5195,6 +5199,12 @@ void startConfigAP() {
             snprintf(resp, sizeof(resp),
                      "{\"ok\":true,\"adcZero\":%.2f}", adcZeroPressure);
             request->send(200, "application/json", resp);
+        }
+        else if (cmd == "toggle_relay") {
+            // Convert web relay names (CR1, CR2, CR5) to ESP32 commands (cr1, cr2, cr5)
+            String relayCmd = "cr" + val.substring(2).toLowerCase(); // CR1 -> cr1, CR2 -> cr2, CR5 -> cr5
+            executeRemoteCommand(relayCmd, "");
+            request->send(200, "application/json", "{\"ok\":true}");
         }
         else if (cmd == "restart") {
             request->send(200, "application/json", "{\"ok\":true}");
