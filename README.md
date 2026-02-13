@@ -313,9 +313,10 @@ The Linux device receives this data and forwards it to the cloud with appropriat
 
 Connects to the BlueCherry IoT platform via Walter modem for:
 
-- **OTA firmware updates** (scheduled: 7AM–1PM EST, every 15 minutes)
-- **Remote commands** ("remote XX" for passthrough, "restart")
+- **OTA firmware updates** (scheduled: 7AM–1PM EST, every 15 minutes, or every 15 seconds in fast mode)
+- **Remote commands** ("remote XX" for passthrough, "restart", "fast_poll", "exit_fast_poll")
 - **CBOR data transmission** (sensor readings, fault codes, cycle counts)
+- **Fast polling mode** (15-second intervals for 60 minutes max) for urgent message retrieval
 
 BlueCherry failures are non-fatal — local operation continues normally. Fault code 4096 indicates BlueCherry offline status.
 

@@ -345,6 +345,18 @@ Changes the active equipment profile on the ESP32.
 
 These tell the ESP32 to start/stop its own failsafe cycle engine. In normal operation (Linux is connected), you would NOT send these — the Linux device manages cycles and just sends mode numbers. These are useful for testing or if Linux wants the ESP32 to run autonomously.
 
+**Fast BlueCherry polling:**
+```json
+{"type":"cmd","cmd":"fast_poll","val":1}   // Enable fast polling (15s intervals, 60min max)
+{"type":"cmd","cmd":"fast_poll","val":0}   // Disable fast polling (return to scheduled)
+```
+
+Enables fast BlueCherry message retrieval by checking every 15 seconds instead of the normal scheduled window (7AM-1PM EST every 15 minutes). Automatically times out after 60 minutes maximum. Use for urgent remote control scenarios.
+
+**BlueCherry fast polling messages:**
+- `fast_poll` - Enable fast polling (15s intervals, 60min timeout)
+- `exit_fast_poll` - Disable fast polling (return to scheduled)
+
 ---
 
 ## Serial Watchdog and Failsafe Mode

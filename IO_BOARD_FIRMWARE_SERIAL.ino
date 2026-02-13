@@ -1,7 +1,7 @@
 /* ********************************************
  *  
  *  Walter IO Board Firmware - Rev 10.18
- *  Date: 2/12/2026
+ *  Date: 2/13/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -983,6 +983,9 @@ int lteReconnectFailures = 0;                     // Track consecutive reconnect
 // BlueCherry connection tracking variables
 // Allows system to run without BlueCherry, but schedules weekly restart for OTA retry
 bool blueCherryConnected = false;                // True if BlueCherry initialized successfully
+bool fastPollingActive = false;                   // True when fast BlueCherry polling is enabled
+unsigned long fastPollingStartTime = 0;          // When fast polling was activated (for timeout)
+const unsigned long FAST_POLLING_TIMEOUT = 60UL * 60UL * 1000UL; // 60 minutes in milliseconds
 unsigned long blueCherryLastAttempt = 0;         // Timestamp of last BlueCherry connection attempt
 unsigned long systemStartTime = 0;               // Timestamp when system started (for weekly restart)
 const unsigned long WEEKLY_RESTART_MS = 604800000UL;  // 7 days in milliseconds (7 * 24 * 60 * 60 * 1000)
@@ -2714,20 +2717,24 @@ void adcReaderTask(void *parameter) {
                     lastSuccessfulAdcRead = millis();  // REV 10.10: Mark data as fresh
                     if (adcDataStale) {
                         adcDataStale = false;
-                        Serial.println("####################################################################");
-                        Serial.println("## ADC DATA RECOVERED — fresh pressure data after stale period   ##");
-                        Serial.println("####################################################################");
+                        if (serialDebugMode) {
+                            Serial.println("####################################################################");
+                            Serial.println("## ADC DATA RECOVERED — fresh pressure data after stale period   ##");
+                            Serial.println("####################################################################");
+                        }
                     }
                 } else {
                     adcErrorCount++;
                     adcTotalErrors++;
-                    // ALWAYS print pressure errors — I2C communication failure indicator
-                    Serial.println("####################################################################");
-                    Serial.printf("## ADC PRESSURE READ ERROR  |  raw=%d  |  errors=%lu  |  @%lums\r\n",
-                                  rawPressure, adcTotalErrors, millis());
-                    Serial.println("## Single-ended CH0 should be 0-2047. Negative = I2C NACK/bus error");
-                    Serial.printf("## Consecutive errors: %lu (reinit at 10)\r\n", adcErrorCount);
-                    Serial.println("####################################################################");
+                    // Silent error handling - only log if debug mode enabled
+                    if (serialDebugMode) {
+                        Serial.println("####################################################################");
+                        Serial.printf("## ADC PRESSURE READ ERROR  |  raw=%d  |  errors=%lu  |  @%lums\r\n",
+                                      rawPressure, adcTotalErrors, millis());
+                        Serial.println("## Single-ended CH0 should be 0-2047. Negative = I2C NACK/bus error");
+                        Serial.printf("## Consecutive errors: %lu (reinit at 10)\r\n", adcErrorCount);
+                        Serial.println("####################################################################");
+                    }
                 }
                 
                 // Read Channels 2 & 3: Current monitoring (hardware differential)
@@ -2758,34 +2765,40 @@ void adcReaderTask(void *parameter) {
                     // Common I2C failure signature — bus NACK or read timeout
                     currentReadValid = false;
                     adcTotalErrors++;
-                    Serial.println("####################################################################");
-                    Serial.println("## ADC CURRENT READ FAILURE — I2C NACK  (rawDiff == -1)          ##");
-                    Serial.printf("## Differential CH2-CH3  |  raw=%d  |  total errors=%lu  |  @%lums\r\n",
-                                  rawDiff, adcTotalErrors, millis());
-                    Serial.println("## This usually means: I2C bus noise, SDA/SCL glitch, or ADS1015 ##");
-                    Serial.println("## not responding. Check wiring, pull-ups, cable shielding.       ##");
-                    Serial.println("####################################################################");
+                    if (serialDebugMode) {
+                        Serial.println("####################################################################");
+                        Serial.println("## ADC CURRENT READ FAILURE — I2C NACK  (rawDiff == -1)          ##");
+                        Serial.printf("## Differential CH2-CH3  |  raw=%d  |  total errors=%lu  |  @%lums\r\n",
+                                      rawDiff, adcTotalErrors, millis());
+                        Serial.println("## This usually means: I2C bus noise, SDA/SCL glitch, or ADS1015 ##");
+                        Serial.println("## not responding. Check wiring, pull-ups, cable shielding.       ##");
+                        Serial.println("####################################################################");
+                    }
                 } else if (rawDiff == -2048 || rawDiff == 2047) {
                     // Value pinned at absolute full-scale rail — likely clipping or bus error
                     currentReadValid = false;
                     adcTotalErrors++;
-                    Serial.println("####################################################################");
-                    Serial.println("## ADC CURRENT FULL-SCALE RAIL — POSSIBLE I2C BUS CORRUPTION     ##");
-                    Serial.printf("## Differential CH2-CH3  |  raw=%d  |  total errors=%lu  |  @%lums\r\n",
-                                  rawDiff, adcTotalErrors, millis());
-                    Serial.println("## Value is pinned at 12-bit limit. Check for shorted/open input ##");
-                    Serial.println("## or I2C line noise causing corrupted register reads.            ##");
-                    Serial.println("####################################################################");
+                    if (serialDebugMode) {
+                        Serial.println("####################################################################");
+                        Serial.println("## ADC CURRENT FULL-SCALE RAIL — POSSIBLE I2C BUS CORRUPTION     ##");
+                        Serial.printf("## Differential CH2-CH3  |  raw=%d  |  total errors=%lu  |  @%lums\r\n",
+                                      rawDiff, adcTotalErrors, millis());
+                        Serial.println("## Value is pinned at 12-bit limit. Check for shorted/open input ##");
+                        Serial.println("## or I2C line noise causing corrupted register reads.            ##");
+                        Serial.println("####################################################################");
+                    }
                 } else if (absDiff > 800) {
                     // Abnormally high — well beyond expected max of ~580 counts at 8.0A
                     // Still use the value but WARN — could be transient noise spike
-                    Serial.println("################################################################");
-                    Serial.printf("## ADC CURRENT ABNORMAL  |  raw=%d  |  abs=%d  (expected <600)\r\n",
-                                  rawDiff, absDiff);
-                    Serial.printf("## Differential CH2-CH3  |  total errors=%lu  |  @%lums\r\n",
-                                  adcTotalErrors, millis());
-                    Serial.println("## Value is unusually high — possible noise spike on I2C bus    ##");
-                    Serial.println("################################################################");
+                    if (serialDebugMode) {
+                        Serial.println("################################################################");
+                        Serial.printf("## ADC CURRENT ABNORMAL  |  raw=%d  |  abs=%d  (expected <600)\r\n",
+                                      rawDiff, absDiff);
+                        Serial.printf("## Differential CH2-CH3  |  total errors=%lu  |  @%lums\r\n",
+                                      adcTotalErrors, millis());
+                        Serial.println("## Value is unusually high — possible noise spike on I2C bus    ##");
+                        Serial.println("################################################################");
+                    }
                     // NOTE: We still process this value but it will be visible in logs
                 }
 
@@ -2807,24 +2820,30 @@ void adcReaderTask(void *parameter) {
                 
                 // Error recovery: After 10 consecutive errors, attempt reinit
                 if (adcErrorCount >= 10) {
-                    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-                    Serial.println("!! ADC CRITICAL: 10 CONSECUTIVE ERRORS — REINITIALIZING I2C BUS !!");
-                    Serial.printf("!!   Total errors since boot: %lu   |  @%lums\r\n", adcTotalErrors, millis());
-                    Serial.println("!!   Stopping Wire, waiting 100ms, then re-initializing ADS1015  !!");
-                    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    if (serialDebugMode) {
+                        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                        Serial.println("!! ADC CRITICAL: 10 CONSECUTIVE ERRORS — REINITIALIZING I2C BUS !!");
+                        Serial.printf("!!   Total errors since boot: %lu   |  @%lums\r\n", adcTotalErrors, millis());
+                        Serial.println("!!   Stopping Wire, waiting 100ms, then re-initializing ADS1015  !!");
+                        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    }
                     adcInitialized = false;
                     Wire.end();
                     vTaskDelay(100 / portTICK_PERIOD_MS);
                     if (initializeADS1015()) {
                         adcErrorCount = 0;
-                        Serial.println("####################################################################");
-                        Serial.println("## ADC REINIT SUCCESS — ADS1015 responding again after I2C reset ##");
-                        Serial.println("####################################################################");
+                        if (serialDebugMode) {
+                            Serial.println("####################################################################");
+                            Serial.println("## ADC REINIT SUCCESS — ADS1015 responding again after I2C reset ##");
+                            Serial.println("####################################################################");
+                        }
                     } else {
-                        Serial.println("####################################################################");
-                        Serial.println("## ADC REINIT FAILED — ADS1015 STILL NOT RESPONDING             ##");
-                        Serial.println("## Will retry in 1 second. Check I2C wiring & pull-ups!          ##");
-                        Serial.println("####################################################################");
+                        if (serialDebugMode) {
+                            Serial.println("####################################################################");
+                            Serial.println("## ADC REINIT FAILED — ADS1015 STILL NOT RESPONDING             ##");
+                            Serial.println("## Will retry in 1 second. Check I2C wiring & pull-ups!          ##");
+                            Serial.println("####################################################################");
+                        }
                         vTaskDelay(1000 / portTICK_PERIOD_MS);  // Wait 1 second before retry
                     }
                 }
@@ -3402,7 +3421,7 @@ const char* control_html = R"rawliteral(
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 0; background: #f0f2f5; color: #222; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 0; background: #1565c0; color: #222; min-height: 100vh; }
         /* SPA Navigation & Layout */
         .topbar { background: #1a1a2e; color: #fff; padding: 8px 14px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 200; }
         .topbar .title { font-size: 1em; font-weight: 700; }
@@ -3433,6 +3452,15 @@ const char* control_html = R"rawliteral(
         .ok-text { color: #2e7d32; }
         .warn-text { color: #e65100; }
         .err-text { color: #c62828; font-weight: bold; }
+        /* New simplified main screen styles */
+        .status-card { background: #4CAF50; border-radius: 12px; margin: 20px; padding: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: background-color 0.3s; }
+        .status-card.alarm { background: #f44336; }
+        .status-content { text-align: center; color: #fff; }
+        .status-mode { font-size: 1.5em; font-weight: 700; margin-bottom: 8px; }
+        .status-alarms { font-size: 1em; opacity: 0.9; }
+        .readings-container { text-align: center; margin: 40px 20px; }
+        .pressure-display { font-size: 2em; font-weight: 700; color: #fff; margin-bottom: 20px; text-shadow: 0 2px 4px rgba(0,0,0,0.3); }
+        .cycles-display { font-size: 1.5em; font-weight: 600; color: #fff; opacity: 0.9; text-shadow: 0 2px 4px rgba(0,0,0,0.3); }
         .signal-wrap { display: inline-flex; align-items: center; gap: 6px; }
         .signal-bar { display: inline-block; width: 60px; height: 10px; background: #e0e0e0; border-radius: 5px; overflow: hidden; }
         .signal-fill { height: 100%%; border-radius: 5px; transition: width 0.5s; }
@@ -3475,8 +3503,13 @@ const char* control_html = R"rawliteral(
         .key-wide { grid-column: span 2; }
         .countdown { font-size: 2em; font-weight: 700; text-align: center; padding: 20px; color: #c62828; }
         .test-status { font-size: 1.1em; text-align: center; padding: 10px; font-weight: 600; }
-        /* Padding at bottom for fixed nav */
-        .content-wrap { padding-bottom: 60px; }
+        /* Maintenance footer button */
+        .maint-footer { position: fixed; bottom: 0; left: 0; right: 0; max-width: 600px; margin: 0 auto; background: rgba(255,255,255,0.9); border-top: 2px solid #1565c0; padding: 15px; text-align: center; }
+        .maint-btn { padding: 12px 30px; background: #4CAF50; color: #fff; border: none; border-radius: 8px; font-size: 1em; font-weight: 700; cursor: pointer; }
+        .maint-btn:active { background: #388E3C; }
+        .maint-btn:active { background: #0d47a1; }
+        /* Padding at bottom for fixed footer */
+        .content-wrap { padding-bottom: 80px; }
     </style>
 </head>
 <body>
@@ -3489,20 +3522,18 @@ const char* control_html = R"rawliteral(
 
     <!-- ============ MAIN SCREEN ============ -->
     <div class="screen active" id="scr-main">
-        <div class="hdr"><h1>%DEVICENAME%</h1>
-        <p id="mainProfile">--</p></div>
-        <div class="card"><div class="card-title bg-blue">System Status</div><div class="card-body">
-            <div class="row"><span class="lbl">Pressure (IWC)</span><span class="val" id="pressure">--</span></div>
-            <div class="row"><span class="lbl">Current (A)</span><span class="val" id="mainCurrent">--</span></div>
-            <div class="row"><span class="lbl">Mode</span><span class="val" id="mainMode">Idle</span></div>
-            <div class="row"><span class="lbl">Run Cycles</span><span class="val" id="mainCycles">0</span></div>
-            <div class="row"><span class="lbl">Overfill</span><span class="val" id="mainOverfill">Normal</span></div>
-            <div class="row"><span class="lbl">Status</span><span class="val" id="mainStatus">--</span></div>
-            <div class="row"><span class="lbl">Failsafe</span><span class="val" id="mainFailsafe">Inactive</span></div>
-        </div></div>
-        <div style="display:flex;gap:8px;margin:10px 0">
-            <button class="btn" style="flex:1;padding:12px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-size:0.9em;font-weight:700" onclick="sendCmd('start_cycle','run')">Start Cycle</button>
-            <button class="btn" style="flex:1;padding:12px;background:#c62828;color:#fff;border:none;border-radius:8px;font-size:0.9em;font-weight:700" onclick="sendCmd('stop_cycle')">Stop</button>
+        <!-- Status Card - Red if any alarms, Green if OK -->
+        <div class="status-card" id="statusCard">
+            <div class="status-content">
+                <div class="status-mode" id="statusMode">IDLE</div>
+                <div class="status-alarms" id="statusAlarms">No Alarms</div>
+            </div>
+        </div>
+
+        <!-- Pressure and Cycles Display -->
+        <div class="readings-container">
+            <div class="pressure-display" id="pressureDisplay">UST PRESSURE: --.--</div>
+            <div class="cycles-display" id="cyclesDisplay">RUN CYCLES: ------</div>
         </div>
     </div><!-- end scr-main -->
 
@@ -3533,13 +3564,13 @@ const char* control_html = R"rawliteral(
     <div class="screen" id="scr-maint">
         <div class="hdr"><h1>Maintenance</h1></div>
         <!-- Password gate (shown when locked) -->
-        <div id="maintLock" style="text-align:center;padding:30px 10px">
-            <p style="color:#666;font-size:0.9em;margin-bottom:12px">Enter maintenance password to continue</p>
-            <input type="password" id="maintPwd" maxlength="10" placeholder="Password" style="padding:10px 14px;border:1px solid #ccc;border-radius:6px;font-size:1em;width:140px;text-align:center">
+        <div id="maintLock" style="text-align:center;padding:30px 10px;color:#fff">
+            <p style="font-size:0.9em;margin-bottom:12px">Enter maintenance password to continue</p>
+            <input type="password" id="maintPwd" maxlength="10" placeholder="Password" style="padding:10px 14px;border:1px solid #ccc;border-radius:6px;font-size:1em;width:140px;text-align:center" onkeypress="if(event.key==='Enter')checkMaintPw()">
             <div style="margin-top:12px">
-                <button class="btn" style="padding:10px 28px;background:#1565c0;color:#fff;border:none;border-radius:6px;font-weight:700" onclick="checkMaintPw()">Unlock</button>
-    </div>
-            <p id="maintPwMsg" style="color:#c62828;font-size:0.85em;margin-top:8px"></p>
+                <button class="btn" style="padding:10px 28px;background:#4CAF50;color:#fff;border:none;border-radius:6px;font-weight:700" onclick="checkMaintPw()">Enter Maintenance</button>
+            </div>
+            <p id="maintPwMsg" style="color:#fff;font-size:0.85em;margin-top:8px"></p>
         </div>
         <!-- Maintenance menu (shown when unlocked) -->
         <div id="maintMenu" style="display:none">
@@ -3771,6 +3802,7 @@ const char* control_html = R"rawliteral(
             <div class="row"><span class="lbl">MCC/MNC</span><span class="val" id="mccmnc">--</span></div>
             <div class="row"><span class="lbl">Cell ID</span><span class="val" id="cellId">--</span></div>
             <div class="row"><span class="lbl">BlueCherry</span><span class="val" id="blueCherry">--</span></div>
+            <div class="row"><span class="lbl">MAC</span><span class="val" id="mac">--</span></div>
         </div></div>
         <div class="card"><div class="card-title bg-gray">IO Board</div><div class="card-body">
             <div class="row"><span class="lbl">Firmware</span><span class="val" id="version">--</span></div>
@@ -3780,7 +3812,6 @@ const char* control_html = R"rawliteral(
             <div class="row"><span class="lbl">GPIO38 Raw</span><span class="val" id="overfillDebug" style="font-size:0.78em;color:#888">--</span></div>
             <div class="row"><span class="lbl">Watchdog</span><span class="val" id="watchdog">--</span></div>
             <div class="row"><span class="lbl">Uptime</span><span class="val" id="uptime">--</span></div>
-            <div class="row"><span class="lbl">MAC</span><span class="val" id="mac">--</span></div>
         </div></div>
     </div><!-- end scr-diagnostics -->
 
@@ -3802,12 +3833,9 @@ const char* control_html = R"rawliteral(
         </div>
     </div>
 
-    <!-- Bottom Navigation -->
-    <div class="nav-footer">
-        <button id="nb-main" class="active" onclick="nav('main')">Main</button>
-        <button id="nb-alarms" onclick="nav('alarms')">Alarms</button>
-        <button id="nb-maint" onclick="nav('maint')">Maint</button>
-        <button id="nb-settings" onclick="nav('settings')">Settings</button>
+    <!-- Maintenance/Back Footer Button -->
+    <div class="maint-footer">
+        <button class="maint-btn" id="footerBtn" onclick="nav('maint')">Maintenance</button>
     </div>
 
     <script>
@@ -3824,11 +3852,17 @@ const char* control_html = R"rawliteral(
             var screens=document.querySelectorAll('.screen');
             for(var i=0;i<screens.length;i++)screens[i].classList.remove('active');
             var target=$('scr-'+scr);if(target)target.classList.add('active');
-            // Update nav footer active state
-            var btns=document.querySelectorAll('.nav-footer button');
-            for(var i=0;i<btns.length;i++)btns[i].classList.remove('active');
-            var nb=$('nb-'+scr);if(nb)nb.classList.add('active');
-            if(scr!==curScr){navStack.push(scr);curScr=scr;}
+            curScr=scr;
+
+            // Update footer button based on current screen
+            var btn=$('footerBtn');
+            if(scr==='main'){
+                btn.textContent='Maintenance';
+                btn.onclick=function(){nav('maint');};
+            } else {
+                btn.textContent='Back';
+                btn.onclick=function(){nav('main');};
+            }
         };
 
         // Send command to ESP32 via POST /api/command
@@ -3895,16 +3929,16 @@ const char* control_html = R"rawliteral(
                     $('profPwMsg').textContent='Profile changed to '+pendingProfile;
                     $('profPwd').value='';
                     // Auto-hide confirm area after 2s
-                    setTimeout(function(){$('profConfirm').style.display='none';$('profPwMsg').textContent='';$('profPwMsg').style.color='#c62828';},2000);
+                    setTimeout(function(){$('profConfirm').style.display='none';$('profPwMsg').textContent='';$('profPwMsg').style.color='#fff';},2000);
                 } else if(x.status===403){
-                    $('profPwMsg').style.color='#c62828';
+                    $('profPwMsg').style.color='#fff';
                     $('profPwMsg').textContent='Wrong password';
                 } else {
-                    $('profPwMsg').style.color='#c62828';
+                    $('profPwMsg').style.color='#fff';
                     $('profPwMsg').textContent='Error: '+x.status;
                 }
             };
-            x.onerror=function(){$('profPwMsg').style.color='#c62828';$('profPwMsg').textContent='Connection error';};
+            x.onerror=function(){$('profPwMsg').style.color='#fff';$('profPwMsg').textContent='Connection error';};
             // Send profile change with password for server-side validation
             x.send(JSON.stringify({command:'set_profile',value:pendingProfile,password:pw}));
         };
@@ -3924,20 +3958,17 @@ const char* control_html = R"rawliteral(
                 $('maintPwMsg').textContent='Incorrect password';
             }
         };
-        // Intercept nav to maint: if already unlocked, show menu directly
+        // Intercept nav to maint: always show password gate first
         var origNav=window.nav;
         window.nav=function(scr){
             origNav(scr);
             if(scr==='maint'){
-                if(maintUnlocked){
-                    $('maintLock').style.display='none';
-                    $('maintMenu').style.display='block';
-                } else {
-                    $('maintLock').style.display='block';
-                    $('maintMenu').style.display='none';
-                    $('maintPwd').value='';
-                    $('maintPwMsg').textContent='';
-                }
+                // Always start with password gate - user must enter 878
+                $('maintLock').style.display='block';
+                $('maintMenu').style.display='none';
+                $('maintPwd').value='';
+                $('maintPwMsg').textContent='';
+                maintUnlocked = false; // Reset unlock status
             }
         };
 
@@ -4012,13 +4043,42 @@ const char* control_html = R"rawliteral(
                         conn(true);
                         // Top bar
                         upd('topTime',d.datetime||'--');
-                        // Main screen
-                        upd('pressure',d.pressure);upd('mainCurrent',d.current);
-                        upd('mainMode',modeNames[d.mode]||d.mode);upd('mainCycles',d.cycles);
-                        upd('mainProfile',d.profile||'--');
-                        var ovEl=$('mainOverfill');if(ovEl){ovEl.textContent=d.overfillAlarm?'ALARM':'Normal';ovEl.style.color=d.overfillAlarm?'#c62828':'#2e7d32';}
-                        var fsEl=$('mainFailsafe');if(fsEl){fsEl.textContent=d.failsafe?'ACTIVE':'Inactive';fsEl.style.color=d.failsafe?'#c62828':'#2e7d32';}
-                        upd('mainStatus',d.serialActive?'Online':'No Serial');
+                        // Main screen - simplified status
+                        var modeText = modeNames[d.mode] || d.mode || 'UNKNOWN';
+                        var hasAlarms = d.overfillAlarm || d.watchdogTriggered || d.failsafe ||
+                                       d.alarmLowPress || d.alarmHighPress || d.alarmZeroPress ||
+                                       d.alarmLowCurrent || d.alarmHighCurrent;
+
+                        // Update status card
+                        var card = $('statusCard');
+                        var modeEl = $('statusMode');
+                        var alarmsEl = $('statusAlarms');
+
+                        if (card && modeEl && alarmsEl) {
+                            modeEl.textContent = modeText;
+                            if (hasAlarms) {
+                                card.classList.add('alarm');
+                                var alarmList = [];
+                                if (d.overfillAlarm) alarmList.push('Overfill');
+                                if (d.watchdogTriggered) alarmList.push('Watchdog');
+                                if (d.failsafe) alarmList.push('Failsafe');
+                                if (d.alarmLowPress) alarmList.push('Low Pressure');
+                                if (d.alarmHighPress) alarmList.push('High Pressure');
+                                if (d.alarmZeroPress) alarmList.push('Zero Pressure');
+                                if (d.alarmLowCurrent) alarmList.push('Low Current');
+                                if (d.alarmHighCurrent) alarmList.push('High Current');
+                                alarmsEl.textContent = alarmList.length > 0 ? alarmList.join(', ') : 'System Alarm';
+                            } else {
+                                card.classList.remove('alarm');
+                                alarmsEl.textContent = 'No Alarms';
+                            }
+                        }
+
+                        // Update pressure and cycles displays
+                        var pressureVal = d.pressure !== undefined ? parseFloat(d.pressure).toFixed(2) : '--.--';
+                        upd('pressureDisplay', 'UST PRESSURE: ' + pressureVal);
+                        var cyclesVal = d.cycles !== undefined ? d.cycles.toString() : '--';
+                        upd('cyclesDisplay', 'RUN CYCLES: ' + cyclesVal);
                         // Alarms
                         upd('alarmProfile',d.profile);upd('alarmFault',d.fault||'0');
                         setInd('aOvfl',d.overfillAlarm);setInd('aWatch',d.watchdogTriggered);setInd('aFailsafe',d.failsafe);
@@ -5271,51 +5331,72 @@ void updateTimestamp() {
  *   if (isFirmwareCheckScheduled()) { checkFirmwareUpdate(); initModemTime(); }
  */
 bool isFirmwareCheckScheduled() {
-    // Need valid time from modem (currentTimestamp > 0 means modem time was set)
+    // FAST POLLING MODE: Check every 15 seconds when active
+    if (fastPollingActive) {
+        // Check if fast polling has timed out (60 minutes max)
+        if (millis() - fastPollingStartTime >= FAST_POLLING_TIMEOUT) {
+            Serial.println("[FAST POLL] Timeout reached - disabling fast polling");
+            fastPollingActive = false;
+            return false;
+        }
+
+        // Use a simple time-based check instead of schedule slots
+        static unsigned long lastFastPollTime = 0;
+        const unsigned long FAST_POLL_INTERVAL = 15 * 1000; // 15 seconds
+
+        if (millis() - lastFastPollTime >= FAST_POLL_INTERVAL) {
+            lastFastPollTime = millis();
+            Serial.println("[FAST POLL] Checking for BlueCherry messages...");
+            return true;
+        }
+        return false;
+    }
+
+    // NORMAL SCHEDULED MODE: Need valid time from modem (currentTimestamp > 0 means modem time was set)
     if (currentTimestamp <= 0) return false;
-    
+
     // Convert UTC epoch to broken-down time
     time_t rawTime = (time_t)currentTimestamp;
     struct tm *utcTime = gmtime(&rawTime);
-    
+
     // Convert UTC hour/minute to EST (UTC - 5 hours)
     // Handle day wraparound (e.g., UTC 03:00 = EST 22:00 previous day)
     int estHour = utcTime->tm_hour - 5;
     int estMinute = utcTime->tm_min;
     if (estHour < 0) estHour += 24;
-    
+
     // Calculate total minutes since midnight EST for easy comparison
     int estTotalMinutes = estHour * 60 + estMinute;
-    
+
     // Schedule window: 7:00 AM EST (420 min) to 1:00 PM EST (780 min)
     const int SCHEDULE_START = 7 * 60;       // 7:00 AM = 420 minutes
     const int SCHEDULE_END   = 13 * 60;      // 1:00 PM = 780 minutes
     const int CHECK_INTERVAL = 15;           // Every 15 minutes
-    
+
     // Outside the schedule window? No check needed.
     if (estTotalMinutes < SCHEDULE_START || estTotalMinutes > SCHEDULE_END) {
         firmwareCheckDoneThisSlot = false;  // Reset for next day's window
         return false;
     }
-    
+
     // Calculate which 15-minute slot we're in (0 = 7:00, 1 = 7:15, 2 = 7:30, ...)
     int currentSlot = (estTotalMinutes - SCHEDULE_START) / CHECK_INTERVAL;
-    
+
     // We're in a valid slot. Have we already checked this slot?
     // Use a static to track which slot was last serviced
     static int lastCheckedSlot = -1;
-    
+
     if (currentSlot == lastCheckedSlot && firmwareCheckDoneThisSlot) {
         return false;  // Already checked this slot
     }
-    
+
     // New slot! Mark it and return true
     lastCheckedSlot = currentSlot;
     firmwareCheckDoneThisSlot = true;
-    
+
     Serial.printf("[SCHEDULE] Firmware check triggered at %02d:%02d EST (slot %d of %d)\r\n",
                   estHour, estMinute, currentSlot, (SCHEDULE_END - SCHEDULE_START) / CHECK_INTERVAL);
-    
+
     return true;
 }
 
@@ -6028,9 +6109,22 @@ void parsedSerialData() {
     if (msgType == "cmd") {
         String cmdStr = getJsonValue(dataBuffer, "cmd");
         Serial.printf("[SERIAL CMD] Legacy command: %s\r\n", cmdStr.c_str());
-        
+
         if (cmdStr == "cal") {
             calibratePressureSensorZeroPoint();
+        } else if (cmdStr == "fast_poll") {
+            // Enable fast BlueCherry polling for 60 minutes max
+            String valStr = getJsonValue(dataBuffer, "val");
+            int val = valStr.toInt();
+
+            if (val == 1) {
+                fastPollingActive = true;
+                fastPollingStartTime = millis();
+                Serial.println("[FAST POLL] Enabled - BlueCherry polling every 15 seconds for 60 minutes max");
+            } else {
+                fastPollingActive = false;
+                Serial.println("[FAST POLL] Disabled - returning to scheduled polling");
+            }
         } else {
             Serial.println("[SERIAL CMD] Unknown legacy command: " + cmdStr);
         }
@@ -6942,6 +7036,20 @@ void checkFirmwareUpdate() {
                 else if (payloadLower.indexOf("calibrate_pressure") >= 0) {
                     Serial.println("[BC Cmd] calibrate_pressure command");
                     executeRemoteCommand("calibrate_pressure", "");
+                }
+                // --- fast_poll ---
+                else if (payloadLower.indexOf("fast_poll") >= 0) {
+                    Serial.println("[BC Cmd] fast_poll command");
+                    // Enable fast BlueCherry polling for 60 minutes max
+                    fastPollingActive = true;
+                    fastPollingStartTime = millis();
+                    Serial.println("[FAST POLL] Enabled via BlueCherry - BlueCherry polling every 15 seconds for 60 minutes max");
+                }
+                // --- exit_fast_poll ---
+                else if (payloadLower.indexOf("exit_fast_poll") >= 0) {
+                    Serial.println("[BC Cmd] exit_fast_poll command");
+                    fastPollingActive = false;
+                    Serial.println("[FAST POLL] Disabled via BlueCherry - returning to scheduled polling");
                 }
                 // --- exit_manual ---
                 else if (payloadLower.indexOf("exit_manual") >= 0) {
