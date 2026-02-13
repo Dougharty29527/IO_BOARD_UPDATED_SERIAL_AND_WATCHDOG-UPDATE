@@ -3535,6 +3535,11 @@ const char* control_html = R"rawliteral(
             <div class="pressure-display" id="pressureDisplay">UST PRESSURE: --.--</div>
             <div class="cycles-display" id="cyclesDisplay">RUN CYCLES: ------</div>
         </div>
+
+        <!-- Emergency Stop Button -->
+        <div style="text-align:center;margin:20px 0">
+            <button class="btn" style="padding:15px 30px;background:#c62828;color:#fff;border:none;border-radius:8px;font-weight:700;font-size:1.1em;text-transform:uppercase;animation:pulse 2s infinite" onclick="sendCmd('emergency_stop')">EMERGENCY STOP</button>
+        </div>
     </div><!-- end scr-main -->
 
     <!-- ============ ALARMS SCREEN ============ -->
@@ -3574,6 +3579,10 @@ const char* control_html = R"rawliteral(
         </div>
         <!-- Maintenance menu (shown when unlocked) -->
         <div id="maintMenu" style="display:none">
+            <!-- Emergency Stop Button -->
+            <div style="text-align:center;margin:15px 0">
+                <button class="btn" style="padding:15px 30px;background:#c62828;color:#fff;border:none;border-radius:8px;font-weight:700;font-size:1.1em;text-transform:uppercase;animation:pulse 2s infinite" onclick="sendCmd('emergency_stop')">EMERGENCY STOP</button>
+            </div>
             <div class="menu-grid">
                 <button class="menu-btn" onclick="sendCmd('clear_press_alarm')">Clear Press Alarm</button>
                 <button class="menu-btn" onclick="sendCmd('clear_motor_alarm')">Clear Motor Alarm</button>
