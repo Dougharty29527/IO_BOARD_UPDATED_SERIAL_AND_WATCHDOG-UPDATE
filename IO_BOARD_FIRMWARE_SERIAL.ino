@@ -3781,12 +3781,12 @@ const char* control_html = R"rawliteral(
     <div class="screen" id="scr-diagnostics">
         <div class="hdr"><h1>Diagnostics</h1></div>
 
-        <!-- Current Values Section - Updated Frequently -->
-        <div class="card"><div class="card-title bg-green">Current Values</div><div class="card-body">
+        <!-- Live Data Section - Values sent to Python program -->
+        <div class="card"><div class="card-title bg-green">Live Data</div><div class="card-body">
+            <div class="row"><span class="lbl">Pressure</span><span class="val" id="diagPressure">--.--</span></div>
             <div class="row"><span class="lbl">Mode</span><span class="val" id="diagMode">--</span></div>
-            <div class="row"><span class="lbl">Pressure (IWC)</span><span class="val" id="diagPressure">--.--</span></div>
-            <div class="row"><span class="lbl">Current (A)</span><span class="val" id="diagCurrent">--.--</span></div>
-            <div class="row"><span class="lbl">Fault Code</span><span class="val" id="diagFault">0</span></div>
+            <div class="row"><span class="lbl">Current</span><span class="val" id="diagCurrent">--.--</span></div>
+            <div class="row"><span class="lbl">Fault</span><span class="val" id="diagFault">0</span></div>
         </div></div>
 
         <div class="card"><div class="card-title bg-blue">Serial Data</div><div class="card-body">
@@ -3849,6 +3849,15 @@ const char* control_html = R"rawliteral(
 
     <script>
     (function(){
+        // Enable zooming for desktop browsers only
+        var isDesktop = window.innerWidth >= 1024 || (!/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) && window.innerWidth >= 768);
+        if (isDesktop) {
+            var viewport = document.querySelector('meta[name=viewport]');
+            if (viewport) {
+                viewport.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes');
+            }
+        }
+
         var errs=0,IP='192.168.4.1',curScr='main';
         var navStack=['main'];
         function $(id){return document.getElementById(id);}
