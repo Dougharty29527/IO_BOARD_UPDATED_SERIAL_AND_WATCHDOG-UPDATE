@@ -200,6 +200,27 @@ The number is the timeout in minutes. Linux should:
 
 ---
 
+### 5. Data Backfill (ESP32 sends collected data after passthrough)
+
+Sent automatically after ESP32 reboots from passthrough mode. Contains SD card data collected during the passthrough session that was not sent to the cloud due to cellular modem being busy with PPP.
+
+```json
+{"backfill":[{"pressure":-14.22,"current":0.07,"mode":0,"fault":0,"cycles":484},{"pressure":-14.25,"current":0.06,"mode":1,"fault":0,"cycles":485}]}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `backfill` | array | Array of data objects collected during passthrough mode |
+| `pressure` | float | Vacuum pressure in inches of water column (IWC) |
+| `current` | float | Motor current in amps |
+| `mode` | int | Relay mode (0-9) |
+| `fault` | int | Active alarm bitmask |
+| `cycles` | int | Run cycle count |
+
+**Why backfill is needed:** During passthrough mode, the ESP32 continues to collect sensor data and store it on the SD card, but cannot send CBOR data to the cloud because the cellular modem is busy with PPP. After passthrough ends, this data is sent to the Linux device for cloud synchronization. Date/time is added by the Linux device/server, not included in the backfill data.
+
+---
+
 ## Linux to ESP32 Messages
 
 ### 1. Periodic Data Payload (every 15 seconds)
@@ -328,26 +349,42 @@ These tell the ESP32 to start/stop its own failsafe cycle engine. In normal oper
 
 ## Serial Watchdog and Failsafe Mode
 
-The ESP32 monitors the serial line for incoming data. If no JSON message is received for **30 minutes**, the watchdog triggers.
+The ESP32 monitors the serial line for incoming data. Watchdog behavior depends on whether failsafe mode is enabled or disabled.
 
-### Watchdog Timeline
+### Failsafe Enable/Disable Setting
+
+Failsafe mode can be enabled/disabled via:
+- **Web Portal**: Settings → Failsafe Mode toggle (password required)
+- **BlueCherry**: `enable_failsafe` or `exit_failsafe` commands
+
+**Default state:** Failsafe is **disabled** (safe default to prevent unintended autonomous operation).
+
+### Watchdog Behavior
+
+| Failsafe Setting | Watchdog Action |
+|------------------|----------------|
+| **Disabled** | Pulses GPIO39 every **10 minutes** if no serial data. Never enters failsafe mode. |
+| **Enabled** | Pulses GPIO39 every **30 minutes** if no serial data. Enters failsafe after 2 attempts. |
+
+### Watchdog Timeline (Failsafe Enabled)
 
 | Time Since Last Data | Action |
 |---------------------|--------|
 | 0 - 30 min | Normal operation. `resetSerialWatchdog()` called on every received `{`. |
-| 30 min | **Watchdog pulse #1**: GPIO39 goes HIGH for **1 second** (short power-cycle attempt on the Linux device). Fault code **1024** added. |
+| 30 min | **Watchdog pulse #1**: GPIO39 goes HIGH for **1 second** (short power-cycle attempt). Fault code **2048** added. |
 | 60 min | **Watchdog pulse #2**: GPIO39 goes HIGH for **30 seconds** (long power-cycle). |
-| After 2 failed attempts | **Failsafe mode**: ESP32 takes autonomous control of relays using its own pressure readings. Fault code **8192** added. |
+| After 2 failed attempts | **Failsafe mode**: ESP32 takes autonomous control. Fault code **16384** added. |
 
-### Failsafe Mode
+### Failsafe Mode (When Enabled and Triggered)
 
-When the ESP32 enters failsafe mode:
-- It runs its own cycle engine (auto-start based on pressure thresholds)
-- It uses the active profile's settings for run/purge/burp timing
-- CBOR data continues to be sent to the cloud (with fault code 8192)
-- The web portal still works and can control cycles
+When failsafe is both enabled AND watchdog has triggered twice:
+- ESP32 runs autonomous cycle engine using ADC pressure/current readings
+- Uses active profile settings for run/purge/burp timing
+- CBOR data continues sending to cloud every 15 seconds
+- Web portal still works for manual control
+- Fault code **16384** indicates active failsafe operation
 
-**Exiting failsafe:** When serial data resumes (Linux sends any valid JSON), the ESP32 automatically exits failsafe mode and returns to normal operation (Linux controls relays).
+**Exiting failsafe:** When serial data resumes (any valid JSON), ESP32 automatically exits failsafe and returns to normal Linux-controlled operation.
 
 ### Fault Code Bitmask
 
@@ -355,11 +392,17 @@ The ESP32 adds these codes to the `fault` value from Linux:
 
 | Code | Meaning |
 |------|---------|
-| 1024 | Serial watchdog triggered (no data for 30+ minutes) |
-| 4096 | BlueCherry cloud platform offline |
-| 8192 | Failsafe mode active (ESP32 running autonomously) |
+| 1024 | SD card failure |
+| 2048 | Serial watchdog triggered (no data for 30+ minutes) |
+| 4096 | Failsafe enabled (setting - can enter failsafe if watchdog triggers) |
+| 8192 | BlueCherry cloud platform offline |
+| 16384 | Failsafe mode active (ESP32 autonomously controlling relays) |
 
-These are additive. A device in failsafe with no cloud connection would have fault = Linux_faults + 8192 + 4096.
+**Examples:**
+- Watchdog triggered: `fault = 2048`
+- Failsafe enabled but not active: `fault = 4096`
+- Failsafe actively running: `fault = 4096 + 16384 = 20480`
+- All faults: `fault = 1024 + 2048 + 4096 + 8192 + 16384 = 31744`
 
 ---
 

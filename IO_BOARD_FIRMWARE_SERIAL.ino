@@ -1,7 +1,7 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 10.17
- *  Date: 2/11/2026
+ *  Walter IO Board Firmware - Rev 10.18
+ *  Date: 2/12/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -12,6 +12,31 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *  
+ *  Rev 10.18 (2/12/2026) - Unified Command System + Manual Relay Override
+ *  - NEW: executeRemoteCommand() central dispatch — all remote commands (Web Portal,
+ *    BlueCherry, Serial1 from Python) route through one function for identical behavior
+ *  - NEW: notifyPythonOfCommand() helper — sends unified JSON to Python on Serial1
+ *  - NEW: Manual relay override mode (cr0/cr1/cr2/cr5 commands with value 0/1)
+ *    * Enters manualRelayOverride mode on any relay command
+ *    * Blocks 15-second relay refresh and Linux serial mode commands
+ *    * exit_manual command or starting a new cycle/test returns to normal operation
+ *  - NEW: enable_failsafe / exit_failsafe commands from Web Portal and BlueCherry
+ *  - NEW: BlueCherry keywords for all unified commands (stop_test, overfill_override,
+ *    clear_press_alarm, clear_motor_alarm, enable_failsafe, exit_failsafe,
+ *    cr0/cr1/cr2/cr5 <0|1>, exit_manual, calibrate_pressure)
+ *  - NEW: parsedSerialData() accepts unified {"command":"<name>","value":"<val>"} format
+ *    from Python in addition to legacy {"type":"cmd","cmd":"cal"} format
+ *  - NEW: Dynamic captive portal status display with mobile-friendly design
+ *    * Shows UST pressure and run cycles with real-time data
+ *    * Red alarm card when any ESP32 alarm is active
+ *    * Date/time in top right corner (mobile-optimized layout)
+ *    * "VST GREEN MACHINE" header with darker blue styling
+ *    * "Advanced Controls" button at bottom linking to full dashboard
+ *  - FIX: stop_test now sends correct command name to Python (was sending "stop_cycle")
+ *  - Removed JSON "source" field from Serial1 messages to minimize serial traffic
+ *  - Updated calibration response format: {"command":"calibrate_pressure","ps_cal":...}
+ *  - Web Portal /api/command handler refactored to delegate to executeRemoteCommand()
  *  
  *  Rev 10.17 (2/12/2026) - Fault Code Reassignment + SD Card Fault
  *  - BREAKING: Fault codes reassigned (coordinate with Linux/server if parsing these)
@@ -597,7 +622,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.17"
+#define VERSION "Rev 10.18"
 
 // REV 10.16: Delay between individual relay GPIO pin changes (milliseconds).
 // Simultaneous activation of CR0_MOTOR, CR1, CR2, CR5 causes electrical noise
@@ -657,6 +682,8 @@ void   sendFastSensorPacket();
 void   loadPressureCalibrationFromEeprom();
 void   savePressureCalibrationToEeprom();
 void   calibratePressureSensorZeroPoint();
+void   notifyPythonOfCommand(const char* command, const char* value);
+void   executeRemoteCommand(String cmd, String value);
 
 // =====================================================================
 // ADS1015 ADC CONFIGURATION (Rev 10 - replaces MCP23017 emulation)
@@ -812,6 +839,15 @@ const uint8_t OVERFILL_TRIGGER_COUNT = 8;   // Consecutive LOW readings to trigg
 const uint8_t OVERFILL_CLEAR_COUNT = 5;     // Consecutive HIGH readings to clear
 
 // =====================================================================
+// REV 10.18: Manual relay override mode
+// =====================================================================
+// When true, individual cr0/cr1/cr2/cr5 commands control GPIO pins directly.
+// The 15-second relay refresh and Linux serial mode commands are blocked
+// while in manual override. Use "exit_manual" to restore normal operation.
+// Any start_cycle or start_test command also auto-exits manual mode.
+bool manualRelayOverride = false;
+
+// =====================================================================
 // FAILSAFE MODE GLOBALS (Rev 10 - autonomous relay control when Comfile is down)
 // =====================================================================
 bool failsafeMode = false;                  // True when ESP32 controls relays autonomously
@@ -919,6 +955,7 @@ bool serialDebugMode = false;                    // Debug mode for Serial Monito
 
 // Serial watchdog variables
 bool watchdogEnabled = true;                     // Watchdog feature enable/disable flag (default: enabled)
+bool failsafeEnabled = false;                     // Failsafe mode enable/disable flag (default: disabled)
 unsigned long lastSerialDataTime = 0;            // Timestamp of last received serial data
 bool watchdogTriggered = false;                  // Flag to track if we're in watchdog state (no serial)
 int watchdogRebootAttempts = 0;                  // Counter for reboot attempts (0 = no attempts yet)
@@ -929,6 +966,7 @@ const unsigned long WATCHDOG_LONG_PULSE = 30000; // Subsequent attempts: 30 seco
 const int SD_CARD_FAULT_CODE = 1024;             // REV 10.17: Fault code for SD card failure
 const int WATCHDOG_FAULT_CODE = 2048;            // REV 10.17: Fault code for serial watchdog (was 1024)
 const int BLUECHERRY_FAULT_CODE = 8192;          // REV 10.17: Fault code for BlueCherry disconnected (was 4096)
+const int FAILSAFE_ACTIVE_FAULT_CODE = 16384;   // NEW: Added when failsafe mode is actively controlling relays
 
 // REV 10.10: LTE connection check interval
 // Previously: lteConnected() was checked EVERY loop iteration. If the cellular modem
@@ -1232,11 +1270,18 @@ const unsigned long RELAY_REFRESH_INTERVAL = 15000; // 15 seconds — matches Li
 bool passthroughMode = false;      // True when passthrough is active
 int passthroughValue = 0;          // 0=normal operation, 1=passthrough active (sent in JSON status)
 
-// Forward declarations for passthrough functions (needed for lambda in web server)
+// Data backfill system - sends SD card data collected during passthrough mode
+// to Linux device after passthrough ends for cloud synchronization
+bool backfillPending = false;      // True when backfill procedure should run after boot
+String passthroughStartTime = "";  // ISO format datetime when passthrough started
+bool purgeNeeded = false;          // True when cycle should be stopped before passthrough
+
+// Forward declarations for passthrough and backfill functions (needed for lambda in web server)
 bool sendPassthroughRequestToLinux(unsigned long timeoutMinutes);
 void enterPassthroughMode(unsigned long timeoutMinutes = 60);
 void exitPassthroughMode();
 void runPassthroughLoop();
+void dataBackfill();               // Send collected data to Linux device
 
 // QC mode removed in Rev 9.4 - web interface is now read-only diagnostic dashboard
 // Relay control is exclusively managed by I2C from the Linux master
@@ -1457,12 +1502,16 @@ void checkSerialWatchdog() {
                           timeSinceLastData / 60000);
         }
         
-        // Check if it's time for another reboot attempt (every 30 minutes)
+        // Check if it's time for another reboot attempt
+        // Interval depends on failsafe enabled state:
+        // - Failsafe disabled: reboot every 10 minutes
+        // - Failsafe enabled: reboot every 30 minutes (normal behavior)
+        unsigned long rebootInterval = failsafeEnabled ? WATCHDOG_TIMEOUT : (10UL * 60UL * 1000UL); // 10 min vs 30 min
         unsigned long timeSinceLastPulse = millis() - lastWatchdogPulseTime;
-        
-        if (lastWatchdogPulseTime == 0 || timeSinceLastPulse >= WATCHDOG_TIMEOUT) {
+
+        if (lastWatchdogPulseTime == 0 || timeSinceLastPulse >= rebootInterval) {
             watchdogRebootAttempts++;
-            
+
             // Determine pulse duration: 1 second for first attempt, 30 seconds for subsequent
             unsigned long pulseDuration;
             if (watchdogRebootAttempts == 1) {
@@ -1470,14 +1519,15 @@ void checkSerialWatchdog() {
             } else {
                 pulseDuration = WATCHDOG_LONG_PULSE;   // 30 seconds
             }
-            
+
             // Trigger the watchdog pulse
             pulseWatchdogPin(pulseDuration);
-            
+
             // Record when we pulsed
             lastWatchdogPulseTime = millis();
-            
-            Serial.printf("[WATCHDOG] Next attempt in 30 min if no serial data\r\n");
+
+            unsigned long nextIntervalMinutes = failsafeEnabled ? 30 : 10;
+            Serial.printf("[WATCHDOG] Next attempt in %lu min if no serial data\r\n", nextIntervalMinutes);
         }
     }
 }
@@ -1560,6 +1610,185 @@ void resetSerialWatchdog() {
     watchdogTriggered = false;
     watchdogRebootAttempts = 0;
     lastWatchdogPulseTime = 0;
+}
+
+// =====================================================================
+// REV 10.18: UNIFIED COMMAND SYSTEM
+// =====================================================================
+// notifyPythonOfCommand() - sends a JSON command to the Python program
+// on Serial1 so the Linux host can act on or relay the command.
+//
+// Usage example:
+//   notifyPythonOfCommand("overfill_override", "1");   // sends {"command":"overfill_override","value":"1"}
+//   notifyPythonOfCommand("stop_test", "");             // sends {"command":"stop_test"}
+// =====================================================================
+
+/**
+ * Send a JSON command notification to the Python program on Serial1.
+ * Omits "value" key when value is empty. No "source" field is sent
+ * (removed in Rev 10.18 to minimize serial traffic).
+ *
+ * @param command  The command name (e.g. "overfill_override")
+ * @param value    Optional value string; pass "" to omit from JSON
+ */
+void notifyPythonOfCommand(const char* command, const char* value) {
+    if (strlen(value) > 0) {
+        Serial1.printf("{\"command\":\"%s\",\"value\":\"%s\"}\n", command, value);
+    } else {
+        Serial1.printf("{\"command\":\"%s\"}\n", command);
+    }
+    Serial.printf("[CMD->PY] %s %s\n", command, value);
+}
+
+/**
+ * Central command dispatcher - all remote commands (Web Portal, BlueCherry,
+ * Serial1 from Python) route through here. This ensures identical behavior
+ * regardless of source.
+ *
+ * Supported commands:
+ *   stop_test           - stop the currently running test
+ *   overfill_override   - toggle overfill override (value "1" to enable)
+ *   clear_press_alarm   - clear pressure alarm fault
+ *   clear_motor_alarm   - clear motor alarm fault
+ *   enable_failsafe     - enter failsafe mode
+ *   exit_failsafe       - exit failsafe mode
+ *   start_leak_test     - begin leak test
+ *   start_func_test     - begin functionality test
+ *   start_eff_test      - begin efficiency test
+ *   cr0, cr1, cr2, cr5  - direct relay control (value "0" or "1"), enters manual mode
+ *   exit_manual          - exit manual relay override mode
+ *   calibrate_pressure  - calibrate the pressure sensor zero point
+ *
+ * Usage example:
+ *   executeRemoteCommand("overfill_override", "1");
+ *   executeRemoteCommand("cr1", "1");        // turns on CR1, enters manual mode
+ *   executeRemoteCommand("exit_manual", "");  // resumes normal operation
+ *
+ * @param cmd    The command name string
+ * @param value  An optional parameter value (empty string if none)
+ */
+void executeRemoteCommand(String cmd, String value) {
+    Serial.printf("[CMD] Executing: %s value=%s\n", cmd.c_str(), value.c_str());
+
+    // --- Stop Test ---
+    if (cmd == "stop_test") {
+        testRunning = false;
+        notifyPythonOfCommand("stop_test", "");
+        Serial.println("[CMD] Test stopped.");
+    }
+    // --- Overfill Override ---
+    else if (cmd == "overfill_override") {
+        overfillAlarmActive = false;  // Clear the overfill alarm
+        overfillLowCount = 0;        // Reset the low-reading counter
+        notifyPythonOfCommand("overfill_override", "1");
+        Serial.println("[CMD] Overfill override activated (alarm cleared).");
+    }
+    // --- Clear Pressure Alarm ---
+    else if (cmd == "clear_press_alarm") {
+        failsafeLowCurrentCount = 0;
+        failsafeHighCurrentCount = 0;
+        notifyPythonOfCommand("clear_press_alarm", "");
+        Serial.println("[CMD] Pressure alarm cleared.");
+    }
+    // --- Clear Motor Alarm ---
+    else if (cmd == "clear_motor_alarm") {
+        failsafeLowCurrentCount = 0;
+        failsafeHighCurrentCount = 0;
+        notifyPythonOfCommand("clear_motor_alarm", "");
+        Serial.println("[CMD] Motor alarm cleared.");
+    }
+    // --- Enable Failsafe Setting ---
+    else if (cmd == "enable_failsafe") {
+        failsafeEnabled = true;
+        preferences.begin("RMS", false);
+        preferences.putBool("failsafe", failsafeEnabled);
+        preferences.end();
+        notifyPythonOfCommand("enable_failsafe", "");
+        Serial.println("[CMD] Failsafe setting ENABLED.");
+    }
+    // --- Disable Failsafe Setting ---
+    else if (cmd == "exit_failsafe") {
+        failsafeEnabled = false;
+        preferences.begin("RMS", false);
+        preferences.putBool("failsafe", failsafeEnabled);
+        preferences.end();
+        // If disabling failsafe while in failsafe mode, exit failsafe
+        if (failsafeMode) {
+            exitFailsafeMode();
+            Serial.println("[FAILSAFE] Exited failsafe mode due to failsafe being disabled");
+        }
+        notifyPythonOfCommand("exit_failsafe", "");
+        Serial.println("[CMD] Failsafe setting DISABLED.");
+    }
+    // --- Start Leak Test ---
+    else if (cmd == "start_leak_test") {
+        testRunning = true;
+        manualRelayOverride = false;  // auto-exit manual mode
+        notifyPythonOfCommand("start_leak_test", "");
+        Serial.println("[CMD] Leak test started.");
+    }
+    // --- Start Functionality Test ---
+    else if (cmd == "start_func_test") {
+        testRunning = true;
+        manualRelayOverride = false;  // auto-exit manual mode
+        notifyPythonOfCommand("start_func_test", "");
+        Serial.println("[CMD] Functionality test started.");
+    }
+    // --- Start Efficiency Test ---
+    else if (cmd == "start_eff_test") {
+        testRunning = true;
+        manualRelayOverride = false;  // auto-exit manual mode
+        notifyPythonOfCommand("start_eff_test", "");
+        Serial.println("[CMD] Efficiency test started.");
+    }
+    // --- Direct Relay Control: CR0 (Motor) ---
+    else if (cmd == "cr0") {
+        manualRelayOverride = true;
+        int state = value.toInt();
+        digitalWrite(CR0_MOTOR, state ? HIGH : LOW);
+        notifyPythonOfCommand("cr0", value.c_str());
+        Serial.printf("[CMD] CR0_MOTOR set to %d (manual override ON)\n", state);
+    }
+    // --- Direct Relay Control: CR1 ---
+    else if (cmd == "cr1") {
+        manualRelayOverride = true;
+        int state = value.toInt();
+        digitalWrite(CR1, state ? HIGH : LOW);
+        notifyPythonOfCommand("cr1", value.c_str());
+        Serial.printf("[CMD] CR1 set to %d (manual override ON)\n", state);
+    }
+    // --- Direct Relay Control: CR2 ---
+    else if (cmd == "cr2") {
+        manualRelayOverride = true;
+        int state = value.toInt();
+        digitalWrite(CR2, state ? HIGH : LOW);
+        notifyPythonOfCommand("cr2", value.c_str());
+        Serial.printf("[CMD] CR2 set to %d (manual override ON)\n", state);
+    }
+    // --- Direct Relay Control: CR5 ---
+    else if (cmd == "cr5") {
+        manualRelayOverride = true;
+        int state = value.toInt();
+        digitalWrite(CR5, state ? HIGH : LOW);
+        notifyPythonOfCommand("cr5", value.c_str());
+        Serial.printf("[CMD] CR5 set to %d (manual override ON)\n", state);
+    }
+    // --- Exit Manual Override ---
+    else if (cmd == "exit_manual") {
+        manualRelayOverride = false;
+        notifyPythonOfCommand("exit_manual", "");
+        Serial.println("[CMD] Manual relay override DISABLED, returning to normal mode.");
+    }
+    // --- Calibrate Pressure Sensor ---
+    else if (cmd == "calibrate_pressure") {
+        calibratePressureSensorZeroPoint();
+        // calibratePressureSensorZeroPoint() sends its own response to Serial1
+        Serial.println("[CMD] Pressure calibration executed.");
+    }
+    // --- Unknown Command ---
+    else {
+        Serial.printf("[CMD] Unknown command: %s\n", cmd.c_str());
+    }
 }
 
 // =====================================================================
@@ -2292,13 +2521,15 @@ void calibratePressureSensorZeroPoint() {
     // Save to EEPROM so calibration persists across reboots
     savePressureCalibrationToEeprom();
     
-    // Send calibration result back to Linux via Serial1.
-    // Python modem.py parses "ps_cal" and saves to gm_db as 'adc_zero'.
-    // Regular sensor packets will immediately show pressure ≈ 0.0 IWC.
-    char calMsg[64];
-    snprintf(calMsg, sizeof(calMsg), "{\"type\":\"data\",\"ps_cal\":%.2f}", adcZeroPressure);
+    // REV 10.18: Send unified calibration response to Linux via Serial1.
+    // Python modem.py now handles both the new "command" format and the
+    // legacy "ps_cal" format. The new format is preferred.
+    char calMsg[128];
+    snprintf(calMsg, sizeof(calMsg),
+             "{\"command\":\"calibrate_pressure\",\"ps_cal\":%.2f}",
+             adcZeroPressure);
     Serial1.println(calMsg);
-    Serial.printf("[CAL] Sent ps_cal to Linux: %s\r\n", calMsg);
+    Serial.printf("[CAL] Sent calibration result to Linux: %s\r\n", calMsg);
 }
 
 // =====================================================================
@@ -2652,8 +2883,9 @@ void adcReaderTask(void *parameter) {
  *   3. Not already in failsafe mode
  */
 bool shouldEnterFailsafeMode() {
-    return watchdogTriggered && 
-           watchdogRebootAttempts >= MAX_WATCHDOG_ATTEMPTS_BEFORE_FAILSAFE && 
+    return watchdogTriggered &&
+           watchdogRebootAttempts >= MAX_WATCHDOG_ATTEMPTS_BEFORE_FAILSAFE &&
+           failsafeEnabled &&  // Only enter failsafe if it's enabled
            !failsafeMode;
 }
 
@@ -2870,7 +3102,8 @@ int getCombinedFaultCode() {
     int code = 0;
     if (!isSDCardOK())       code += SD_CARD_FAULT_CODE;
     if (isInWatchdogState()) code += WATCHDOG_FAULT_CODE;
-    if (failsafeMode)        code += FAILSAFE_FAULT_CODE;
+    if (failsafeEnabled)     code += FAILSAFE_FAULT_CODE;      // Failsafe is enabled (4096)
+    if (failsafeMode)        code += FAILSAFE_ACTIVE_FAULT_CODE; // Failsafe is actively running (16384)
     if (!blueCherryConnected) code += BLUECHERRY_FAULT_CODE;
     return code;
 }
@@ -2998,6 +3231,157 @@ void flushCborPassthroughBuffer() {
     Serial.println("[CBOR] Passthrough buffer flushed successfully");
 }
 
+/**
+ * Data Backfill Function - sends SD card data collected during passthrough mode
+ * to Linux device after passthrough ends for cloud synchronization.
+ *
+ * Reads the current year's logfile, filters entries by timestamp to only include
+ * data collected during the passthrough session, and sends as JSON array to Linux.
+ *
+ * Expected JSON format sent to Linux:
+ * {"backfill":[{"timestamp":"2026-02-13 10:30:15","pressure":-14.22,"current":0.07,"mode":0,"fault":0,"cycles":484}]}
+ */
+void dataBackfill() {
+    if (passthroughStartTime.length() == 0) {
+        Serial.println("[BACKFILL] ERROR: No passthrough start time available");
+        return;
+    }
+
+    Serial.printf("[BACKFILL] Starting backfill procedure for data after: %s\r\n", passthroughStartTime.c_str());
+
+    // Get current year for logfile name
+    time_t rawTime = (time_t)currentTimestamp;
+    struct tm *timeInfo = gmtime(&rawTime);
+    int currentYear = timeInfo->tm_year + 1900;
+    String logFileName = "/logfile" + String(currentYear) + ".log";
+
+    // Open the logfile for reading
+    File logFile = SD.open(logFileName.c_str(), FILE_READ);
+    if (!logFile) {
+        Serial.printf("[BACKFILL] ERROR: Could not open logfile: %s\r\n", logFileName.c_str());
+        return;
+    }
+
+    Serial.printf("[BACKFILL] Opened logfile: %s for backfill\r\n", logFileName.c_str());
+
+    // Convert passthrough start time to timestamp for comparison
+    unsigned long startTimestamp = 0;
+    struct tm parseTime = {0};
+    if (sscanf(passthroughStartTime.c_str(), "%d-%d-%d %d:%d:%d",
+               &parseTime.tm_year, &parseTime.tm_mon, &parseTime.tm_mday,
+               &parseTime.tm_hour, &parseTime.tm_min, &parseTime.tm_sec) == 6) {
+        parseTime.tm_year -= 1900;  // tm_year is years since 1900
+        parseTime.tm_mon -= 1;      // tm_mon is 0-based
+        startTimestamp = mktime(&parseTime);
+    }
+
+    if (startTimestamp == 0) {
+        Serial.println("[BACKFILL] ERROR: Could not parse passthrough start time");
+        logFile.close();
+        return;
+    }
+
+    Serial.printf("[BACKFILL] Filtering data with timestamp >= %lu\r\n", startTimestamp);
+
+    // Read through the file and collect matching entries
+    String jsonArray = "[";
+    bool firstEntry = true;
+    int backfillCount = 0;
+
+    while (logFile.available()) {
+        String line = logFile.readStringUntil('\n');
+        line.trim();
+
+        if (line.length() == 0) continue;
+
+        // Parse CSV line: timestamp,id,seq,pressure,cycles,fault,mode,temp,current
+        int comma1 = line.indexOf(',');
+        if (comma1 == -1) continue;
+
+        String timestampStr = line.substring(0, comma1);
+        unsigned long entryTimestamp = strtoul(timestampStr.c_str(), NULL, 10);
+
+        // Only include entries with timestamp >= passthrough start time
+        if (entryTimestamp < startTimestamp) continue;
+
+        // Parse remaining fields
+        int pos = comma1 + 1;
+        int comma2 = line.indexOf(',', pos);
+        if (comma2 == -1) continue;
+        String idStr = line.substring(pos, comma2);
+
+        pos = comma2 + 1;
+        int comma3 = line.indexOf(',', pos);
+        if (comma3 == -1) continue;
+        String seqStr = line.substring(pos, comma3);
+
+        pos = comma3 + 1;
+        int comma4 = line.indexOf(',', pos);
+        if (comma4 == -1) continue;
+        String pressureStr = line.substring(pos, comma4);
+
+        pos = comma4 + 1;
+        int comma5 = line.indexOf(',', pos);
+        if (comma5 == -1) continue;
+        String cyclesStr = line.substring(pos, comma5);
+
+        pos = comma5 + 1;
+        int comma6 = line.indexOf(',', pos);
+        if (comma6 == -1) continue;
+        String faultStr = line.substring(pos, comma6);
+
+        pos = comma6 + 1;
+        int comma7 = line.indexOf(',', pos);
+        if (comma7 == -1) continue;
+        String modeStr = line.substring(pos, comma7);
+
+        pos = comma7 + 1;
+        int comma8 = line.indexOf(',', pos);
+        if (comma8 == -1) continue;
+        String tempStr = line.substring(pos, comma8);
+
+        String currentStr = line.substring(comma8 + 1);
+
+        // Format as JSON object (without timestamp as per requirements)
+        if (!firstEntry) jsonArray += ",";
+        firstEntry = false;
+
+        jsonArray += "{";
+        jsonArray += "\"pressure\":" + pressureStr + ",";
+        jsonArray += "\"current\":" + currentStr + ",";
+        jsonArray += "\"mode\":" + modeStr + ",";
+        jsonArray += "\"fault\":" + faultStr + ",";
+        jsonArray += "\"cycles\":" + cyclesStr;
+        jsonArray += "}";
+
+        backfillCount++;
+
+        // Prevent JSON array from getting too large (limit to ~100 entries)
+        if (backfillCount >= 100) {
+            Serial.println("[BACKFILL] WARNING: Limiting backfill to 100 entries to prevent buffer overflow");
+            break;
+        }
+    }
+
+    logFile.close();
+
+    jsonArray += "]";
+
+    if (backfillCount == 0) {
+        Serial.println("[BACKFILL] No data found for backfill period");
+        return;
+    }
+
+    Serial.printf("[BACKFILL] Found %d entries for backfill\r\n", backfillCount);
+
+    // Send the backfill data to Linux device
+    String backfillMessage = "{\"backfill\":" + jsonArray + "}";
+    Serial1.println(backfillMessage);
+    Serial.printf("[BACKFILL] Sent backfill data to Linux: %d bytes\r\n", backfillMessage.length());
+
+    Serial.println("[BACKFILL] Backfill procedure completed successfully");
+}
+
 // =====================================================================
 // WEB INTERFACE
 // =====================================================================
@@ -3014,7 +3398,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.17</title>
+    <title>Walter IO Board - Rev 10.18</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -3098,7 +3482,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.17</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.18</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -3344,6 +3728,14 @@ const char* control_html = R"rawliteral(
             </div>
             <div style="font-size:0.75em;color:#999;padding:2px 0 8px">Pulses GPIO39 if no serial data for 30 min</div>
             <div class="cfg-row" style="padding:6px 0;display:flex;gap:6px;align-items:center">
+                <span class="lbl">Failsafe Mode:</span>
+                <label style="display:flex;align-items:center;cursor:pointer">
+                    <input type="checkbox" id="fsToggle" onchange="setFailsafe(this.checked)" style="width:20px;height:20px;margin-right:6px">
+                    <span id="fsLabel" style="font-weight:600;font-size:0.85em">--</span>
+                </label>
+            </div>
+            <div style="font-size:0.75em;color:#999;padding:2px 0 8px">Enables autonomous relay control after watchdog failures</div>
+            <div class="cfg-row" style="padding:6px 0;display:flex;gap:6px;align-items:center">
                 <span class="lbl">Serial Debug:</span>
                 <label style="display:flex;align-items:center;cursor:pointer">
                     <input type="checkbox" id="dbgToggle" onchange="setDebugMode(this.checked)" style="width:20px;height:20px;margin-right:6px">
@@ -3575,6 +3967,17 @@ const char* control_html = R"rawliteral(
             };
             x.send();
         };
+        window.setFailsafe=function(on){
+            var p=$('cfgPwd').value;
+            if(!p){alert('Password required');$('fsToggle').checked=!on;return;}
+            var x=new XMLHttpRequest();
+            x.open('GET','http://'+IP+'/setfailsafe?enabled='+(on?'1':'0')+'&pwd='+encodeURIComponent(p),true);
+            x.onload=function(){
+                if(x.status===403){alert('Wrong password');$('fsToggle').checked=!on;}
+                else{$('fsLabel').textContent=on?'ENABLED':'DISABLED';$('fsLabel').style.color=on?'#2e7d32':'#999';}
+            };
+            x.send();
+        };
         window.setDebugMode=function(on){
             var p=$('cfgPwd').value;
             if(!p){alert('Password required');$('dbgToggle').checked=!on;return;}
@@ -3677,6 +4080,8 @@ const char* control_html = R"rawliteral(
                         var od=$('overfillDebug');if(od)od.innerHTML='Pin='+(d.gpio38Raw?'HIGH':'LOW')+' L:'+d.overfillLowCnt+' H:'+d.overfillHighCnt;
                         upd('watchdog',d.watchdogEnabled?'Enabled':'Disabled');
                         var wt=$('wdToggle'),wl=$('wdLabel');if(wt)wt.checked=d.watchdogEnabled;if(wl){wl.textContent=d.watchdogEnabled?'ENABLED':'DISABLED';wl.style.color=d.watchdogEnabled?'#2e7d32':'#999';}
+                        upd('failsafe',d.failsafeEnabled?'Enabled':'Disabled');
+                        var ft=$('fsToggle'),fl=$('fsLabel');if(ft)ft.checked=d.failsafeEnabled;if(fl){fl.textContent=d.failsafeEnabled?'ENABLED':'DISABLED';fl.style.color=d.failsafeEnabled?'#2e7d32':'#999';}
                         var dt=$('dbgToggle'),dl=$('dbgLabel');if(dt)dt.checked=d.serialDebugMode;if(dl){dl.textContent=d.serialDebugMode?'ON':'OFF';dl.style.color=d.serialDebugMode?'#e65100':'#999';}
                         upd('uptime',d.uptime);upd('mac',d.macAddress);
                     }catch(e){errs++;if(errs>=3)conn(false);}
@@ -4022,6 +4427,77 @@ void initializeAPName() {
  * when using send_P() with a processor function. Otherwise the template
  * engine eats chunks of HTML between % signs -> blank page!
  */
+
+/**
+ * Generate dynamic HTML for the captive portal landing page (Rev 10.18)
+ * Shows current pressure, cycles, alarms, and datetime in a mobile-friendly layout
+ */
+String generateCaptivePortalHTML() {
+    // Get current data
+    float currentPressure = pressure;  // From global variable
+    int currentCycles = cycles;        // From global variable
+    int alarmCode = getCombinedFaultCode();  // Any ESP32 alarm active?
+    String datetimeStr = getDateTimeString(); // Format: "YYYY-MM-DD HH:MM:SS"
+
+    // Parse datetime string to separate date and time
+    String dateStr = "---- -- --";
+    String timeStr = "--:--:--";
+    if (datetimeStr.length() >= 19) {  // "2026-02-12 14:30:45" = 19 chars
+        dateStr = datetimeStr.substring(0, 10);  // "2026-02-12"
+        timeStr = datetimeStr.substring(11, 19); // "14:30:45"
+    }
+
+    // Format pressure with 2 decimal places
+    char pressureBuf[16];
+    snprintf(pressureBuf, sizeof(pressureBuf), "%.2f", currentPressure);
+
+    // Determine if alarm card should be red
+    bool hasAlarms = (alarmCode > 0);
+    String alarmCardClass = hasAlarms ? "alarm-active" : "alarm-normal";
+
+    // Generate HTML with embedded CSS for mobile-first design
+    String html = "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no'>"
+        "<title>VST Green Machine</title>"
+        "<style>"
+        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;margin:0;padding:0;background:#2563eb;color:#fff;min-height:100vh;display:flex;flex-direction:column;}"
+        ".header{background:#1e40af;padding:16px;text-align:center;font-size:1.25rem;font-weight:700;}"
+        ".datetime{position:absolute;top:16px;right:16px;text-align:right;color:#fff;}"
+        ".datetime .date{font-size:0.875rem;opacity:0.9;margin-bottom:2px;}"
+        ".datetime .time{font-size:1.125rem;font-weight:600;}"
+        ".content{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:20px;text-align:center;}"
+        ".alarm-card{background:#dc2626;border-radius:12px;padding:16px;margin-bottom:24px;max-width:280px;width:100%;box-shadow:0 4px 12px rgba(0,0,0,0.3);}"
+        ".alarm-normal{background:#16a34a;}"
+        ".status-text{font-size:1.5rem;font-weight:700;margin:8px 0;color:#fff;}"
+        ".status-value{font-size:2rem;font-weight:900;margin:4px 0;color:#fff;text-shadow:0 2px 4px rgba(0,0,0,0.3);}"
+        ".button-container{position:fixed;bottom:0;left:0;right:0;padding:16px;background:#1e40af;text-align:center;}"
+        ".btn{background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:14px 28px;font-size:1.1rem;font-weight:600;text-decoration:none;display:inline-block;min-width:200px;}"
+        ".btn:active{background:#2563eb;}"
+        "@media (max-width:480px){.content{padding:16px;}.alarm-card{max-width:100%;}.status-text{font-size:1.3rem;}.status-value{font-size:1.8rem;}}"
+        "</style>"
+        "</head><body>"
+        "<div class='header'>VST GREEN MACHINE</div>"
+        "<div class='datetime'>"
+        "<div class='date'>" + dateStr + "</div>"
+        "<div class='time'>" + timeStr + "</div>"
+        "</div>"
+        "<div class='content'>"
+        "<div class='alarm-card " + alarmCardClass + "'>"
+        "<div class='status-text'>UST PRESSURE:</div>"
+        "<div class='status-value'>" + String(pressureBuf) + " IWC</div>"
+        "</div>"
+        "<div class='status-text'>RUN CYCLES:</div>"
+        "<div class='status-value'>" + String(currentCycles) + "</div>"
+        "</div>"
+        "<div class='button-container'>"
+        "<a href='http://192.168.4.1/' class='btn'>Advanced Controls</a>"
+        "</div>"
+        "</body></html>";
+
+    return html;
+}
+
 void startConfigAP() {
     // Configure WiFi AP with explicit settings for reliability
     WiFi.mode(WIFI_AP);
@@ -4071,7 +4547,43 @@ void startConfigAP() {
             }
             
             request->send(200, "text/plain", watchdogEnabled ? "Watchdog ENABLED" : "Watchdog DISABLED");
-    });
+        });
+
+    // Failsafe enable/disable endpoint
+    // Usage: GET /setfailsafe?enabled=1&pwd=gm2026
+    server.on("/setfailsafe", HTTP_GET, [](AsyncWebServerRequest *request){
+        if (!request->hasParam("enabled")) {
+            request->send(400, "text/plain", "Missing enabled parameter");
+            return;
+        }
+
+        // Validate password before allowing failsafe changes
+        if (!request->hasParam("pwd") || request->getParam("pwd")->value() != CONFIG_PASSWORD) {
+            Serial.println("[Web] Failsafe change DENIED - wrong or missing password");
+            request->send(403, "text/plain", "Invalid password");
+            return;
+        }
+
+            int enabledVal = request->getParam("enabled")->value().toInt();
+            failsafeEnabled = (enabledVal == 1);
+
+            // Save to preferences/EPROM
+            preferences.begin("RMS", false);
+            preferences.putBool("failsafe", failsafeEnabled);
+            preferences.end();
+
+            Serial.print("Failsafe setting changed: ");
+            Serial.println(failsafeEnabled ? "ENABLED" : "DISABLED");
+        Serial.println("✓ Failsafe setting saved to EPROM (password verified)");
+
+            // If disabling failsafe while in failsafe mode, exit failsafe
+            if (!failsafeEnabled && failsafeMode) {
+                exitFailsafeMode();
+                Serial.println("[FAILSAFE] Exited failsafe mode due to failsafe being disabled");
+            }
+
+            request->send(200, "text/plain", failsafeEnabled ? "Failsafe ENABLED" : "Failsafe DISABLED");
+        });
     
     // REV 10.9: Set serial debug mode endpoint
     // Usage: GET /setdebug?enabled=1&pwd=1793 (enable verbose Serial Monitor output)
@@ -4291,12 +4803,12 @@ void startConfigAP() {
             "\"alarmZeroPress\":%s,\"alarmVarPress\":false,"
             "\"alarmLowCurrent\":%s,\"alarmHighCurrent\":%s,"
             "\"watchdogTriggered\":%s,\"watchdogEnabled\":%s,"
-            "\"serialDebugMode\":%s,",
+            "\"failsafeEnabled\":%s,\"serialDebugMode\":%s,",
             alarmLowPress ? "true" : "false", alarmHighPress ? "true" : "false",
             alarmZeroPress ? "true" : "false",
             alarmLowCurrent ? "true" : "false", alarmHighCurrent ? "true" : "false",
             watchdogTriggered ? "true" : "false", watchdogEnabled ? "true" : "false",
-            serialDebugMode ? "true" : "false");
+            failsafeEnabled ? "true" : "false", serialDebugMode ? "true" : "false");
         
         // Test state, datetime, uptime, mac
         // Include multi-step test progress (step/total) when running functionality test
@@ -4480,8 +4992,8 @@ void startConfigAP() {
             }
         }
         // STOP TEST — ESP32 releases relay control, returns to idle
-        // REV 10.11: Sets relays to idle and clears testRunning so Linux
-        // resumes relay control on its next mode command.
+        // REV 10.18: Uses executeRemoteCommand() for notification to Python,
+        // but keeps web-specific cleanup (relay idle, test state clear) here.
         else if (cmd == "stop_test") {
             if (testRunning) {
                 Serial.printf("[WEB CMD] ===== WEB PORTAL TEST STOPPED (manual) =====\r\n");
@@ -4497,11 +5009,8 @@ void startConfigAP() {
                 activeTestType = "";
                 webTestMultiStep = false;  // Clear multi-step state
             }
-            // Notify Linux the test was stopped
-            if (!failsafeMode) {
-                Serial1.println("{\"command\":\"stop_cycle\"}");
-                Serial.println("[WEB CMD] Forwarded stop_test as stop_cycle to Linux");
-            }
+            // REV 10.18: Send correct command name "stop_test" (was sending "stop_cycle")
+            notifyPythonOfCommand("stop_test", "");
             request->send(200, "application/json", "{\"ok\":true}");
         }
         // =========================================================
@@ -4523,28 +5032,38 @@ void startConfigAP() {
                 request->send(400, "application/json", "{\"ok\":false,\"error\":\"Unknown profile\"}");
             }
         }
+        // =========================================================
+        // REV 10.18: Unified command dispatch for overfill, alarms,
+        // failsafe, relay control, and calibration.
+        // All of these route through executeRemoteCommand() so the
+        // same logic runs regardless of source (Web, BlueCherry, Serial).
+        // =========================================================
         else if (cmd == "overfill_override") {
-            overfillAlarmActive = false;
-            overfillLowCount = 0;
-            Serial.println("[WEB] Overfill override activated");
+            executeRemoteCommand(cmd, val);
             request->send(200, "application/json", "{\"ok\":true}");
         }
         else if (cmd == "clear_press_alarm" || cmd == "clear_motor_alarm") {
-            failsafeLowCurrentCount = 0;
-            failsafeHighCurrentCount = 0;
-            Serial.printf("[WEB] Cleared alarm: %s\r\n", cmd.c_str());
+            executeRemoteCommand(cmd, val);
             request->send(200, "application/json", "{\"ok\":true}");
         }
-        // =========================================================
-        // CALIBRATE PRESSURE — Zero the pressure sensor at current reading.
-        // Triggered from web portal Maintenance screen or serial {"cal":1}.
-        // Body: {"command":"calibrate_pressure"}
-        // Sets the current reading as 0.0 IWC. Sensor should be open to ambient air.
-        // Collects 60 samples, trimmed mean, saves zero point to EEPROM.
-        // =========================================================
+        else if (cmd == "enable_failsafe") {
+            executeRemoteCommand(cmd, val);
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        else if (cmd == "exit_failsafe") {
+            executeRemoteCommand(cmd, val);
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        else if (cmd == "cr0" || cmd == "cr1" || cmd == "cr2" || cmd == "cr5") {
+            executeRemoteCommand(cmd, val);
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        else if (cmd == "exit_manual") {
+            executeRemoteCommand(cmd, val);
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
         else if (cmd == "calibrate_pressure") {
-            Serial.println("[WEB CMD] Pressure calibration requested");
-            calibratePressureSensorZeroPoint();
+            executeRemoteCommand(cmd, val);
             char resp[128];
             snprintf(resp, sizeof(resp),
                      "{\"ok\":true,\"adcZero\":%.2f}", adcZeroPressure);
@@ -4567,64 +5086,59 @@ void startConfigAP() {
     
     // Lightweight captive portal redirect page (used by all CP handlers below)
     // Served inline - no template processor needed, no %% escaping issues
-    static const char CP_PAGE[] PROGMEM = 
-        "<!DOCTYPE html><html><head>"
-        "<meta charset='UTF-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Walter IO Board</title>"
-        "<style>body{font-family:-apple-system,Arial,sans-serif;text-align:center;padding:40px 20px;background:#f0f2f5;}"
-        "h2{color:#1a1a2e;margin-bottom:10px;}p{color:#666;margin:8px 0;}"
-        "a{display:inline-block;margin-top:15px;padding:12px 30px;background:#1565c0;color:#fff;"
-        "text-decoration:none;border-radius:6px;font-weight:bold;font-size:1.1em;}"
-        "a:active{background:#0d47a1;}.hint{font-size:12px;color:#999;margin-top:20px;}</style>"
-        "</head><body>"
-        "<h2>Walter IO Board</h2>"
-        "<p>Service Diagnostic Dashboard</p>"
-        "<a href='http://192.168.4.1/'>Open Dashboard</a>"
-        "<p class='hint'>If the page doesn't load, open your browser<br>and go to <b>192.168.4.1</b></p>"
-        "</body></html>";
-    
+    // Dynamic status display for captive portal (Rev 10.18)
+    // Replaced static CP_PAGE with generateCaptivePortalHTML() function
+
     // Apple iOS / macOS captive portal detection
     // iOS probes http://captive.apple.com/hotspot-detect.html
-    // If response is NOT "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"
-    // then iOS opens the captive portal popup. We return our redirect page.
+    // If response is NOT "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY</HTML>"
+    // then iOS opens the captive portal popup. We return our dynamic status page.
     server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", CP_PAGE);
+        String html = generateCaptivePortalHTML();
+        request->send(200, "text/html", html);
     });
     
     // Android captive portal detection
     // Android probes http://connectivitycheck.gstatic.com/generate_204
     // Expects HTTP 204 No Content. Any other response triggers captive portal popup.
-    // We return 200 with our redirect page to force the popup open.
+    // We return 200 with our dynamic status page to force the popup open.
     server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", CP_PAGE);
+        String html = generateCaptivePortalHTML();
+        request->send(200, "text/html", html);
     });
     
     // Windows NCSI (Network Connectivity Status Indicator) probes
     server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", CP_PAGE);
+        String html = generateCaptivePortalHTML();
+        request->send(200, "text/html", html);
     });
     server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", CP_PAGE);
+        String html = generateCaptivePortalHTML();
+        request->send(200, "text/html", html);
     });
     server.on("/fwlink", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", CP_PAGE);
+        String html = generateCaptivePortalHTML();
+        request->send(200, "text/html", html);
     });
     server.on("/redirect", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", CP_PAGE);
+        String html = generateCaptivePortalHTML();
+        request->send(200, "text/html", html);
     });
-    
+
     // Firefox captive portal detection
     server.on("/canonical.html", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", CP_PAGE);
+        String html = generateCaptivePortalHTML();
+        request->send(200, "text/html", html);
     });
     
     // Additional common captive portal probe URLs
     server.on("/success.txt", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", CP_PAGE);
+        String html = generateCaptivePortalHTML();
+        request->send(200, "text/html", html);
     });
     server.on("/chat", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", CP_PAGE);
+        String html = generateCaptivePortalHTML();
+        request->send(200, "text/html", html);
     });
     
     // ---- CATCH-ALL HANDLER ----
@@ -5203,25 +5717,36 @@ void enterPassthroughMode(unsigned long timeoutMinutes) {
     preferences.begin("RMS", false);
     preferences.putBool("ptBoot", true);
     preferences.putULong("ptTimeout", timeoutMinutes);
-    
+
+    // Save current datetime for backfill filtering
+    String currentTime = getDateTimeString();
+    preferences.putString("backfillStartTime", currentTime);
+    preferences.putBool("backfillPending", true);
+
+    // Set purge needed flag if cycle is running
     if (failsafeCycleRunning) {
+        preferences.putBool("purgeNeeded", true);
         // Save current step so passthrough boot can finish it quietly
         uint8_t stepMode = activeCycleSequence[failsafeCycleStep].mode;
         unsigned long elapsed = millis() - failsafeCycleStepTimer;
         unsigned long totalMs = (unsigned long)activeCycleSequence[failsafeCycleStep].durationSeconds * 1000UL;
         unsigned long remainingMs = (elapsed < totalMs) ? (totalMs - elapsed) : 0;
         unsigned long remainingSec = remainingMs / 1000UL;
-        
+
         preferences.putUChar("ptRelayMode", stepMode);
         preferences.putULong("ptRelaySec", remainingSec);
-        
+
         Serial.printf("[PASSTHROUGH] Saving cycle state: mode %d, %lu sec remaining\r\n",
                       stepMode, remainingSec);
     } else {
+        preferences.putBool("purgeNeeded", false);
         // No cycle running - clear any stale relay state
         preferences.putUChar("ptRelayMode", 0);
         preferences.putULong("ptRelaySec", 0);
     }
+
+    Serial.printf("[BACKFILL] Passthrough start time: %s\r\n", currentTime.c_str());
+    Serial.println("[BACKFILL] Backfill procedure will run after passthrough ends");
     preferences.end();
     
     // Notify Linux THEN restart immediately - no waiting for purge, no confirmation delay
@@ -5473,29 +5998,41 @@ void parsedSerialData() {
         return;
     }
     
-    // Check message type
+    // ─── REV 10.18: UNIFIED COMMAND FORMAT ─────────────────────────────
+    // New format: {"command":"<name>","value":"<val>"}
+    // Check for "command" field FIRST — this is the unified format used by
+    // the Web Portal, BlueCherry, and Python for all commands.
+    // Old format {"type":"cmd","cmd":"cal"} is still supported for backward
+    // compatibility with older Python versions.
+    // ─────────────────────────────────────────────────────────────────────
+    String cmdField = getJsonValue(dataBuffer, "command");
+    if (cmdField.length() > 0) {
+        String valField = getJsonValue(dataBuffer, "value");
+        Serial.printf("[SERIAL CMD] Unified command: %s value=%s\r\n", cmdField.c_str(), valField.c_str());
+        executeRemoteCommand(cmdField, valField);
+        return;  // Command handled — don't process as data packet
+    }
+    
+    // Check message type (data packets from Linux)
     String msgType = getJsonValue(dataBuffer, "type");
     if (msgType.length() == 0) {
-        Serial.println("No 'type' field in JSON");
+        Serial.println("No 'type' or 'command' field in JSON");
         return;
     }
     
-    // ─── COMMAND MESSAGES ─────────────────────────────────────────────────
-    // {"type":"cmd","cmd":"cal"}  — Calibrate pressure sensor zero point.
-    // Separate message type so commands are not confused with data packets.
+    // ─── LEGACY COMMAND FORMAT (backward compatibility) ──────────────────
+    // {"type":"cmd","cmd":"cal"}  — Old calibration command format.
+    // Kept for backward compatibility with older Python versions.
+    // New Python should send {"command":"calibrate_pressure"} instead.
     // ─────────────────────────────────────────────────────────────────────
     if (msgType == "cmd") {
         String cmdStr = getJsonValue(dataBuffer, "cmd");
-        Serial.printf("[SERIAL CMD] Received command: %s\r\n", cmdStr.c_str());
+        Serial.printf("[SERIAL CMD] Legacy command: %s\r\n", cmdStr.c_str());
         
-        // {"type":"cmd","cmd":"cal"} — Calibrate pressure sensor zero point.
-        // Sets the current reading as 0.0 IWC. Sensor should be open to ambient air.
-        // Collects 60 raw ADC samples, computes trimmed mean, saves to EEPROM.
-        // Mirrors Python pressure_sensor.py calibrate() behavior.
         if (cmdStr == "cal") {
             calibratePressureSensorZeroPoint();
         } else {
-            Serial.println("[SERIAL CMD] Unknown command: " + cmdStr);
+            Serial.println("[SERIAL CMD] Unknown legacy command: " + cmdStr);
         }
         return;  // Command handled — don't process as data packet
     }
@@ -5561,8 +6098,12 @@ void parsedSerialData() {
     // These transients couple EMI into the ADS1015 analog input, biasing pressure
     // readings. Now we only call setRelaysForMode() when the mode actually changes.
     // The 15-second relay refresh (loop) still force-writes as a safety net.
+    // REV 10.18: Also block Linux mode commands during manual relay override
     if (modeStr.length() > 0 && !failsafeMode) {
-        if (testRunning) {
+        if (manualRelayOverride) {
+            // Manual relay override in progress — BLOCK Linux mode commands
+            Serial.printf("[Serial] Mode %d from Linux BLOCKED — manual relay override active\r\n", mode);
+        } else if (testRunning) {
             // Web portal test in progress — BLOCK all Linux mode commands
             Serial.printf("[Serial] Mode %d from Linux BLOCKED — web test '%s' in progress "
                           "(ESP32 owns relays, elapsed %lus)\r\n",
@@ -6351,6 +6892,72 @@ void checkFirmwareUpdate() {
                     delay(3000);
                     ESP.restart();
                 }
+
+                // =========================================================
+                // REV 10.18: BlueCherry command keywords routed through
+                // executeRemoteCommand() for unified behavior.
+                //
+                // BlueCherry messages are plain-text keywords (not JSON).
+                // Each keyword maps directly to a command name.
+                // For relay commands, format is "cr1 1" or "cr5 0".
+                //
+                // Supported keywords:
+                //   stop_test, overfill_override, clear_press_alarm,
+                //   clear_motor_alarm, enable_failsafe, exit_failsafe,
+                //   cr0/cr1/cr2/cr5 <0|1>, exit_manual,
+                //   calibrate_pressure
+                // =========================================================
+
+                // --- enable_failsafe (check before generic "failsafe") ---
+                if (payloadLower.indexOf("enable_failsafe") >= 0) {
+                    Serial.println("[BC Cmd] enable_failsafe command");
+                    executeRemoteCommand("enable_failsafe", "");
+                }
+                // --- exit_failsafe ---
+                else if (payloadLower.indexOf("exit_failsafe") >= 0) {
+                    Serial.println("[BC Cmd] exit_failsafe command");
+                    executeRemoteCommand("exit_failsafe", "");
+                }
+                // --- stop_test ---
+                else if (payloadLower.indexOf("stop_test") >= 0) {
+                    Serial.println("[BC Cmd] stop_test command");
+                    executeRemoteCommand("stop_test", "");
+                }
+                // --- overfill_override ---
+                else if (payloadLower.indexOf("overfill_override") >= 0) {
+                    Serial.println("[BC Cmd] overfill_override command");
+                    executeRemoteCommand("overfill_override", "1");
+                }
+                // --- clear_press_alarm ---
+                else if (payloadLower.indexOf("clear_press_alarm") >= 0) {
+                    Serial.println("[BC Cmd] clear_press_alarm command");
+                    executeRemoteCommand("clear_press_alarm", "");
+                }
+                // --- clear_motor_alarm ---
+                else if (payloadLower.indexOf("clear_motor_alarm") >= 0) {
+                    Serial.println("[BC Cmd] clear_motor_alarm command");
+                    executeRemoteCommand("clear_motor_alarm", "");
+                }
+                // --- calibrate_pressure ---
+                else if (payloadLower.indexOf("calibrate_pressure") >= 0) {
+                    Serial.println("[BC Cmd] calibrate_pressure command");
+                    executeRemoteCommand("calibrate_pressure", "");
+                }
+                // --- exit_manual ---
+                else if (payloadLower.indexOf("exit_manual") >= 0) {
+                    Serial.println("[BC Cmd] exit_manual command");
+                    executeRemoteCommand("exit_manual", "");
+                }
+                // --- Direct relay commands: "cr0 1", "cr1 0", "cr2 1", "cr5 0" ---
+                // Format: keyword followed by space and 0 or 1
+                else if (payloadLower.startsWith("cr0 ") || payloadLower.startsWith("cr1 ") ||
+                         payloadLower.startsWith("cr2 ") || payloadLower.startsWith("cr5 ")) {
+                    String relayCmd = payloadLower.substring(0, 3);  // "cr0", "cr1", etc.
+                    String relayVal = payloadLower.substring(4);     // "0" or "1"
+                    relayVal.trim();
+                    Serial.printf("[BC Cmd] Relay command: %s = %s\n", relayCmd.c_str(), relayVal.c_str());
+                    executeRemoteCommand(relayCmd, relayVal);
+                }
             }
         }
     } while (!rsp.data.blueCherry.syncFinished);
@@ -6942,7 +7549,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.17                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.18                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -6973,14 +7580,43 @@ void setup() {
     preferences.begin("RMS", false);
     DeviceName = preferences.getString("DeviceName", "CSX-9000");
     watchdogEnabled = preferences.getBool("watchdog", true);   // Default to ENABLED for safety
+    failsafeEnabled = preferences.getBool("failsafe", false);  // Default to DISABLED
     serialDebugMode = preferences.getBool("debugMode", false); // Default to OFF (quiet Serial Monitor)
     preferences.end();
     
     Serial.print("✓ Loaded watchdog setting from EPROM: ");
     Serial.println(watchdogEnabled ? "ENABLED" : "DISABLED");
+    Serial.print("✓ Loaded failsafe setting from EPROM: ");
+    Serial.println(failsafeEnabled ? "ENABLED" : "DISABLED");
     Serial.print("✓ Loaded debug mode from EPROM: ");
     Serial.println(serialDebugMode ? "ON (verbose)" : "OFF (quiet)");
-    
+
+    // Check for pending backfill procedure from previous passthrough session
+    preferences.begin("RMS", false);
+    backfillPending = preferences.getBool("backfillPending", false);
+    passthroughStartTime = preferences.getString("backfillStartTime", "");
+    purgeNeeded = preferences.getBool("purgeNeeded", false);
+    preferences.end();
+
+    if (backfillPending) {
+        Serial.println("[BACKFILL] Backfill procedure pending from previous passthrough session");
+        Serial.printf("[BACKFILL] Passthrough start time: %s\r\n", passthroughStartTime.c_str());
+        Serial.println("[BACKFILL] Executing data backfill to Linux device...");
+
+        // Clear the flag immediately to prevent re-running on next boot
+        preferences.begin("RMS", false);
+        preferences.putBool("backfillPending", false);
+        preferences.end();
+
+        // Execute backfill procedure
+        dataBackfill();
+
+        // Clear the start time after backfill completes
+        preferences.begin("RMS", false);
+        preferences.putString("backfillStartTime", "");
+        preferences.end();
+    }
+
     // Fixed send interval (Python sends every 15 seconds)
     sendInterval = 15000;  // 15 seconds in milliseconds
     
@@ -7078,7 +7714,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.17 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.18 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
@@ -7306,7 +7942,10 @@ void loop() {
     // this refresh re-applies an old mode, the next Linux packet will correct
     // it. Worst-case recovery from a missed mode command: 15 seconds.
     // =====================================================================
-    if (!failsafeMode && !passthroughMode &&
+    // REV 10.18: Skip relay refresh during manual relay override — the user
+    // is controlling individual relay pins directly via cr0/cr1/cr2/cr5 commands.
+    // Refreshing would overwrite their manual settings with the current mode.
+    if (!failsafeMode && !passthroughMode && !manualRelayOverride &&
         (currentTime - lastRelayRefreshTime >= RELAY_REFRESH_INTERVAL)) {
         setRelaysForMode(currentRelayMode);
         if (serialDebugMode) {

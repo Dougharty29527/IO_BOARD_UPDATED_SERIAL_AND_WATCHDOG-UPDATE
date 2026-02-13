@@ -230,9 +230,34 @@ All web portal buttons that control the system (Start Cycle, tests, etc.) are fo
 
 ## Failsafe Mode
 
-If the Linux device stops communicating for an extended period (serial watchdog triggers twice), the ESP32 enters failsafe mode and runs basic vacuum cycles autonomously using its own ADC sensor data. This ensures the site continues operating even if the Linux controller fails.
+Failsafe mode is an optional autonomous operation mode that can be enabled/disabled via the web portal or BlueCherry commands.
 
-Failsafe mode is indicated on the web portal and in the serial status. Normal operation resumes automatically when serial communication is restored.
+### Configuration
+- **Default:** Failsafe is **disabled** for safety
+- **Enable via:** Web Portal Settings → Failsafe Mode toggle (password required)
+- **Enable via:** BlueCherry `enable_failsafe` command
+- **Disable via:** BlueCherry `exit_failsafe` command
+
+### Watchdog Behavior
+When failsafe is **disabled**:
+- Watchdog pulses GPIO39 every 10 minutes if no serial data
+- Never enters autonomous failsafe operation
+- Safe for installations where autonomous operation is not desired
+
+When failsafe is **enabled**:
+- Watchdog pulses GPIO39 every 30 minutes if no serial data
+- After 2 failed attempts (60 minutes), enters failsafe mode
+- ESP32 takes autonomous control using ADC sensors
+
+### Autonomous Operation
+When in failsafe mode:
+- Runs vacuum cycles based on pressure thresholds
+- Uses active profile timing settings
+- CBOR data continues sending to cloud
+- Web portal remains functional for manual control
+- Fault code 16384 indicates active failsafe operation
+
+Normal operation resumes automatically when serial communication is restored.
 
 ---
 
@@ -252,6 +277,35 @@ Passthrough mode creates a direct serial bridge between the Linux device and the
 1. **Timeout** — Auto-restarts after specified minutes (default 60)
 2. **Serial Escape** — Linux sends `+++STOPPPP`
 3. **Power cycle** — Always boots to normal mode
+
+---
+
+## Data Backfill After Passthrough
+
+When the ESP32 exits passthrough mode, it automatically sends any sensor data collected during the passthrough session to the Linux device for cloud synchronization.
+
+### Why Backfill is Needed
+
+During passthrough mode:
+- The ESP32 continues collecting sensor data and logging to SD card at 15-second intervals
+- The cellular modem is busy with PPP connections and cannot send CBOR data to the cloud
+- This creates a gap in cloud data during remote access sessions
+
+### How Backfill Works
+
+1. **Entry**: When entering passthrough, ESP32 saves current datetime and sets backfill flag in EEPROM
+2. **During**: Sensor data continues to be collected and stored on SD card normally
+3. **Exit**: After passthrough ends and ESP32 reboots, it checks the backfill flag
+4. **Send**: Reads SD card data collected after the passthrough start time and sends as JSON array to Linux
+5. **Clear**: Backfill flag is cleared to prevent re-sending on subsequent boots
+
+### Backfill Message Format
+
+```json
+{"backfill":[{"pressure":-14.22,"current":0.07,"mode":0,"fault":0,"cycles":484},{"pressure":-14.25,"current":0.06,"mode":1,"fault":0,"cycles":485}]}
+```
+
+The Linux device receives this data and forwards it to the cloud with appropriate timestamps added server-side.
 
 ---
 
@@ -282,10 +336,17 @@ The overfill sensor (GPIO38, active LOW with internal pull-up) uses multi-layer 
 
 | Code | Description |
 |------|-------------|
-| 1024 | Serial watchdog triggered (no Linux data for 30+ minutes) |
-| 4096 | BlueCherry platform offline |
-| 5120 | Both watchdog AND BlueCherry faults |
-| 8192 | Failsafe mode active (ESP32 running autonomously — Comfile panel down) |
+| 1024 | SD card failure |
+| 2048 | Serial watchdog triggered (no Linux data for 30+ minutes) |
+| 4096 | Failsafe enabled (setting - can enter failsafe if watchdog triggers) |
+| 8192 | BlueCherry platform offline |
+| 16384 | Failsafe mode active (ESP32 autonomously controlling relays) |
+
+**Examples:**
+- Watchdog triggered: `2048`
+- Failsafe enabled but not active: `4096`
+- Failsafe actively running: `20480` (4096 + 16384)
+- All faults active: `31744` (1024 + 2048 + 4096 + 8192 + 16384)
 
 These codes are **added** to any existing fault codes from the Linux device.
 
