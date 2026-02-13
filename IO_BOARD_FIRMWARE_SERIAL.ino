@@ -3432,7 +3432,7 @@ const char* control_html = R"rawliteral(
         .nav-footer button { flex: 1; padding: 10px 4px; border: none; border-radius: 8px; background: #e0e0e0; font-size: 0.82em; font-weight: 600; cursor: pointer; }
         .nav-footer button.active { background: #1565c0; color: #fff; }
         .hdr { text-align: center; padding: 10px 0; }
-        .hdr h1 { font-size: 1.2em; color: #1a1a2e; }
+        .hdr h1 { font-size: 1.8em; color: #ffffff; }
         .hdr p { margin: 4px 0 0; color: #666; font-size: 0.82em; }
         .badge { position: fixed; top: 8px; right: 8px; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; z-index: 100; }
         .badge.ok { background: #4CAF50; color: #fff; }
@@ -3780,6 +3780,15 @@ const char* control_html = R"rawliteral(
     <!-- ============ DIAGNOSTICS SCREEN ============ -->
     <div class="screen" id="scr-diagnostics">
         <div class="hdr"><h1>Diagnostics</h1></div>
+
+        <!-- Current Values Section - Updated Frequently -->
+        <div class="card"><div class="card-title bg-green">Current Values</div><div class="card-body">
+            <div class="row"><span class="lbl">Mode</span><span class="val" id="diagMode">--</span></div>
+            <div class="row"><span class="lbl">Pressure (IWC)</span><span class="val" id="diagPressure">--.--</span></div>
+            <div class="row"><span class="lbl">Current (A)</span><span class="val" id="diagCurrent">--.--</span></div>
+            <div class="row"><span class="lbl">Fault Code</span><span class="val" id="diagFault">0</span></div>
+        </div></div>
+
         <div class="card"><div class="card-title bg-blue">Serial Data</div><div class="card-body">
             <div class="row"><span class="lbl">Serial Status</span><span class="val" id="serialStatus">--</span></div>
             <div class="row"><span class="lbl">Device ID</span><span class="val" id="deviceId">--</span></div>
@@ -4123,6 +4132,12 @@ const char* control_html = R"rawliteral(
                         upd('aboutMac',d.macAddress);upd('aboutModem',d.modemStatus);
                         upd('aboutUptime',d.uptime);upd('aboutTemp',d.temperature+' F');
                         upd('aboutAdcErr',d.adcErrors||'0');
+                        // Diagnostics - Current Values Section
+                        upd('diagMode', modeNames[d.mode] || d.mode || '--');
+                        upd('diagPressure', d.pressure !== undefined ? parseFloat(d.pressure).toFixed(2) : '--.--');
+                        upd('diagCurrent', d.current !== undefined ? parseFloat(d.current).toFixed(2) : '--.--');
+                        upd('diagFault', d.fault || '0');
+
                         // Diagnostics
                         var ss=$('serialStatus');if(ss){ss.textContent=d.serialActive?'Receiving':'No Data';ss.style.color=d.serialActive?'#2e7d32':'#c62828';}
                         upd('deviceId',d.deviceName);upd('fault',d.fault||'0');
