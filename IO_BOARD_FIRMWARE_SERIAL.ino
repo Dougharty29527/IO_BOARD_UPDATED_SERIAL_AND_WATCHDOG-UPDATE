@@ -5202,7 +5202,8 @@ void startConfigAP() {
         }
         else if (cmd == "toggle_relay") {
             // Convert web relay names (CR1, CR2, CR5) to ESP32 commands (cr1, cr2, cr5)
-            String relayCmd = "cr" + val.substring(2).toLowerCase(); // CR1 -> cr1, CR2 -> cr2, CR5 -> cr5
+            String relayCmd = "cr" + val.substring(2); // CR1 -> cr1, CR2 -> cr2, CR5 -> cr5
+            relayCmd.toLowerCase();
             executeRemoteCommand(relayCmd, "");
             request->send(200, "application/json", "{\"ok\":true}");
         }
