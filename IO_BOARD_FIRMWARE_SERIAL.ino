@@ -4044,9 +4044,10 @@ const char* control_html = R"rawliteral(
             var target=$('scr-'+scr);if(target)target.classList.add('active');
 
             // Push current screen to navigation stack before changing
-            // EXCEPT when navigating between test screens (leak, func, eff) - they should go back to maint
+            // EXCEPT when navigating between test screens (leak, func, eff) or within maintenance area
             var isTestScreen = ['leak', 'func', 'eff'].includes(curScr);
-            if(curScr && curScr !== scr && !isTestScreen) {
+            var isMaintenanceScreen = ['maint', 'tests', 'diagnostics', 'manual', 'profiles', 'overfill', 'clean', 'settings', 'scr-manual-adc-zero'].includes(curScr);
+            if(curScr && curScr !== scr && !isTestScreen && !isMaintenanceScreen) {
                 navStack.push(curScr);
             }
             curScr=scr;
@@ -4061,9 +4062,14 @@ const char* control_html = R"rawliteral(
             } else {
                 btn.textContent='Back';
                 btn.onclick=function(){
-                    // Special handling for test screens - always go back to maintenance
-                    if (['leak', 'func', 'eff'].includes(curScr)) {
+                    // Special handling for different screen types
+                    if (['leak', 'func', 'eff', 'diagnostics', 'tests'].includes(curScr)) {
+                        // Test screens and diagnostics/tests go back to maintenance
                         nav('maint');
+                        return;
+                    } else if (curScr === 'maint') {
+                        // Maintenance screen goes back to main landing page
+                        nav('main');
                         return;
                     }
                     // Normal navigation stack behavior for other screens
@@ -4212,7 +4218,7 @@ const char* control_html = R"rawliteral(
 
         // ---- MAINTENANCE PASSWORD GATE (PW: 878, checked client-side) ----
         // Keeps maintenance locked until correct password is entered.
-        // Password stays unlocked for the rest of the browser session.
+        // Password stays unlocked for the entire session - user only enters once.
         var maintUnlocked=false;
         window.checkMaintPw=function(){
             var pw=$('maintPwd').value;
@@ -4220,22 +4226,23 @@ const char* control_html = R"rawliteral(
                 maintUnlocked=true;
                 $('maintLock').style.display='none';
                 $('maintMenu').style.display='block';
-                $('maintPwMsg').textContent='';
+                $('maintPwMsg').textContent='Access granted - navigate freely';
+                // Clear password field for security
+                $('maintPwd').value='';
             } else {
                 $('maintPwMsg').textContent='Incorrect password';
             }
         };
-        // Intercept nav to maint: always show password gate first
+        // Intercept nav to maint: show password gate only if not already unlocked
         var origNav=window.nav;
         window.nav=function(scr){
             origNav(scr);
-            if(scr==='maint'){
-                // Always start with password gate - user must enter 878
+            if(scr==='maint' && !maintUnlocked){
+                // Show password gate only if not already unlocked
                 $('maintLock').style.display='block';
                 $('maintMenu').style.display='none';
                 $('maintPwd').value='';
-                $('maintPwMsg').textContent='';
-                maintUnlocked = false; // Reset unlock status
+                $('maintPwMsg').textContent='Enter maintenance password';
             }
         };
 
