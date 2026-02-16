@@ -13,7 +13,7 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *
- *  Rev 10.28 (2/16/2026) - Web Diagnostics Enhancements: CSV Display & Command Tracking
+ *  Rev 10.28 (2/16/2026) - Web Diagnostics Enhancements & Alarm Logic Fix
  *  - ENHANCED: CBOR payload display now shows human-readable CSV format
  *    * Replaced encoded CBOR array display with formatted CSV: ID,Seq,Pressure,Cycles,Faults,Mode,Temp,Current
  *    * Added decoded field descriptions (e.g., Pressure: -2.45 IWC, Current: 1.23A)
@@ -22,7 +22,12 @@
  *    * Tracks and displays the last serial command received from control panel
  *    * Shows command name and any parameters (e.g., "start_cycle (run)")
  *    * Helps monitor and debug serial communication with Python control software
- *  - IMPROVED: Enhanced diagnostic visibility for system monitoring and troubleshooting
+ *  - FIXED: Zero Pressure alarm logic - now only triggers on Python fault codes
+ *    * Previously calculated locally based on ADC pressure readings
+ *    * Now only goes red when Python program sends ZERO_PRESS_FAULT_BIT (1)
+ *    * Or when system is in failsafe mode (autonomous ESP32 control)
+ *    * Prevents false alarms from local ADC calculations
+ *  - IMPROVED: Enhanced diagnostic visibility and alarm accuracy
  *
  *  Rev 10.25 (2/16/2026) - Fixed Web Portal Maintenance Navigation & Password
  *  - BUG FIX: Maintenance password required re-entry on every navigation
@@ -1065,6 +1070,9 @@ const int SD_CARD_FAULT_CODE = 1024;             // REV 10.17: Fault code for SD
 const int WATCHDOG_FAULT_CODE = 2048;            // REV 10.17: Fault code for serial watchdog (was 1024)
 const int BLUECHERRY_FAULT_CODE = 8192;          // REV 10.17: Fault code for BlueCherry disconnected (was 4096)
 const int FAILSAFE_ACTIVE_FAULT_CODE = 16384;   // NEW: Added when failsafe mode is actively controlling relays
+
+// Python program fault code bits (from Linux control software)
+const int ZERO_PRESS_FAULT_BIT = 1;              // Bit 0: Zero pressure alarm from Python program
 
 // REV 10.10: LTE connection check interval
 // Previously: lteConnected() was checked EVERY loop iteration. If the cellular modem
@@ -5167,7 +5175,7 @@ void startConfigAP() {
         const ProfileConfig* activeProfile = profileManager.getActiveProfile();
         bool alarmLowPress = (adcPressure < activeProfile->lowPressThreshold && currentRelayMode > 0);
         bool alarmHighPress = (adcPressure > activeProfile->highPressThreshold && currentRelayMode > 0);
-        bool alarmZeroPress = (activeProfile->hasZeroPressAlarm && fabs(adcPressure) < 0.15 && currentRelayMode > 0);
+        bool alarmZeroPress = ((faults & ZERO_PRESS_FAULT_BIT) != 0) || failsafeMode;
         bool alarmLowCurrent = (adcCurrent > 0 && adcCurrent < LOW_CURRENT_THRESHOLD && currentRelayMode > 0);
         bool alarmHighCurrent = (adcCurrent > HIGH_CURRENT_THRESHOLD);
         int combinedFault = faults + getCombinedFaultCode();
