@@ -1,7 +1,7 @@
 /* ********************************************
- *  
- *  Walter IO Board Firmware - Rev 10.19
- *  Date: 2/13/2026
+ *
+ *  Walter IO Board Firmware - Rev 10.20
+ *  Date: 2/16/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -12,7 +12,20 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
- *  
+ *
+ *  Rev 10.20 (2/16/2026) - Manual ADC Zero Calibration + Serial Debug Logs
+ *  - NEW: Manual ADC zero calibration feature (set_manual_adc_zero command)
+ *    * Allows manual setting of pressure sensor zero point with validation (500-2000 range)
+ *    * Saves calibration to EEPROM and clears pressure averaging buffer
+ *    * Web portal integration with user-friendly controls
+ *    * Notifies Python program of calibration changes via Serial1
+ *  - NEW: Serial data log file for debugging ESP32-Python communication
+ *    * Contains log output showing ESP32 packet parsing and sensor data
+ *    * Useful for troubleshooting serial buffer backlog and communication issues
+ *    * Shows pressure readings, timestamps, and protocol debugging information
+ *  - IMPROVED: Enhanced sendFastSensorPacket() buffer size for additional JSON fields
+ *  - IMPROVED: startConfigAP() function with additional configuration options
+ *
  *  Rev 10.19 (2/13/2026) - Web Portal Enhancements + Direct Relay Control
  *  - NEW: executeRemoteCommand() central dispatch — all remote commands (Web Portal,
  *    BlueCherry, Serial1 from Python) route through one function for identical behavior
