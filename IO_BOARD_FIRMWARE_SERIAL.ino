@@ -1,6 +1,6 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.20
+ *  Walter IO Board Firmware - Rev 10.21
  *  Date: 2/16/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,17 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.21 (2/16/2026) - Enhanced Serial Communication Debugging
+ *  - NEW: SERIAL1-TX debug messages showing actual JSON content sent to Python
+ *    * Added [SERIAL1-TX] debug output in sendFastSensorPacket() showing exact JSON
+ *    * Added SERIAL1-TX debug for web portal commands (manual_purge, clean, start_test)
+ *    * Shows actual Serial1.println() content between FAST-TX messages
+ *    * Debug messages only appear when serialDebugMode is enabled
+ *    * Helps troubleshoot what Python device receives over RS-232 serial port
+ *  - IMPROVED: Enhanced debugging visibility for ESP32-Python serial communication
+ *    * Clear separation between FAST-TX (USB monitor) and SERIAL1-TX (RS-232 to Python)
+ *    * Easier to verify correct data transmission and timing
  *
  *  Rev 10.20 (2/16/2026) - Manual ADC Zero Calibration + Serial Debug Logs
  *  - NEW: Manual ADC zero calibration feature (set_manual_adc_zero command)
