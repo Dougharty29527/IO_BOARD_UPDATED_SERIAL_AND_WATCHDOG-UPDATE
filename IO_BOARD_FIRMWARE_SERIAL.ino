@@ -1,6 +1,6 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.24
+ *  Walter IO Board Firmware - Rev 10.25
  *  Date: 2/16/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,20 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.25 (2/16/2026) - Fixed Web Portal Maintenance Navigation & Password
+ *  - BUG FIX: Maintenance password required re-entry on every navigation
+ *    * Changed password gate to stay unlocked for entire browser session
+ *    * User now enters password once, then freely navigates maintenance screens
+ *    * Password only resets when navigating back to main landing page
+ *  - IMPROVED: Back button behavior on maintenance screens
+ *    * Maintenance screen Back button now goes to landing page ('main')
+ *    * Test screens (Leak/Functionality/Efficiency) Back button goes to maintenance
+ *    * Diagnostics and Tests screens Back button goes to maintenance
+ *    * Eliminates navigation stack confusion in maintenance area
+ *  - IMPROVED: Navigation stack excludes maintenance screens
+ *    * Maintenance screens don't clutter navigation stack
+ *    * Cleaner navigation flow within maintenance area
  *
  *  Rev 10.24 (2/16/2026) - Fixed Web Portal Test Screen Navigation
  *  - BUG FIX: Back button on test screens (Leak, Functionality, Efficiency) was cycling
