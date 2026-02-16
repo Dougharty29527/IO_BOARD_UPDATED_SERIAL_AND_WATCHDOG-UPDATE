@@ -1,6 +1,6 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.25
+ *  Walter IO Board Firmware - Rev 10.28
  *  Date: 2/16/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,17 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.28 (2/16/2026) - Web Diagnostics Enhancements: CSV Display & Command Tracking
+ *  - ENHANCED: CBOR payload display now shows human-readable CSV format
+ *    * Replaced encoded CBOR array display with formatted CSV: ID,Seq,Pressure,Cycles,Faults,Mode,Temp,Current
+ *    * Added decoded field descriptions (e.g., Pressure: -2.45 IWC, Current: 1.23A)
+ *    * Maintains both raw CSV and decoded human-readable formats for diagnostics
+ *  - NEW: "Control Panel Command Received" field in Diagnostics screen
+ *    * Tracks and displays the last serial command received from control panel
+ *    * Shows command name and any parameters (e.g., "start_cycle (run)")
+ *    * Helps monitor and debug serial communication with Python control software
+ *  - IMPROVED: Enhanced diagnostic visibility for system monitoring and troubleshooting
  *
  *  Rev 10.25 (2/16/2026) - Fixed Web Portal Maintenance Navigation & Password
  *  - BUG FIX: Maintenance password required re-entry on every navigation
@@ -1187,6 +1198,7 @@ uint8_t cborBuffer[1024];
 char deviceName[20];
 String Modem_Status = "Unknown";
 String modemBand = "";            // LTE band number (e.g. "12", "4")
+String lastSerialCommand = "None"; // Last serial command received from control panel
 String modemNetName = "";         // Operator/network name (e.g. "T-Mobile")
 String modemRSRP = "";            // Reference Signal Received Power in dBm (e.g. "-89.5")
 String modemRSRQ = "";            // Reference Signal Received Quality in dB (e.g. "-11.2")
@@ -1755,6 +1767,12 @@ void notifyPythonOfCommand(const char* command, const char* value) {
  */
 void executeRemoteCommand(String cmd, String value) {
     Serial.printf("[CMD] Executing: %s value=%s\n", cmd.c_str(), value.c_str());
+
+    // Track last serial command received from control panel
+    lastSerialCommand = cmd;
+    if (value.length() > 0) {
+        lastSerialCommand += " (" + value + ")";
+    }
 
     // --- Stop Test ---
     if (cmd == "stop_test") {
@@ -3645,11 +3663,12 @@ const char* control_html = R"rawliteral(
         .key-wide { grid-column: span 2; }
         .countdown { font-size: 2em; font-weight: 700; text-align: center; padding: 20px; color: #c62828; }
         .test-status { font-size: 1.1em; text-align: center; padding: 10px; font-weight: 600; }
-        /* Maintenance footer button */
-        .maint-footer { position: fixed; bottom: 0; left: 0; right: 0; max-width: 600px; margin: 0 auto; background: rgba(255,255,255,0.9); border-top: 2px solid #1565c0; padding: 15px; text-align: center; }
-        .maint-btn { padding: 12px 30px; background: #4CAF50; color: #fff; border: none; border-radius: 8px; font-size: 1em; font-weight: 700; cursor: pointer; }
+        /* Maintenance footer buttons */
+        .maint-footer { position: fixed; bottom: 0; left: 0; right: 0; max-width: 600px; margin: 0 auto; background: rgba(255,255,255,0.9); border-top: 2px solid #1565c0; padding: 15px; display: flex; gap: 15px; justify-content: center; }
+        .maint-btn { padding: 12px 20px; background: #4CAF50; color: #fff; border: none; border-radius: 8px; font-size: 0.9em; font-weight: 700; cursor: pointer; flex: 1; max-width: 200px; }
         .maint-btn:active { background: #388E3C; }
-        .maint-btn:active { background: #0d47a1; }
+        .alarms-btn { background: #f44336; }
+        .alarms-btn:active { background: #d32f2f; }
         /* Padding at bottom for fixed footer */
         .content-wrap { padding-bottom: 80px; }
     </style>
@@ -3975,6 +3994,9 @@ const char* control_html = R"rawliteral(
             <div class="row"><span class="lbl">ADC Current (raw)</span><span class="val" id="adcRawC">--</span></div>
             <div class="row"><span class="lbl">ADC Zero Point</span><span class="val" id="adcZeroP">--</span></div>
             <div class="row"><span class="lbl">ADC Initialized</span><span class="val" id="adcInit">--</span></div>
+        </div></div>
+        <div class="card"><div class="card-title bg-blue">Control Panel</div><div class="card-body">
+            <div class="row"><span class="lbl">Command Received</span><span class="val" id="lastSerialCmd">--</span></div>
             <div class="row"><span class="lbl">ADC Errors</span><span class="val" id="adcErrors">0</span></div>
             <div class="row"><span class="lbl">ADC Outliers Rejected</span><span class="val" id="adcOutliers">0</span></div>
         </div></div>
@@ -4025,9 +4047,10 @@ const char* control_html = R"rawliteral(
         </div>
     </div>
 
-    <!-- Maintenance/Back Footer Button -->
+    <!-- Maintenance and Faults/Alarms Footer Buttons -->
     <div class="maint-footer">
         <button class="maint-btn" id="footerBtn" onclick="nav('maint')">Maintenance</button>
+        <button class="maint-btn alarms-btn" onclick="nav('alarms')">Faults and Alarms</button>
     </div>
 
     <script>
@@ -4352,16 +4375,27 @@ const char* control_html = R"rawliteral(
                     var timeStr = date.toLocaleTimeString();
                     html += '<div style="border-bottom:1px solid #eee;padding:8px 0">';
                     html += '<div style="color:#666;font-weight:bold">#' + (history.length - idx) + ' - ' + timeStr + '</div>';
-                    html += '<div style="margin-top:4px;color:#333">CBOR Data: [' + payload.data.join(', ') + ']</div>';
+                    // Convert CBOR array to readable CSV format
+                    if(payload.data.length >= 8){
+                        var csvData = payload.data[0] + ',' + payload.data[1] + ',' +
+                                    payload.data[2] + ',' + payload.data[3] + ',' +
+                                    payload.data[4] + ',' + payload.data[5] + ',' +
+                                    payload.data[6] + ',' + payload.data[7];
+                        html += '<div style="margin-top:4px;color:#333;font-family:monospace;background:#f5f5f5;padding:4px;border-radius:3px">CSV: ' + csvData + '</div>';
 
-                    // Try to decode the CBOR array elements for readability
-                    if(payload.data.length >= 15){
+                        // Decode the fields for readability
                         html += '<div style="margin-top:4px;color:#666;font-size:0.9em">';
-                        html += 'Device ID: ' + payload.data[0] + ', ';
-                        html += 'Type: IO_Board, ';
-                        html += 'LTE Band: ' + payload.data[3] + ', ';
-                        html += 'RSRP: ' + payload.data[5] + ' dBm';
+                        html += 'ID: ' + payload.data[0] + ', ';
+                        html += 'Seq: ' + payload.data[1] + ', ';
+                        html += 'Pressure: ' + (payload.data[2]/100.0).toFixed(2) + ' IWC, ';
+                        html += 'Cycles: ' + payload.data[3] + ', ';
+                        html += 'Faults: ' + payload.data[4] + ', ';
+                        html += 'Mode: ' + payload.data[5] + ', ';
+                        html += 'Temp: ' + (payload.data[6]/100.0).toFixed(1) + '°C, ';
+                        html += 'Current: ' + (payload.data[7]/100.0).toFixed(2) + 'A';
                         html += '</div>';
+                    } else {
+                        html += '<div style="margin-top:4px;color:#333">CBOR Data: [' + payload.data.join(', ') + ']</div>';
                     }
                     html += '</div>';
                 }
@@ -4472,6 +4506,7 @@ const char* control_html = R"rawliteral(
                         upd('adcRawP',d.adcRawPressure||'--');upd('adcRawC',d.adcRawCurrent||'--');
                         upd('adcZeroP',d.adcZeroPressure||'--');
                         upd('adcInit',d.adcInitialized?'Yes':'No');upd('adcErrors',d.adcErrors||'0');upd('adcOutliers',d.adcOutliers||'0');
+                        upd('lastSerialCmd',d.lastSerialCommand||'None');
                         var le=$('lteStatus');if(le){if(d.lteConnected){le.innerHTML='<span style=color:#2e7d32>Connected</span>';}else if(!d.cellularReady){le.innerHTML='<span style=color:#e65100>Connecting...</span>';}else{le.innerHTML='<span style=color:#c62828>Disconnected</span>';}}
                         upd('rsrp',(d.rsrp||'--')+' dBm');upd('rsrq',(d.rsrq||'--')+' dB');
                         upd('diagOperator',d.operator||'--');upd('band',d.band||'--');
@@ -5229,13 +5264,15 @@ void startConfigAP() {
             "\"testMultiStep\":%s,\"testStep\":%d,\"testStepTotal\":%d,"
             "\"datetime\":\"%s\",\"uptime\":\"%s\","
             "\"macAddress\":\"%s\","
-            "\"cborPayloadHistory\":%s}",
+            "\"cborPayloadHistory\":%s,"
+            "\"lastSerialCommand\":\"%s\"}",
             testRunning ? "true" : "false", activeTestType.c_str(),
             testElapsedSec,
             webTestMultiStep ? "true" : "false", webTestCycleStep, webTestCycleLength,
             dtStr.c_str(), uptimeStr,
             macStr.c_str(),
-            buildCborPayloadHistoryJson().c_str());
+            buildCborPayloadHistoryJson().c_str(),
+            lastSerialCommand.c_str());
         
         request->send(200, "application/json", json);
     });
@@ -6356,29 +6393,36 @@ void readSerialData() {
             resetSerialWatchdog();  // Reset watchdog timer when data arrives
             Serial.print("→ Receiving JSON: ");
         }
-        // Accumulate characters
+        // Accumulate characters with bounds checking BEFORE adding
         else if (jsonBuffer.length() > 0) {
+            // CRITICAL SECURITY: Check bounds BEFORE adding character to prevent overflow
+            if (jsonBuffer.length() >= MAX_BUFFER_SIZE - 1) {
+                Serial.println("ERROR: JSON buffer overflow prevented - message too long");
+                jsonBuffer = "";  // Clear buffer immediately on overflow detection
+                continue;  // Continue processing any remaining data in buffer
+            }
+
             jsonBuffer += ch;
-            
-            // End of JSON object - process it immediately
+
+            // End of JSON object - process it immediately and clear buffer
             if (ch == '}') {
-                Serial.println(jsonBuffer);  // Print complete JSON
-                
-                // Check for command messages (passthrough, set_profile, start/stop cycle)
+                Serial.println(jsonBuffer);  // Print complete JSON for debugging
+
+                // Process command messages immediately
                 if (jsonBuffer.indexOf("\"command\"") >= 0) {
                     String cmdType = getJsonValue(jsonBuffer.c_str(), "command");
-                    
+
                     if (cmdType == "passthrough") {
-                    int timeoutIdx = jsonBuffer.indexOf("\"timeout\":");
+                        int timeoutIdx = jsonBuffer.indexOf("\"timeout\":");
                         unsigned long timeout = 60;
-                    if (timeoutIdx >= 0) {
-                        String timeoutStr = jsonBuffer.substring(timeoutIdx + 10);
-                        timeout = timeoutStr.toInt();
-                        if (timeout < 1) timeout = 60;
-                    }
+                        if (timeoutIdx >= 0) {
+                            String timeoutStr = jsonBuffer.substring(timeoutIdx + 10);
+                            timeout = timeoutStr.toInt();
+                            if (timeout < 1) timeout = 60;
+                        }
                         Serial.printf("[SERIAL] Passthrough command - %lu min\r\n", timeout);
-                    enterPassthroughMode(timeout);
-                    jsonBuffer = "";
+                        enterPassthroughMode(timeout);
+                        jsonBuffer = "";  // Clear buffer immediately after command processing
                         return;
                     }
                     else if (cmdType == "set_profile") {
@@ -6386,7 +6430,7 @@ void readSerialData() {
                         if (profName.length() > 0) {
                             profileManager.setActiveProfile(profName.c_str());
                         }
-                        jsonBuffer = "";
+                        jsonBuffer = "";  // Clear buffer immediately after command processing
                         return;
                     }
                     else if (cmdType == "start_cycle") {
@@ -6394,7 +6438,7 @@ void readSerialData() {
                         if (cycleType == "run") startFailsafeCycle(0);
                         else if (cycleType == "purge") startFailsafeCycle(1);
                         else if (cycleType == "clean") startFailsafeCycle(2);
-                        jsonBuffer = "";
+                        jsonBuffer = "";  // Clear buffer immediately after command processing
                         return;
                     }
                     else if (cmdType == "stop_cycle") {
@@ -6408,25 +6452,26 @@ void readSerialData() {
                                           "— only web portal Stop or timer can end it\r\n",
                                           activeTestType.c_str());
                         }
-                        jsonBuffer = "";
+                        jsonBuffer = "";  // Clear buffer immediately after command processing
                         return;
                     }
                 }
-                
-                strcpy(dataBuffer, jsonBuffer.c_str());
-                diagData = jsonBuffer;
-                
-                // Parse the data immediately instead of waiting for parseSDInterval
-                parsedSerialData();
-                
-                jsonBuffer = "";  // Reset for next message
-                break;
-            }
-            
-            // Safety limit
-            if (jsonBuffer.length() >= MAX_BUFFER_SIZE - 1) {
-                Serial.println("ERROR: JSON buffer overflow, resetting");
+
+                // For non-command messages, copy to dataBuffer and parse
+                size_t jsonLen = jsonBuffer.length();
+                if (jsonLen < MAX_BUFFER_SIZE) {
+                    strcpy(dataBuffer, jsonBuffer.c_str());
+                    diagData = jsonBuffer;
+
+                    // Parse the data immediately
+                    parsedSerialData();
+                } else {
+                    Serial.println("ERROR: JSON message too long for dataBuffer");
+                }
+
+                // CRITICAL SECURITY: Always clear buffer immediately after processing
                 jsonBuffer = "";
+                break;
             }
         }
     }
