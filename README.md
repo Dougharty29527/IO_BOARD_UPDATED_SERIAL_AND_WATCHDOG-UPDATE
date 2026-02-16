@@ -100,7 +100,7 @@ The ESP32 only takes autonomous control in **failsafe mode** — when the Linux 
 | SDA/SCL | GPIO 4 / GPIO 5 |
 | Bus Speed | 100 kHz |
 
-> **Note:** The ESP32 is the I2C **master** as of Rev 10.0. The previous MCP23017 I2C slave emulation (Rev 9.x) has been completely removed. The Linux device no longer communicates with the ESP32 via I2C — all communication is via serial JSON.
+> **Note:** The ESP32 is the I2C **master** as of Rev 10.0. The previous MCP23017 I2C slave emulation (Rev 9.x) has been completely removed due to intermittent errors that caused the Python Adafruit library to crash. The Linux device no longer communicates with the ESP32 via I2C — all communication is via serial JSON.
 
 ---
 
@@ -288,6 +288,7 @@ When the ESP32 exits passthrough mode, it automatically sends any sensor data co
 
 During passthrough mode:
 - The ESP32 continues collecting sensor data and logging to SD card at 15-second intervals
+**Data Storage:** Sensor data is logged to SD card in CSV format for local storage and retrieval. Cellular transmission uses CBOR format for efficient cloud communication.
 - The cellular modem is busy with PPP connections and cannot send CBOR data to the cloud
 - This creates a gap in cloud data during remote access sessions
 
