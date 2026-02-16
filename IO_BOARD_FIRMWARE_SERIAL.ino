@@ -4034,7 +4034,9 @@ const char* control_html = R"rawliteral(
             var target=$('scr-'+scr);if(target)target.classList.add('active');
 
             // Push current screen to navigation stack before changing
-            if(curScr && curScr !== scr) {
+            // EXCEPT when navigating between test screens (leak, func, eff) - they should go back to maint
+            var isTestScreen = ['leak', 'func', 'eff'].includes(curScr);
+            if(curScr && curScr !== scr && !isTestScreen) {
                 navStack.push(curScr);
             }
             curScr=scr;
@@ -4049,7 +4051,12 @@ const char* control_html = R"rawliteral(
             } else {
                 btn.textContent='Back';
                 btn.onclick=function(){
-                    // Go back to previous screen in stack, or main if stack is empty
+                    // Special handling for test screens - always go back to maintenance
+                    if (['leak', 'func', 'eff'].includes(curScr)) {
+                        nav('maint');
+                        return;
+                    }
+                    // Normal navigation stack behavior for other screens
                     var prevScr = navStack.length > 0 ? navStack.pop() : 'main';
                     nav(prevScr);
                 };
