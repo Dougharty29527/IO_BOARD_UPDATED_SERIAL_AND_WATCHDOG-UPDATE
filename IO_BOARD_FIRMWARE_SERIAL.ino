@@ -1,7 +1,7 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.28
- *  Date: 2/16/2026
+ *  Walter IO Board Firmware - Rev FIRMWARE_VERSION
+ *  Date: FIRMWARE_DATE
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -13,7 +13,7 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *
- *  Rev 10.28 (2/16/2026) - Web Diagnostics Enhancements: CSV Display & Command Tracking
+ *  Rev FIRMWARE_VERSION (FIRMWARE_DATE) - Web Diagnostics Enhancements: CSV Display & Command Tracking
  *  - ENHANCED: CBOR payload display now shows human-readable CSV format
  *    * Replaced encoded CBOR array display with formatted CSV: ID,Seq,Pressure,Cycles,Faults,Mode,Temp,Current
  *    * Added decoded field descriptions (e.g., Pressure: -2.45 IWC, Current: 1.23A)
@@ -705,7 +705,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.25"
+#define VERSION "Rev " FIRMWARE_VERSION
 
 // REV 10.16: Delay between individual relay GPIO pin changes (milliseconds).
 // Simultaneous activation of CR0_MOTOR, CR1, CR2, CR5 causes electrical noise
@@ -721,6 +721,10 @@ String ver = VERSION;
 // Password required to change device name or toggle watchdog via web portal
 // Change this to your desired password. Case-sensitive, sent as URL parameter.
 #define CONFIG_PASSWORD "1793"
+
+// Firmware version - update this single location for all version references
+#define FIRMWARE_VERSION "10.28"
+#define FIRMWARE_DATE "2/16/2026"
 
 // ### Libraries ###
 #include <esp_mac.h>
@@ -3676,7 +3680,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.25</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.28</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
