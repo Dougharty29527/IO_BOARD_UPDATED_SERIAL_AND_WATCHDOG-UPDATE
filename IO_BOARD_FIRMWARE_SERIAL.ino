@@ -1,6 +1,6 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.21
+ *  Walter IO Board Firmware - Rev 10.22
  *  Date: 2/16/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,17 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.22 (2/16/2026) - Fixed Web Portal Pressure Display + Serial Debugging
+ *  - BUG FIX: Web portal was showing stale pressure from serial parsing instead of live ADC
+ *    * generateCaptivePortalHTML() now uses adcPressure (live ADC reading) instead of global pressure
+ *    * Global pressure variable comes from incoming serial data (potentially stale/delayed)
+ *    * adcPressure is 60Hz rolling average from ADS1015 sensor (current/realtime)
+ *  - DEBUG: Added pressure variable logging to diagnose Serial1 vs FAST-TX discrepancies
+ *    * Shows adcPressure, global pressure, and sendPressure values when serialDebugMode enabled
+ *    * SERIAL1-TX debug moved before Serial1.println() to show exact JSON content sent
+ *    * Helps identify if issue is in variable selection, JSON building, or transmission
+ *  - IMPROVED: Consistent pressure source across firmware - adcPressure for all real-time displays
  *
  *  Rev 10.21 (2/16/2026) - Enhanced Serial Communication Debugging
  *  - NEW: SERIAL1-TX debug messages showing actual JSON content sent to Python
