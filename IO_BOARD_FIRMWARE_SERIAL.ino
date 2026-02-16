@@ -1,7 +1,7 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev FIRMWARE_VERSION
- *  Date: FIRMWARE_DATE
+ *  Walter IO Board Firmware - Rev 10.28
+ *  Date: 2/16/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -13,7 +13,7 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *
- *  Rev FIRMWARE_VERSION (FIRMWARE_DATE) - Web Diagnostics Enhancements: CSV Display & Command Tracking
+ *  Rev 10.28 (2/16/2026) - Web Diagnostics Enhancements: CSV Display & Command Tracking
  *  - ENHANCED: CBOR payload display now shows human-readable CSV format
  *    * Replaced encoded CBOR array display with formatted CSV: ID,Seq,Pressure,Cycles,Faults,Mode,Temp,Current
  *    * Added decoded field descriptions (e.g., Pressure: -2.45 IWC, Current: 1.23A)
@@ -704,9 +704,6 @@
  *  
  ***********************************************/
 
-// Define the software version as a macro
-#define VERSION "Rev " FIRMWARE_VERSION
-
 // REV 10.16: Delay between individual relay GPIO pin changes (milliseconds).
 // Simultaneous activation of CR0_MOTOR, CR1, CR2, CR5 causes electrical noise
 // that couples into the ADS1015 analog inputs. Staggering each pin change by
@@ -725,6 +722,9 @@ String ver = VERSION;
 // Firmware version - update this single location for all version references
 #define FIRMWARE_VERSION "10.28"
 #define FIRMWARE_DATE "2/16/2026"
+
+// Define the software version as a macro (must come after FIRMWARE_VERSION)
+#define VERSION "Rev " FIRMWARE_VERSION
 
 // ### Libraries ###
 #include <esp_mac.h>
