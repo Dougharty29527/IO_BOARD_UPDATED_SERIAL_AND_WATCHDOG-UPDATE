@@ -146,20 +146,24 @@ Sent **only** when the modem clock returns a genuinely new timestamp (`modemTime
 
 ---
 
-### 3. Web Portal Command (forwarded from ESP32 web UI)
+### 3. Web Portal Command (ESP32 takes priority and controls GPIO directly)
 
-When a user interacts with the ESP32's WiFi web portal (default IP: `192.168.4.1`), certain commands are forwarded to the Linux device over serial. The ESP32 does NOT execute these commands itself (unless in failsafe mode).
+When a user interacts with the ESP32's WiFi web portal (default IP: `192.168.4.1`), the ESP32 **takes priority** and sets GPIO outputs directly. Web portal commands have higher precedence than Python control panel commands. Control is returned to the Python control panel when the user exits the web config portal.
 
-**Cycle commands:**
+**Commands handled directly by ESP32 (GPIO control):**
+```json
+{"command":"toggle_relay","value":"CR1"}
+{"command":"toggle_relay","value":"CR2"}
+{"command":"toggle_relay","value":"CR5"}
+{"command":"emergency_stop"}
+```
+
+**Commands forwarded to Linux:**
 ```json
 {"command":"start_cycle","type":"run"}
 {"command":"start_cycle","type":"manual_purge"}
 {"command":"start_cycle","type":"clean"}
 {"command":"stop_cycle"}
-```
-
-**Test commands:**
-```json
 {"command":"start_test","type":"leak"}
 {"command":"start_test","type":"func"}
 {"command":"start_test","type":"eff"}
@@ -169,10 +173,17 @@ Note: `stop_test` is forwarded as `{"command":"stop_cycle"}` (same as stop_cycle
 
 | Field | Description |
 |-------|-------------|
-| `command` | The action: `"start_cycle"`, `"stop_cycle"`, or `"start_test"` |
+| `command` | The action: `"start_cycle"`, `"stop_cycle"`, `"start_test"`, `"toggle_relay"`, or `"emergency_stop"` |
 | `type` | For start commands: `"run"`, `"manual_purge"`, `"clean"`, `"leak"`, `"func"`, `"eff"` |
+| `value` | For toggle_relay: `"CR1"`, `"CR2"`, or `"CR5"` |
 
-**What the Linux device should do with these:**
+**ESP32 direct control (immediate GPIO action):**
+- `toggle_relay/CR1` — Toggle CR1 relay ON/OFF
+- `toggle_relay/CR2` — Toggle CR2 relay ON/OFF
+- `toggle_relay/CR5` — Toggle CR5 relay ON/OFF
+- `emergency_stop` — Set ESP32 to idle mode (mode 0)
+
+**Linux device handles (forwarded commands):**
 - `start_cycle/run` — Start a normal run cycle (same as pressing Start on the touchscreen)
 - `start_cycle/manual_purge` — Start a manual purge cycle
 - `start_cycle/clean` — Start a canister clean (15 min motor run)
