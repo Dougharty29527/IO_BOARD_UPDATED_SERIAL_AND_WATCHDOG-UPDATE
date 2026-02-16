@@ -13,7 +13,32 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *
- *  Rev 10.28 (2/16/2026) - Web Diagnostics Enhancements & Complete Alarm Logic Overhaul
+ *  Rev 10.29 (2/16/2026) - Profile-Specific Fault Code Mappings Implementation
+ *  - IMPLEMENTED: Complete profile-specific fault code mappings as specified
+ *    * CS8/CS12 profiles: Full alarm set with distinct bit assignments
+ *      * Vac Pump Alarm = 1, Overfill Alarm = 4, SD Card = 8
+ *      * High Pressure = 16, Low Pressure = 32, Zero Pressure = 64, Var Pressure = 128
+ *      * Pressure Sensor = 256, 72-Hour Shutdown = 512
+ *    * CS2/CS9 profiles: Basic system alarms with different bit assignments
+ *      * Pressure Sensor = 1, Vacuum Pump Alarm = 2, Overfill Alarm = 8, SD Card = 16
+ *    * System-wide ESP32 codes: IO Board SD Card = 1024, BlueCherry Fault = 2048
+ *      * Watchdog Alarm = 4096, Failsafe Mode = 8192
+ *  - ENHANCED: Web portal now shows profile-appropriate alarms
+ *    * CS8/CS12: Shows all pressure alarms + Vac Pump, Overfill, SD Card
+ *    * CS2/CS9: Shows only basic system alarms (Pressure Sensor, Vac Pump, Overfill, SD Card)
+ *  - IMPROVED: Alarm status card and diagnostics screen updated for new alarm types
+ *
+ *  Rev 10.28 (2/16/2026) - Profile-Aware Alarm System & Web Diagnostics Enhancements
+ *  - MAJOR REWORK: Profile-aware alarm system - different fault codes per profile
+ *    * CS8/CS12 profiles: Comprehensive alarm coverage (Vac Pump, Overfill, SD Card, all pressure alarms)
+ *      * Fault codes: 1=Vac Pump, 4=Overfill, 8=SD Card, 16=Low Press, 32=High Press,
+ *        64=Zero Press, 128=Var Press, 256=Pressure Sensor, 512=72-Hour Timer
+ *    * CS2/CS9 profiles: Basic system alarms only (Pressure Sensor, Vac Pump, Overfill, SD Card)
+ *      * Fault codes: 1=Pressure Sensor, 2=Vac Pump, 8=Overfill, 16=SD Card
+ *    * ESP32 system codes (all profiles): 1024=IO SD, 2048=BlueCherry, 4096=Watchdog, 8192=Failsafe
+ *    * Normal mode: Profile-specific fault code interpretation from Python
+ *    * Failsafe mode: ESP32 autonomous ADC-based alarm detection
+ *    * Eliminates false alarms by respecting profile-specific alarm capabilities
  *  - ENHANCED: CBOR payload display now shows human-readable CSV format
  *    * Replaced encoded CBOR array display with formatted CSV: ID,Seq,Pressure,Cycles,Faults,Mode,Temp,Current
  *    * Added decoded field descriptions (e.g., Pressure: -2.45 IWC, Current: 1.23A)
@@ -22,17 +47,6 @@
  *    * Tracks and displays the last serial command received from control panel
  *    * Shows command name and any parameters (e.g., "start_cycle (run)")
  *    * Helps monitor and debug serial communication with Python control software
- *  - CRITICAL FIX: Complete alarm logic overhaul - ESP32 now only reports Python-detected alarms
- *    * ALL alarms now follow CS8 fault code specification (16-2048 range):
- *      * Normal mode: Only trigger when Python sends corresponding fault code bits
- *      * Failsafe mode: ESP32 autonomously detects critical alarms using local ADC calculations
- *    * Eliminates ALL false alarms from local ADC calculations during normal operation
- *    * Maintains critical safety monitoring during failsafe autonomous control
- *    * Implemented complete CS8 fault code mapping:
- *      16=Low Pressure, 32=High Pressure, 64=Zero Pressure, 128=Var Pressure,
- *      256=Pressure Sensor, 512=72-Hour Timer, 1024=Low Current, 2048=High Current
- *    * Full support for CS8 "full alarm set" and CS12 selective alarm configurations
- *  - IMPROVED: Clean separation between Python alarm detection and ESP32 display logic
  *
  *  Rev 10.25 (2/16/2026) - Fixed Web Portal Maintenance Navigation & Password
  *  - BUG FIX: Maintenance password required re-entry on every navigation
@@ -725,7 +739,7 @@
 #define RELAY_DELAY 1
 
 // Define the software version as a macro
-#define FIRMWARE_VERSION "10.28"
+#define FIRMWARE_VERSION "10.29"
 #define FIRMWARE_DATE "2/16/2026"
 #define VERSION "Rev " FIRMWARE_VERSION
 
@@ -1076,15 +1090,29 @@ const int WATCHDOG_FAULT_CODE = 2048;            // REV 10.17: Fault code for se
 const int BLUECHERRY_FAULT_CODE = 8192;          // REV 10.17: Fault code for BlueCherry disconnected (was 4096)
 const int FAILSAFE_ACTIVE_FAULT_CODE = 16384;   // NEW: Added when failsafe mode is actively controlling relays
 
-// Python program fault code bits (from Linux control software) - CS8/CS12 mappings
-const int LOW_PRESS_FAULT_BIT = 16;             // Bit 4: Low pressure alarm (CS8)
-const int HIGH_PRESS_FAULT_BIT = 32;            // Bit 5: High pressure alarm (CS8)
-const int ZERO_PRESS_FAULT_BIT = 64;            // Bit 6: Zero pressure alarm (CS8)
-const int VAR_PRESS_FAULT_BIT = 128;            // Bit 7: Variable pressure alarm (CS8)
-const int PRESSURE_SENSOR_FAULT_BIT = 256;     // Bit 8: Pressure sensor fault (CS8)
-const int SEVENTY_TWO_HOUR_FAULT_BIT = 512;    // Bit 9: 72-hour alarm (CS8/CS12)
-const int LOW_CURRENT_FAULT_BIT = 1024;        // Bit 10: Low current alarm (CS8/CS12)
-const int HIGH_CURRENT_FAULT_BIT = 2048;       // Bit 11: High current alarm (CS8/CS12)
+// Profile-specific fault code mappings (from Python control software)
+// CS8/CS12 profiles have extensive alarm coverage
+const int CS8_LOW_PRESS_FAULT = 32;             // Low pressure alarm
+const int CS8_HIGH_PRESS_FAULT = 16;            // High pressure alarm
+const int CS8_ZERO_PRESS_FAULT = 64;            // Zero pressure alarm
+const int CS8_VAR_PRESS_FAULT = 128;            // Variable pressure alarm
+const int CS8_PRESSURE_SENSOR_FAULT = 256;     // Pressure sensor fault
+const int CS8_72HR_FAULT = 512;                 // 72-hour shutdown alarm
+const int CS8_VAC_PUMP_FAULT = 1;               // Vacuum pump alarm
+const int CS8_OVERFILL_FAULT = 4;               // Overfill alarm
+const int CS8_SD_CARD_FAULT = 8;                // SD card alarm
+
+// CS2/CS9 profiles have basic system alarms only
+const int CS2_PRESSURE_SENSOR_FAULT = 1;       // Pressure sensor fault
+const int CS2_VAC_PUMP_FAULT = 2;               // Vacuum pump alarm
+const int CS2_OVERFILL_FAULT = 8;               // Overfill alarm
+const int CS2_SD_CARD_FAULT = 16;               // SD card alarm
+
+// ESP32 system fault codes (same for all profiles)
+const int IO_BOARD_SD_FAULT = 1024;             // IO Board SD card failure
+const int BLUECHERRY_FAULT = 2048;              // BlueCherry connection failed
+const int WATCHDOG_FAULT = 4096;                // Serial watchdog activated
+const int FAILSAFE_MODE_FAULT = 8192;           // Failsafe mode active
 
 // REV 10.10: LTE connection check interval
 // Previously: lteConnected() was checked EVERY loop iteration. If the cellular modem
@@ -3737,6 +3765,9 @@ const char* control_html = R"rawliteral(
             <div class="alarm-row"><span class="name">Zero Pressure</span><span class="ind ind-g" id="aZeroP"></span></div>
             <div class="alarm-row"><span class="name">Var Pressure</span><span class="ind ind-g" id="aVarP"></span></div>
             <div class="alarm-row"><span class="name">Pressure Sensor</span><span class="ind ind-g" id="aPressureSensor"></span></div>
+            <div class="alarm-row"><span class="name">Vac Pump</span><span class="ind ind-g" id="aVacPump"></span></div>
+            <div class="alarm-row"><span class="name">Overfill</span><span class="ind ind-g" id="aOverfill"></span></div>
+            <div class="alarm-row"><span class="name">SD Card</span><span class="ind ind-g" id="aSdCard"></span></div>
             <div class="alarm-row"><span class="name">Low Current</span><span class="ind ind-g" id="aLowC"></span></div>
             <div class="alarm-row"><span class="name">High Current</span><span class="ind ind-g" id="aHighC"></span></div>
             <div class="alarm-row"><span class="name">Panel Power</span><span class="ind ind-g" id="aPanelPwr"></span></div>
@@ -4443,6 +4474,7 @@ const char* control_html = R"rawliteral(
                         var modeText = modeNames[d.mode] || d.mode || 'UNKNOWN';
                         var hasAlarms = d.overfillAlarm || d.watchdogTriggered || d.failsafe ||
                                        d.alarmLowPress || d.alarmHighPress || d.alarmZeroPress ||
+                                       d.alarmPressureSensor || d.alarmVacPump || d.alarmOverfill || d.alarmSdCard ||
                                        d.alarmLowCurrent || d.alarmHighCurrent;
 
                         // Update status card
@@ -4461,6 +4493,10 @@ const char* control_html = R"rawliteral(
                                 if (d.alarmLowPress) alarmList.push('Low Pressure');
                                 if (d.alarmHighPress) alarmList.push('High Pressure');
                                 if (d.alarmZeroPress) alarmList.push('Zero Pressure');
+                                if (d.alarmPressureSensor) alarmList.push('Pressure Sensor');
+                                if (d.alarmVacPump) alarmList.push('Vac Pump');
+                                if (d.alarmOverfill) alarmList.push('Overfill');
+                                if (d.alarmSdCard) alarmList.push('SD Card');
                                 if (d.alarmLowCurrent) alarmList.push('Low Current');
                                 if (d.alarmHighCurrent) alarmList.push('High Current');
                                 alarmsEl.textContent = alarmList.length > 0 ? alarmList.join(', ') : 'System Alarm';
@@ -4481,6 +4517,9 @@ const char* control_html = R"rawliteral(
                         setInd('aLowP',d.alarmLowPress);setInd('aHighP',d.alarmHighPress);
                         setInd('aZeroP',d.alarmZeroPress);setInd('aVarP',d.alarmVarPress);
                         setInd('aPressureSensor',d.alarmPressureSensor);
+                        setInd('aVacPump',d.alarmVacPump);
+                        setInd('aOverfill',d.alarmOverfill);
+                        setInd('aSdCard',d.alarmSdCard);
                         setInd('aLowC',d.alarmLowCurrent);setInd('aHighC',d.alarmHighCurrent);
                         setInd('aPanelPwr',d.failsafe);setInd('a72Hr',d.alarmSeventyTwoHour||false);
                         // Manual mode
@@ -5190,14 +5229,61 @@ void startConfigAP() {
         // Normal operation: ESP32 displays alarms sent by Python control software
         // Failsafe mode: ESP32 autonomously detects and reports critical alarms
         const ProfileConfig* activeProfile = profileManager.getActiveProfile();
-        bool alarmLowPress = failsafeMode ? (adcPressure < activeProfile->lowPressThreshold && currentRelayMode > 0) : ((faults & LOW_PRESS_FAULT_BIT) != 0);
-        bool alarmHighPress = failsafeMode ? (adcPressure > activeProfile->highPressThreshold && currentRelayMode > 0) : ((faults & HIGH_PRESS_FAULT_BIT) != 0);
-        bool alarmZeroPress = failsafeMode ? (activeProfile->hasZeroPressAlarm && fabs(adcPressure) < 0.15 && currentRelayMode > 0) : ((faults & ZERO_PRESS_FAULT_BIT) != 0);
-        bool alarmVarPress = failsafeMode ? false : ((faults & VAR_PRESS_FAULT_BIT) != 0);  // Variable pressure alarm from Python
-        bool alarmPressureSensor = failsafeMode ? false : ((faults & PRESSURE_SENSOR_FAULT_BIT) != 0);  // Pressure sensor fault from Python
-        bool alarmSeventyTwoHour = failsafeMode ? false : ((faults & SEVENTY_TWO_HOUR_FAULT_BIT) != 0);  // 72-hour timer alarm from Python
-        bool alarmLowCurrent = failsafeMode ? (adcCurrent > 0 && adcCurrent < LOW_CURRENT_THRESHOLD && currentRelayMode > 0) : ((faults & LOW_CURRENT_FAULT_BIT) != 0);
-        bool alarmHighCurrent = failsafeMode ? (adcCurrent > HIGH_CURRENT_THRESHOLD) : ((faults & HIGH_CURRENT_FAULT_BIT) != 0);
+        String profileName = profileManager.getActiveProfileName();
+
+        // Profile-aware alarm interpretation - different fault code mappings per profile
+        bool alarmLowPress, alarmHighPress, alarmZeroPress, alarmVarPress, alarmPressureSensor, alarmSeventyTwoHour;
+        bool alarmLowCurrent, alarmHighCurrent, alarmVacPump, alarmOverfill, alarmSdCard;
+
+        if (failsafeMode) {
+            // Failsafe mode: ESP32 autonomously detects critical alarms
+            alarmLowPress = (adcPressure < activeProfile->lowPressThreshold && currentRelayMode > 0);
+            alarmHighPress = (adcPressure > activeProfile->highPressThreshold && currentRelayMode > 0);
+            alarmZeroPress = (activeProfile->hasZeroPressAlarm && fabs(adcPressure) < 0.15 && currentRelayMode > 0);
+            alarmVarPress = false;  // No autonomous variable pressure detection
+            alarmPressureSensor = false;  // No autonomous sensor fault detection
+            alarmSeventyTwoHour = false;  // No autonomous 72-hour detection
+            alarmLowCurrent = (adcCurrent > 0 && adcCurrent < LOW_CURRENT_THRESHOLD && currentRelayMode > 0);
+            alarmHighCurrent = (adcCurrent > HIGH_CURRENT_THRESHOLD);
+            alarmVacPump = false;  // No autonomous vac pump detection
+            alarmOverfill = false;  // No autonomous overfill detection
+            alarmSdCard = false;  // No autonomous SD card detection
+        } else {
+            // Normal mode: Interpret Python fault codes based on active profile
+            if (profileName == "CS8" || profileName == "CS12") {
+                // CS8/CS12: Extensive pressure and system alarms
+                alarmLowPress = (faults & CS8_LOW_PRESS_FAULT) != 0;
+                alarmHighPress = (faults & CS8_HIGH_PRESS_FAULT) != 0;
+                alarmZeroPress = (faults & CS8_ZERO_PRESS_FAULT) != 0;
+                alarmVarPress = (faults & CS8_VAR_PRESS_FAULT) != 0;
+                alarmPressureSensor = (faults & CS8_PRESSURE_SENSOR_FAULT) != 0;
+                alarmSeventyTwoHour = (faults & CS8_72HR_FAULT) != 0;
+                alarmLowCurrent = false;  // CS8/CS12 use vac pump alarm instead
+                alarmHighCurrent = false; // CS8/CS12 use vac pump alarm instead
+                alarmVacPump = (faults & CS8_VAC_PUMP_FAULT) != 0;
+                alarmOverfill = (faults & CS8_OVERFILL_FAULT) != 0;
+                alarmSdCard = (faults & CS8_SD_CARD_FAULT) != 0;
+            } else if (profileName == "CS2" || profileName == "CS9") {
+                // CS2/CS9: Basic system alarms only
+                alarmLowPress = false;     // No pressure alarms in CS2/CS9
+                alarmHighPress = false;    // No pressure alarms in CS2/CS9
+                alarmZeroPress = false;    // No pressure alarms in CS2/CS9
+                alarmVarPress = false;     // No pressure alarms in CS2/CS9
+                alarmPressureSensor = (faults & CS2_PRESSURE_SENSOR_FAULT) != 0;
+                alarmSeventyTwoHour = false; // No 72-hour alarm in CS2/CS9
+                alarmLowCurrent = false;   // No current alarms in CS2/CS9
+                alarmHighCurrent = false;  // No current alarms in CS2/CS9
+                alarmVacPump = (faults & CS2_VAC_PUMP_FAULT) != 0;
+                alarmOverfill = (faults & CS2_OVERFILL_FAULT) != 0;
+                alarmSdCard = (faults & CS2_SD_CARD_FAULT) != 0;
+            } else {
+                // Unknown profile - no alarms
+                alarmLowPress = alarmHighPress = alarmZeroPress = alarmVarPress = false;
+                alarmPressureSensor = alarmSeventyTwoHour = false;
+                alarmLowCurrent = alarmHighCurrent = false;
+                alarmVacPump = alarmOverfill = alarmSdCard = false;
+            }
+        }
         int combinedFault = faults + getCombinedFaultCode();
         unsigned long testElapsedSec = testRunning ? (millis() - testStartTime) / 1000 : 0;
         // REV 10.13: Don't call lteConnected() during cellular init — it sends an AT
@@ -5279,14 +5365,16 @@ void startConfigAP() {
         pos += snprintf(json + pos, sizeof(json) - pos,
             "\"alarmLowPress\":%s,\"alarmHighPress\":%s,"
             "\"alarmZeroPress\":%s,\"alarmVarPress\":%s,"
-            "\"alarmPressureSensor\":%s,\"alarmLowCurrent\":%s,\"alarmHighCurrent\":%s,"
+            "\"alarmPressureSensor\":%s,\"alarmSeventyTwoHour\":%s,"
+            "\"alarmLowCurrent\":%s,\"alarmHighCurrent\":%s,"
+            "\"alarmVacPump\":%s,\"alarmOverfill\":%s,\"alarmSdCard\":%s,"
             "\"watchdogTriggered\":%s,\"watchdogEnabled\":%s,"
             "\"failsafeEnabled\":%s,\"serialDebugMode\":%s,",
             alarmLowPress ? "true" : "false", alarmHighPress ? "true" : "false",
-            alarmZeroPress ? "true" : "false",
-            alarmVarPress ? "true" : "false",
-            alarmPressureSensor ? "true" : "false",
+            alarmZeroPress ? "true" : "false", alarmVarPress ? "true" : "false",
+            alarmPressureSensor ? "true" : "false", alarmSeventyTwoHour ? "true" : "false",
             alarmLowCurrent ? "true" : "false", alarmHighCurrent ? "true" : "false",
+            alarmVacPump ? "true" : "false", alarmOverfill ? "true" : "false", alarmSdCard ? "true" : "false",
             watchdogTriggered ? "true" : "false", watchdogEnabled ? "true" : "false",
             failsafeEnabled ? "true" : "false", serialDebugMode ? "true" : "false");
         
