@@ -1,6 +1,6 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.23
+ *  Walter IO Board Firmware - Rev 10.24
  *  Date: 2/16/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,16 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.24 (2/16/2026) - Fixed Web Portal Test Screen Navigation
+ *  - BUG FIX: Back button on test screens (Leak, Functionality, Efficiency) was cycling
+ *    * Between test screens instead of returning to maintenance screen
+ *    * Root cause: Test screens were being added to navigation stack
+ *    * Fixed by preventing test screens from entering navigation stack
+ *    * Added special Back button handling for test screens to go directly to 'maint'
+ *  - IMPROVED: Test screen navigation now properly returns to maintenance on Back
+ *    * Eliminates confusing navigation behavior between Leak/Functionality/Efficiency tests
+ *    * Maintains consistent navigation pattern across web portal
  *
  *  Rev 10.23 (2/16/2026) - Pressure Sensor Current Loss Detection
  *  - NEW: Pressure sensor fault detection for current loss (raw ADC < 20)
