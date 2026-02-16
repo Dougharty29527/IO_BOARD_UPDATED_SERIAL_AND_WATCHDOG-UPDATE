@@ -1,7 +1,7 @@
 # Walter IO Board Firmware
 
-**Version:** Rev 10.13  
-**Date:** February 11, 2026  
+**Version:** Rev 10.19
+**Date:** February 13, 2026  
 **Authors:** Todd Adams & Doug Harty
 
 ESP32-based IO board firmware for the Walter cellular modem platform. Provides relay control, sensor monitoring, web configuration portal, CBOR cellular data transmission, and PPP passthrough for remote access.
