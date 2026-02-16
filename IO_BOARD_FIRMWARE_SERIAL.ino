@@ -5915,6 +5915,12 @@ void sendFastSensorPacket() {
     // Check if ADC data is stale (no successful read for ADC_STALE_TIMEOUT_MS)
     float sendPressure = adcPressure;
     float sendCurrent = adcCurrent;
+
+    // DEBUG: Log pressure variable values for troubleshooting
+    if (serialDebugMode) {
+        Serial.printf("[DEBUG] adcPressure=%.3f, global pressure=%.3f, sendPressure=%.3f\r\n",
+                      adcPressure, pressure, sendPressure);
+    }
     
     if (lastSuccessfulAdcRead > 0 && (millis() - lastSuccessfulAdcRead >= ADC_STALE_TIMEOUT_MS)) {
         // ADC has been failing for > 60 seconds — send fault sentinel values
@@ -5940,13 +5946,13 @@ void sendFastSensorPacket() {
              sendPressure, sendCurrent, overfillAlarmActive ? 1 : 0,
              isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
              failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1, ms);
-    Serial1.println(buf);
-
     // Debug: Show actual Serial1 content sent to Python device
     // This shows what Python receives on RS-232 serial port
     if (serialDebugMode) {
         Serial.printf("[SERIAL1-TX @%lums] %s\r\n", millis(), buf);
     }
+
+    Serial1.println(buf);
 
     // Debug log to USB Serial Monitor — shows timestamp (ms) so you can verify 5Hz rate
     // Expect ~200ms between each line. Look for consistent spacing in the millis() values.
