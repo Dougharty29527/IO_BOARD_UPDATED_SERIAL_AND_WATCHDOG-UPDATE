@@ -1,0 +1,55 @@
+Recieved Serial Data from ESP32:
+Feb 16 09:48:31 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:32 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:32 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:33 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:33 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:34 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:34 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:35 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:35 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:36 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:36 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:37 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:37 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:38 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:38 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:39 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:39 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:40 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:40 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:41 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:41 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:42 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:42 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:43 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:43 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:44 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Feb 16 09:48:44 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 sensors: pressure=-11.82 IWC, current=0.00 A, overfill=False, mode=2, failsafe=False, shutdown=False
+Feb 16 09:48:45 RND-0003 bash[988]: [DEBUG  ] [Serial      ] ESP32 packet: pressure=-11.82, current=0.0, overfill=0, sdcard=OK, relayMode=2, failsafe=0, shutdown=0
+Sent from ESP32 to Linux: 
+09:49:18.129 -> [FAST-TX @1580395ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:18.327 -> [FAST-TX @1580595ms] P=3.09 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:18.525 -> [FAST-TX @1580796ms] P=3.09 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:18.723 -> [FAST-TX @1580997ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:18.952 -> [FAST-TX @1581199ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:19.148 -> [FAST-TX @1581400ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:19.348 -> [FAST-TX @1581602ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:19.544 -> [FAST-TX @1581803ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:19.742 -> [FAST-TX @1582004ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:19.938 -> [FAST-TX @1582205ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:20.136 -> [FAST-TX @1582406ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:20.333 -> [FAST-TX @1582606ms] P=3.09 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:20.530 -> [FAST-TX @1582808ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:20.760 -> [FAST-TX @1583009ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:20.958 -> [FAST-TX @1583211ms] P=3.09 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:21.154 -> [FAST-TX @1583412ms] P=3.09 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:21.352 -> [FAST-TX @1583612ms] P=3.09 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:21.550 -> [FAST-TX @1583814ms] P=3.09 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:21.748 -> [FAST-TX @1584015ms] P=3.10 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:21.946 -> [FAST-TX @1584216ms] P=3.09 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:22.144 -> [FAST-TX @1584417ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:22.342 -> [FAST-TX @1584619ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:22.572 -> [FAST-TX @1584819ms] P=3.09 rawP=1021 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:22.767 -> [FAST-TX @1585021ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
+09:49:22.965 -> [FAST-TX @1585221ms] P=3.09 rawP=1020 zero=950.00 C=0.00 rawC=0 OV=0 M=0
