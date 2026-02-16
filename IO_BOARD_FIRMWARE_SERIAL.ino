@@ -694,7 +694,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 10.19"
+#define VERSION "Rev 10.25"
 
 // REV 10.16: Delay between individual relay GPIO pin changes (milliseconds).
 // Simultaneous activation of CR0_MOTOR, CR1, CR2, CR5 causes electrical noise
@@ -3559,7 +3559,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.19</title>
+    <title>Walter IO Board - Rev 10.25</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -3657,7 +3657,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.19</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.25</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -8115,7 +8115,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.19                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.25                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -8280,7 +8280,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.19 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.25 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
