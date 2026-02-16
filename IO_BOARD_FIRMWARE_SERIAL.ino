@@ -713,18 +713,18 @@
 // Usage: Used in setRelaysForMode() and boot-time relay init (adcReaderTask).
 //   Example: with RELAY_DELAY=1, a 4-pin mode change takes ~3ms (3 gaps × 1ms).
 #define RELAY_DELAY 1
+
+// Define the software version as a macro
+#define FIRMWARE_VERSION "10.28"
+#define FIRMWARE_DATE "2/16/2026"
+#define VERSION "Rev " FIRMWARE_VERSION
+
 String ver = VERSION;
 
 // Password required to change device name or toggle watchdog via web portal
 // Change this to your desired password. Case-sensitive, sent as URL parameter.
 #define CONFIG_PASSWORD "1793"
 
-// Firmware version - update this single location for all version references
-#define FIRMWARE_VERSION "10.28"
-#define FIRMWARE_DATE "2/16/2026"
-
-// Define the software version as a macro (must come after FIRMWARE_VERSION)
-#define VERSION "Rev " FIRMWARE_VERSION
 
 // ### Libraries ###
 #include <esp_mac.h>
