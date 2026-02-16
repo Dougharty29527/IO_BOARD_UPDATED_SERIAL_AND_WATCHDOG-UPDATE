@@ -5188,6 +5188,9 @@ void startConfigAP() {
                 
                 // Forward to Linux for logging/awareness
                 Serial1.println("{\"command\":\"start_cycle\",\"type\":\"manual_purge\"}");
+                if (serialDebugMode) {
+                    Serial.println("[SERIAL1-TX WEB] {\"command\":\"start_cycle\",\"type\":\"manual_purge\"}");
+                }
             } else if (val == "clean") {
                 // =========================================================
                 // REV 10.11: CLEAN CANISTER — ESP32 takes sole relay control
@@ -5207,6 +5210,9 @@ void startConfigAP() {
                 
                 // Forward to Linux for logging/awareness
                 Serial1.println("{\"command\":\"start_cycle\",\"type\":\"clean\"}");
+                if (serialDebugMode) {
+                    Serial.println("[SERIAL1-TX WEB] {\"command\":\"start_cycle\",\"type\":\"clean\"}");
+                }
             } else {
                 // =========================================================
                 // NORMAL MODE: run — Linux controls relays.
@@ -5306,6 +5312,9 @@ void startConfigAP() {
                 snprintf(cmdBuf, sizeof(cmdBuf),
                          "{\"command\":\"start_test\",\"type\":\"%s\"}", val.c_str());
                 Serial1.println(cmdBuf);
+                if (serialDebugMode) {
+                    Serial.printf("[SERIAL1-TX WEB] %s\r\n", cmdBuf);
+                }
                 
                 request->send(200, "application/json", "{\"ok\":true}");
             }
@@ -5921,7 +5930,13 @@ void sendFastSensorPacket() {
              isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
              failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1, ms);
     Serial1.println(buf);
-    
+
+    // Debug: Show actual Serial1 content sent to Python device
+    // This shows what Python receives on RS-232 serial port
+    if (serialDebugMode) {
+        Serial.printf("[SERIAL1-TX @%lums] %s\r\n", millis(), buf);
+    }
+
     // Debug log to USB Serial Monitor — shows timestamp (ms) so you can verify 5Hz rate
     // Expect ~200ms between each line. Look for consistent spacing in the millis() values.
     // REV 10.9: Only prints when debug mode ON — this fires 5x/second and floods the monitor
