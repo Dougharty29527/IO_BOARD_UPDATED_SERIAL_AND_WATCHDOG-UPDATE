@@ -29,7 +29,8 @@
  *    * Eliminates ALL false alarms from local ADC calculations during normal operation
  *    * Maintains critical safety monitoring during failsafe autonomous control
  *    * Added fault bit constants: LOW_PRESS_FAULT_BIT(1), HIGH_PRESS_FAULT_BIT(2),
- *      ZERO_PRESS_FAULT_BIT(4), LOW_CURRENT_FAULT_BIT(8), HIGH_CURRENT_FAULT_BIT(16)
+ *      ZERO_PRESS_FAULT_BIT(4), VAR_PRESS_FAULT_BIT(8), LOW_CURRENT_FAULT_BIT(16), HIGH_CURRENT_FAULT_BIT(32)
+ *    * Now supports all 6 Python alarm types including Variable Pressure alarm for CS8/CS12 profiles
  *  - IMPROVED: Clean separation between Python alarm detection and ESP32 display logic
  *
  *  Rev 10.25 (2/16/2026) - Fixed Web Portal Maintenance Navigation & Password
@@ -1078,8 +1079,9 @@ const int FAILSAFE_ACTIVE_FAULT_CODE = 16384;   // NEW: Added when failsafe mode
 const int LOW_PRESS_FAULT_BIT = 1;              // Bit 0: Low pressure alarm from Python program
 const int HIGH_PRESS_FAULT_BIT = 2;             // Bit 1: High pressure alarm from Python program
 const int ZERO_PRESS_FAULT_BIT = 4;             // Bit 2: Zero pressure alarm from Python program
-const int LOW_CURRENT_FAULT_BIT = 8;            // Bit 3: Low current alarm from Python program
-const int HIGH_CURRENT_FAULT_BIT = 16;          // Bit 4: High current alarm from Python program
+const int VAR_PRESS_FAULT_BIT = 8;              // Bit 3: Variable pressure alarm from Python program
+const int LOW_CURRENT_FAULT_BIT = 16;           // Bit 4: Low current alarm from Python program
+const int HIGH_CURRENT_FAULT_BIT = 32;          // Bit 5: High current alarm from Python program
 
 // REV 10.10: LTE connection check interval
 // Previously: lteConnected() was checked EVERY loop iteration. If the cellular modem
@@ -5186,6 +5188,7 @@ void startConfigAP() {
         bool alarmLowPress = failsafeMode ? (adcPressure < activeProfile->lowPressThreshold && currentRelayMode > 0) : ((faults & LOW_PRESS_FAULT_BIT) != 0);
         bool alarmHighPress = failsafeMode ? (adcPressure > activeProfile->highPressThreshold && currentRelayMode > 0) : ((faults & HIGH_PRESS_FAULT_BIT) != 0);
         bool alarmZeroPress = failsafeMode ? (activeProfile->hasZeroPressAlarm && fabs(adcPressure) < 0.15 && currentRelayMode > 0) : ((faults & ZERO_PRESS_FAULT_BIT) != 0);
+        bool alarmVarPress = failsafeMode ? false : ((faults & VAR_PRESS_FAULT_BIT) != 0);  // Variable pressure alarm from Python
         bool alarmLowCurrent = failsafeMode ? (adcCurrent > 0 && adcCurrent < LOW_CURRENT_THRESHOLD && currentRelayMode > 0) : ((faults & LOW_CURRENT_FAULT_BIT) != 0);
         bool alarmHighCurrent = failsafeMode ? (adcCurrent > HIGH_CURRENT_THRESHOLD) : ((faults & HIGH_CURRENT_FAULT_BIT) != 0);
         int combinedFault = faults + getCombinedFaultCode();
@@ -5268,12 +5271,13 @@ void startConfigAP() {
         // Alarms & watchdog & debug mode
         pos += snprintf(json + pos, sizeof(json) - pos,
             "\"alarmLowPress\":%s,\"alarmHighPress\":%s,"
-            "\"alarmZeroPress\":%s,\"alarmVarPress\":false,"
+            "\"alarmZeroPress\":%s,\"alarmVarPress\":%s,"
             "\"alarmLowCurrent\":%s,\"alarmHighCurrent\":%s,"
             "\"watchdogTriggered\":%s,\"watchdogEnabled\":%s,"
             "\"failsafeEnabled\":%s,\"serialDebugMode\":%s,",
             alarmLowPress ? "true" : "false", alarmHighPress ? "true" : "false",
             alarmZeroPress ? "true" : "false",
+            alarmVarPress ? "true" : "false",
             alarmLowCurrent ? "true" : "false", alarmHighCurrent ? "true" : "false",
             watchdogTriggered ? "true" : "false", watchdogEnabled ? "true" : "false",
             failsafeEnabled ? "true" : "false", serialDebugMode ? "true" : "false");
