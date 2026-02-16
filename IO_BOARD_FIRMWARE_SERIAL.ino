@@ -1,6 +1,6 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.22
+ *  Walter IO Board Firmware - Rev 10.23
  *  Date: 2/16/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,19 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.23 (2/16/2026) - Pressure Sensor Current Loss Detection
+ *  - NEW: Pressure sensor fault detection for current loss (raw ADC < 20)
+ *    * Monitors ADS1015 channel 0 raw value for pressure sensor current loss
+ *    * If rawPressure < 20, sends pressure=-99.9 to indicate sensor alarm to Python
+ *    * -99.9 serves as error code for "pressure sensor current/power loss"
+ *    * Different from stale data timeout (-99.9 also used for ADC communication faults)
+ *    * Python program can detect -99.9 as pressure sensor alarm/fault condition
+ *  - DEBUG: Added sensor fault logging when serialDebugMode enabled
+ *    * Shows raw ADC value and timestamp when fault detected
+ *    * Helps diagnose pressure sensor power/connection issues
+ *  - IMPROVED: Updated sendFastSensorPacket comments to clarify -99.9 usage
+ *    * -99.9 can indicate either ADC stale timeout OR pressure sensor fault
  *
  *  Rev 10.22 (2/16/2026) - Fixed Web Portal Pressure Display + Serial Debugging
  *  - BUG FIX: Web portal was showing stale pressure from serial parsing instead of live ADC
@@ -2788,8 +2801,29 @@ void adcReaderTask(void *parameter) {
             if (adcInitialized) {
                 // Read Channel 0: Pressure sensor (single-ended)
                 int16_t rawPressure = ads.readADC_SingleEnded(0);
-                
-                if (rawPressure >= 0 && rawPressure < 2048) {
+
+                // Check for pressure sensor current loss (raw value < 20 indicates sensor fault)
+                // This indicates the pressure sensor has lost power or current, sending -99.9 alarm
+                bool pressureSensorFault = (rawPressure < 20);
+
+                if (pressureSensorFault) {
+                    // Sensor fault - send -99.9 to indicate pressure sensor alarm to Python
+                    adcRawPressure = rawPressure;  // Still store raw value for diagnostics
+                    adcPressure = -99.9;           // Alarm value for pressure sensor fault
+                    adcErrorCount = 0;            // Reset error count (this is a different type of fault)
+                    lastSuccessfulAdcRead = millis();  // Mark as "successful" to avoid stale data timeout
+
+                    // Log sensor fault detection
+                    if (serialDebugMode) {
+                        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                        Serial.printf("!! PRESSURE SENSOR CURRENT LOSS  |  raw=%d (< 20 threshold)  |  @%lums\r\n",
+                                      rawPressure, millis());
+                        Serial.println("!! Sending pressure=-99.9 to indicate sensor fault to Python     !!");
+                        Serial.println("!! Check pressure sensor power/current connections              !!");
+                        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    }
+                }
+                else if (rawPressure >= 0 && rawPressure < 2048) {
                     // Success - convert to pressure IWC using Python-compatible linear formula
                     // pressure = (raw - adc_zero) / slope
                     // Vacuum (raw < adc_zero) → negative IWC (normal operating range)
@@ -5915,7 +5949,8 @@ void sendFastSensorPacket() {
     //   Stale:   {"pressure":-99.90,"current":0.00,"overfill":0,"sdcard":"OK","relayMode":1,"failsafe":0,"shutdown":0}
     //
     // Fields:
-    //   pressure  - ESP32 ADC pressure in IWC (60Hz rolling average), or -99.9 if stale
+    //   pressure  - ESP32 ADC pressure in IWC (60Hz rolling average), or -99.9 if stale/fault
+    //              -99.9 indicates either ADC data stale timeout OR pressure sensor current loss
     //   current   - ESP32 ADC motor current in amps (differential, peak-detect), or 0.0 if stale
     //   overfill  - 0=normal, 1=overfill alarm active (GPIO38 LOW)
     //   sdcard    - "OK" or "FAULT"
