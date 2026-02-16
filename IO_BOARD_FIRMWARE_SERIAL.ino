@@ -23,14 +23,15 @@
  *    * Shows command name and any parameters (e.g., "start_cycle (run)")
  *    * Helps monitor and debug serial communication with Python control software
  *  - CRITICAL FIX: Complete alarm logic overhaul - ESP32 now only reports Python-detected alarms
- *    * ALL alarms (Low/High Pressure, Zero Pressure, Low/High Current) now follow same pattern:
- *      * Normal mode: Only trigger when Python sends corresponding fault code bits (1-16)
- *      * Failsafe mode: ESP32 autonomously detects alarms using local ADC calculations
+ *    * ALL alarms now follow CS8 fault code specification (16-2048 range):
+ *      * Normal mode: Only trigger when Python sends corresponding fault code bits
+ *      * Failsafe mode: ESP32 autonomously detects critical alarms using local ADC calculations
  *    * Eliminates ALL false alarms from local ADC calculations during normal operation
  *    * Maintains critical safety monitoring during failsafe autonomous control
- *    * Added fault bit constants: LOW_PRESS_FAULT_BIT(1), HIGH_PRESS_FAULT_BIT(2),
- *      ZERO_PRESS_FAULT_BIT(4), VAR_PRESS_FAULT_BIT(8), LOW_CURRENT_FAULT_BIT(16), HIGH_CURRENT_FAULT_BIT(32)
- *    * Now supports all 6 Python alarm types including Variable Pressure alarm for CS8/CS12 profiles
+ *    * Implemented complete CS8 fault code mapping:
+ *      16=Low Pressure, 32=High Pressure, 64=Zero Pressure, 128=Var Pressure,
+ *      256=Pressure Sensor, 512=72-Hour Timer, 1024=Low Current, 2048=High Current
+ *    * Full support for CS8 "full alarm set" and CS12 selective alarm configurations
  *  - IMPROVED: Clean separation between Python alarm detection and ESP32 display logic
  *
  *  Rev 10.25 (2/16/2026) - Fixed Web Portal Maintenance Navigation & Password
@@ -1075,13 +1076,15 @@ const int WATCHDOG_FAULT_CODE = 2048;            // REV 10.17: Fault code for se
 const int BLUECHERRY_FAULT_CODE = 8192;          // REV 10.17: Fault code for BlueCherry disconnected (was 4096)
 const int FAILSAFE_ACTIVE_FAULT_CODE = 16384;   // NEW: Added when failsafe mode is actively controlling relays
 
-// Python program fault code bits (from Linux control software)
-const int LOW_PRESS_FAULT_BIT = 1;              // Bit 0: Low pressure alarm from Python program
-const int HIGH_PRESS_FAULT_BIT = 2;             // Bit 1: High pressure alarm from Python program
-const int ZERO_PRESS_FAULT_BIT = 4;             // Bit 2: Zero pressure alarm from Python program
-const int VAR_PRESS_FAULT_BIT = 8;              // Bit 3: Variable pressure alarm from Python program
-const int LOW_CURRENT_FAULT_BIT = 16;           // Bit 4: Low current alarm from Python program
-const int HIGH_CURRENT_FAULT_BIT = 32;          // Bit 5: High current alarm from Python program
+// Python program fault code bits (from Linux control software) - CS8/CS12 mappings
+const int LOW_PRESS_FAULT_BIT = 16;             // Bit 4: Low pressure alarm (CS8)
+const int HIGH_PRESS_FAULT_BIT = 32;            // Bit 5: High pressure alarm (CS8)
+const int ZERO_PRESS_FAULT_BIT = 64;            // Bit 6: Zero pressure alarm (CS8)
+const int VAR_PRESS_FAULT_BIT = 128;            // Bit 7: Variable pressure alarm (CS8)
+const int PRESSURE_SENSOR_FAULT_BIT = 256;     // Bit 8: Pressure sensor fault (CS8)
+const int SEVENTY_TWO_HOUR_FAULT_BIT = 512;    // Bit 9: 72-hour alarm (CS8/CS12)
+const int LOW_CURRENT_FAULT_BIT = 1024;        // Bit 10: Low current alarm (CS8/CS12)
+const int HIGH_CURRENT_FAULT_BIT = 2048;       // Bit 11: High current alarm (CS8/CS12)
 
 // REV 10.10: LTE connection check interval
 // Previously: lteConnected() was checked EVERY loop iteration. If the cellular modem
@@ -3733,6 +3736,7 @@ const char* control_html = R"rawliteral(
             <div class="alarm-row"><span class="name">High Pressure</span><span class="ind ind-g" id="aHighP"></span></div>
             <div class="alarm-row"><span class="name">Zero Pressure</span><span class="ind ind-g" id="aZeroP"></span></div>
             <div class="alarm-row"><span class="name">Var Pressure</span><span class="ind ind-g" id="aVarP"></span></div>
+            <div class="alarm-row"><span class="name">Pressure Sensor</span><span class="ind ind-g" id="aPressureSensor"></span></div>
             <div class="alarm-row"><span class="name">Low Current</span><span class="ind ind-g" id="aLowC"></span></div>
             <div class="alarm-row"><span class="name">High Current</span><span class="ind ind-g" id="aHighC"></span></div>
             <div class="alarm-row"><span class="name">Panel Power</span><span class="ind ind-g" id="aPanelPwr"></span></div>
@@ -4476,8 +4480,9 @@ const char* control_html = R"rawliteral(
                         setInd('aOvfl',d.overfillAlarm);setInd('aWatch',d.watchdogTriggered);setInd('aFailsafe',d.failsafe);
                         setInd('aLowP',d.alarmLowPress);setInd('aHighP',d.alarmHighPress);
                         setInd('aZeroP',d.alarmZeroPress);setInd('aVarP',d.alarmVarPress);
+                        setInd('aPressureSensor',d.alarmPressureSensor);
                         setInd('aLowC',d.alarmLowCurrent);setInd('aHighC',d.alarmHighCurrent);
-                        setInd('aPanelPwr',d.failsafe);setInd('a72Hr',false);
+                        setInd('aPanelPwr',d.failsafe);setInd('a72Hr',d.alarmSeventyTwoHour||false);
                         // Manual mode
                         upd('manPressure',d.pressure);upd('manCurrent',d.current);
                         upd('manCycles',d.cycles);upd('manMode',modeNames[d.mode]||d.mode);
@@ -5189,6 +5194,8 @@ void startConfigAP() {
         bool alarmHighPress = failsafeMode ? (adcPressure > activeProfile->highPressThreshold && currentRelayMode > 0) : ((faults & HIGH_PRESS_FAULT_BIT) != 0);
         bool alarmZeroPress = failsafeMode ? (activeProfile->hasZeroPressAlarm && fabs(adcPressure) < 0.15 && currentRelayMode > 0) : ((faults & ZERO_PRESS_FAULT_BIT) != 0);
         bool alarmVarPress = failsafeMode ? false : ((faults & VAR_PRESS_FAULT_BIT) != 0);  // Variable pressure alarm from Python
+        bool alarmPressureSensor = failsafeMode ? false : ((faults & PRESSURE_SENSOR_FAULT_BIT) != 0);  // Pressure sensor fault from Python
+        bool alarmSeventyTwoHour = failsafeMode ? false : ((faults & SEVENTY_TWO_HOUR_FAULT_BIT) != 0);  // 72-hour timer alarm from Python
         bool alarmLowCurrent = failsafeMode ? (adcCurrent > 0 && adcCurrent < LOW_CURRENT_THRESHOLD && currentRelayMode > 0) : ((faults & LOW_CURRENT_FAULT_BIT) != 0);
         bool alarmHighCurrent = failsafeMode ? (adcCurrent > HIGH_CURRENT_THRESHOLD) : ((faults & HIGH_CURRENT_FAULT_BIT) != 0);
         int combinedFault = faults + getCombinedFaultCode();
@@ -5272,12 +5279,13 @@ void startConfigAP() {
         pos += snprintf(json + pos, sizeof(json) - pos,
             "\"alarmLowPress\":%s,\"alarmHighPress\":%s,"
             "\"alarmZeroPress\":%s,\"alarmVarPress\":%s,"
-            "\"alarmLowCurrent\":%s,\"alarmHighCurrent\":%s,"
+            "\"alarmPressureSensor\":%s,\"alarmLowCurrent\":%s,\"alarmHighCurrent\":%s,"
             "\"watchdogTriggered\":%s,\"watchdogEnabled\":%s,"
             "\"failsafeEnabled\":%s,\"serialDebugMode\":%s,",
             alarmLowPress ? "true" : "false", alarmHighPress ? "true" : "false",
             alarmZeroPress ? "true" : "false",
             alarmVarPress ? "true" : "false",
+            alarmPressureSensor ? "true" : "false",
             alarmLowCurrent ? "true" : "false", alarmHighCurrent ? "true" : "false",
             watchdogTriggered ? "true" : "false", watchdogEnabled ? "true" : "false",
             failsafeEnabled ? "true" : "false", serialDebugMode ? "true" : "false");
@@ -5291,14 +5299,16 @@ void startConfigAP() {
             "\"datetime\":\"%s\",\"uptime\":\"%s\","
             "\"macAddress\":\"%s\","
             "\"cborPayloadHistory\":%s,"
-            "\"lastSerialCommand\":\"%s\"}",
+            "\"lastSerialCommand\":\"%s\","
+            "\"alarmSeventyTwoHour\":%s}",
             testRunning ? "true" : "false", activeTestType.c_str(),
             testElapsedSec,
             webTestMultiStep ? "true" : "false", webTestCycleStep, webTestCycleLength,
             dtStr.c_str(), uptimeStr,
             macStr.c_str(),
             buildCborPayloadHistoryJson().c_str(),
-            lastSerialCommand.c_str());
+            lastSerialCommand.c_str(),
+            alarmSeventyTwoHour ? "true" : "false");
         
         request->send(200, "application/json", json);
     });
