@@ -4758,7 +4758,7 @@ void initializeAPName() {
  */
 String generateCaptivePortalHTML() {
     // Get current data
-    float currentPressure = pressure;  // From global variable
+    float currentPressure = adcPressure;  // Use live ADC pressure reading (not stale serial data)
     int currentCycles = cycles;        // From global variable
     int alarmCode = getCombinedFaultCode();  // Any ESP32 alarm active?
     String datetimeStr = getDateTimeString(); // Format: "YYYY-MM-DD HH:MM:SS"
