@@ -1799,6 +1799,44 @@ void executeRemoteCommand(String cmd, String value) {
         // calibratePressureSensorZeroPoint() sends its own response to Serial1
         Serial.println("[CMD] Pressure calibration executed.");
     }
+    // --- Set Manual ADC Zero ---
+    // Allows user to manually set the ADC zero point for pressure sensor calibration.
+    // Unlike calibrate_pressure (which reads the live ADC), this accepts a user-supplied value.
+    // The value is validated against MANUAL_ADC_MIN/MAX (broader range than CAL_RANGE), then saved to EEPROM.
+    // HTTP response is sent by the /api/command handler (not here, since request is not in scope).
+    // NOTIFIES Python program about calibration change via Serial1 (same as calibrate_pressure).
+    //
+    // Usage example:
+    //   executeRemoteCommand("set_manual_adc_zero", "1200.00");
+    else if (cmd == "set_manual_adc_zero") {
+        float newAdcZero = value.toFloat();
+        const float MANUAL_ADC_MIN = 500.0;   // Allow broader range for manual entry
+        const float MANUAL_ADC_MAX = 2000.0;  // ADS1015 12-bit: 0-4095, pressure ~500-2000
+        if (newAdcZero >= MANUAL_ADC_MIN && newAdcZero <= MANUAL_ADC_MAX) {
+            adcZeroPressure = newAdcZero;
+            savePressureCalibrationToEeprom();
+
+            // Clear the pressure averaging buffer so old readings don't linger
+            // Fill buffer with current pressure value to avoid temporary incorrect averages
+            float currentPressure = adcPressure;
+            pressureSampleCount = PRESSURE_AVG_SAMPLES;  // Mark buffer as full
+            pressureBufferIdx = 0;
+            for (int i = 0; i < PRESSURE_AVG_SAMPLES; i++) pressureBuffer[i] = currentPressure;
+
+            Serial.printf("[CMD] Manual ADC zero set to: %.2f\r\n", adcZeroPressure);
+
+            // Notify Python program about the calibration change (same format as calibrate_pressure)
+            char calMsg[128];
+            snprintf(calMsg, sizeof(calMsg),
+                     "{\"type\":\"data\",\"ps_cal\":%.2f}",
+                     adcZeroPressure);
+            Serial1.println(calMsg);
+            Serial.printf("[CMD] Sent manual ADC zero result to Linux: %s\r\n", calMsg);
+        } else {
+            Serial.printf("[CMD] ERROR: Manual ADC zero %.2f outside valid range (%.0f-%.0f)\r\n",
+                         newAdcZero, MANUAL_ADC_MIN, MANUAL_ADC_MAX);
+        }
+    }
     // --- Unknown Command ---
     else {
         Serial.printf("[CMD] Unknown command: %s\n", cmd.c_str());
@@ -3601,11 +3639,28 @@ const char* control_html = R"rawliteral(
                 <button class="menu-btn" onclick="nav('diagnostics')">Diagnostics</button>
                 <button class="menu-btn" onclick="nav('clean')">Clean Canister</button>
                 <button class="menu-btn" onclick="showPtModal()">Passthrough</button>
+                <button class="menu-btn" onclick="nav('config')" style="background:#1565c0;color:#fff">Configuration</button>
                 <button class="menu-btn" onclick="calibratePressure()" style="background:#00695c;color:#fff">Calibrate Pressure</button>
+                <button class="menu-btn" onclick="nav('manual-adc-zero')" style="background:#c62828;color:#fff">Manual ADC Zero</button>
             </div>
             <p id="calResult" style="text-align:center;font-size:0.85em;color:#00695c;margin-top:8px"></p>
         </div>
     </div><!-- end scr-maint -->
+
+    <!-- ============ MANUAL ADC ZERO SCREEN ============ -->
+    <div class="screen" id="scr-manual-adc-zero">
+        <div class="hdr"><h1>Manual ADC Zero</h1></div>
+        <div class="card"><div class="card-body">
+            <p style="color:#e65100;font-weight:700;text-align:center;padding:8px">Enter a custom ADC zero value to manually set the pressure sensor calibration.</p>
+            <div style="text-align:center;padding:20px 10px">
+                <input type="number" id="adcZeroInput" step="0.01" placeholder="Enter ADC zero value" style="padding:12px 16px;border:2px solid #ddd;border-radius:8px;font-size:1.1em;width:200px;text-align:center" />
+                <br><br>
+                <button class="btn" style="padding:12px 32px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-weight:700;font-size:1.1em" onclick="submitManualAdcZero()">Submit</button>
+                <button class="btn" style="padding:12px 32px;background:#666;color:#fff;border:none;border-radius:8px;font-weight:700;font-size:1.1em;margin-left:10px" onclick="nav('maint')">Cancel</button>
+            </div>
+            <p id="adcZeroResult" style="text-align:center;font-size:0.9em;color:#00695c;margin-top:8px"></p>
+        </div></div>
+    </div><!-- end scr-manual-adc-zero -->
 
     <!-- ============ TESTS SCREEN ============ -->
     <div class="screen" id="scr-tests">
@@ -3971,6 +4026,55 @@ const char* control_html = R"rawliteral(
             };
             x.onerror=function(){if(el) el.textContent='Calibration request failed';};
             x.send(JSON.stringify({command:'calibrate_pressure'}));
+        };
+
+        // ---- MANUAL ADC ZERO SETTING ----
+        // Gets ADC zero value from input field and sends to ESP32 via /api/command.
+        // ESP32 validates the value, updates adcZeroPressure, saves to EEPROM,
+        // and returns the new value. User is then navigated back to Maintenance screen.
+        //
+        // Usage: User clicks "Manual ADC Zero" button on Maintenance screen,
+        //        enters a numeric value, clicks Submit. The value is saved to EEPROM.
+        window.submitManualAdcZero=function(){
+            var inputEl=document.getElementById('adcZeroInput');
+            var resultEl=document.getElementById('adcZeroResult');
+            if(!inputEl || !resultEl) return;
+
+            var adcValue=parseFloat(inputEl.value);
+            if(isNaN(adcValue) || adcValue < 0){
+                resultEl.style.color='#ff6b6b';
+                resultEl.textContent='Invalid ADC value - must be a positive number';
+                return;
+            }
+
+            if(!confirm('Set manual ADC zero to '+adcValue.toFixed(2)+'?\\nThis will override the current calibration.')) return;
+
+            resultEl.style.color='#00695c';
+            resultEl.textContent='Setting ADC zero...';
+
+            var x=new XMLHttpRequest();
+            x.open('POST','http://'+IP+'/api/command',true);
+            x.setRequestHeader('Content-Type','application/json');
+            x.onload=function(){
+                if(x.status===200){
+                    try{
+                        var r=JSON.parse(x.responseText);
+                        resultEl.textContent='ADC Zero set to: '+r.adcZero.toFixed(2)+' - Returning to Maintenance...';
+                        setTimeout(function(){nav('maint');}, 2000);
+                    }catch(e){
+                        resultEl.style.color='#ff6b6b';
+                        resultEl.textContent='Error: Invalid response from device';
+                    }
+                }else{
+                    resultEl.style.color='#ff6b6b';
+                    resultEl.textContent='Failed to set ADC zero ('+x.status+')';
+                }
+            };
+            x.onerror=function(){
+                resultEl.style.color='#ff6b6b';
+                resultEl.textContent='Connection error - please try again';
+            };
+            x.send(JSON.stringify({command:'set_manual_adc_zero',value:adcValue.toString()}));
         };
 
         // ---- PROFILE SELECT + PASSWORD CONFIRM (PW: validated server-side) ----
@@ -5271,6 +5375,32 @@ void startConfigAP() {
                      "{\"ok\":true,\"adcZero\":%.2f}", adcZeroPressure);
             request->send(200, "application/json", resp);
         }
+        // =========================================================
+        // SET MANUAL ADC ZERO — User-supplied ADC zero point value
+        // Validates against MANUAL_ADC_MIN/MAX (broader than CAL_RANGE for flexibility).
+        // Returns the new adcZero value on success, or error on invalid range.
+        // =========================================================
+        else if (cmd == "set_manual_adc_zero") {
+            float newAdcZero = val.toFloat();
+            const float MANUAL_ADC_MIN = 500.0;   // Allow broader range for manual entry
+            const float MANUAL_ADC_MAX = 2000.0;  // ADS1015 12-bit: 0-4095, pressure ~500-2000
+            if (newAdcZero >= MANUAL_ADC_MIN && newAdcZero <= MANUAL_ADC_MAX) {
+                executeRemoteCommand(cmd, val);
+                char resp[128];
+                snprintf(resp, sizeof(resp),
+                         "{\"command\":\"set_manual_adc_zero\",\"adcZero\":%.2f,\"success\":true}",
+                         adcZeroPressure);
+                request->send(200, "application/json", resp);
+            } else {
+                Serial.printf("[WEB CMD] Manual ADC zero %.2f outside valid range (%.0f-%.0f)\r\n",
+                             newAdcZero, MANUAL_ADC_MIN, MANUAL_ADC_MAX);
+                char resp[192];
+                snprintf(resp, sizeof(resp),
+                         "{\"command\":\"set_manual_adc_zero\",\"success\":false,\"error\":\"ADC value outside valid range (%.0f-%.0f)\"}",
+                         MANUAL_ADC_MIN, MANUAL_ADC_MAX);
+                request->send(400, "application/json", resp);
+            }
+        }
         else if (cmd == "toggle_relay") {
             // Convert web relay names (CR1, CR2, CR5) to ESP32 GPIO pins and toggle them
             int pin = -1;
@@ -5769,13 +5899,14 @@ void sendFastSensorPacket() {
         sendCurrent = 0.0;                   // No valid current reading
     }
     
-    char buf[160];
+    char buf[200];
+    unsigned long ms = millis();
     snprintf(buf, sizeof(buf),
              "{\"pressure\":%.2f,\"current\":%.2f,\"overfill\":%d,\"sdcard\":\"%s\","
-             "\"relayMode\":%d,\"failsafe\":%d,\"shutdown\":%d}",
+             "\"relayMode\":%d,\"failsafe\":%d,\"shutdown\":%d,\"ms\":%lu}",
              sendPressure, sendCurrent, overfillAlarmActive ? 1 : 0,
              isSDCardOK() ? "OK" : "FAULT", currentRelayMode,
-             failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1);
+             failsafeMode ? 1 : 0, dispShutdownActive ? 0 : 1, ms);
     Serial1.println(buf);
     
     // Debug log to USB Serial Monitor — shows timestamp (ms) so you can verify 5Hz rate
