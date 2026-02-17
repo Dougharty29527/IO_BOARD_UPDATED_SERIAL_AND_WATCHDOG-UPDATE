@@ -1,7 +1,7 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 1
- *  Date: 2/16/2026
+ *  Walter IO Board Firmware - Rev 10.32
+ *  Date: 2/17/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -12,6 +12,50 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.32 (2/17/2026) - Serial Command Reliability + Fast-Path Mode Diagnostics
+ *  - ARCHITECTURE: Rewrote readSerialData() with char-array buffer and brace-depth
+ *    message framing.  Replaces Arduino String concatenation which caused heap
+ *    fragmentation and slow character-by-character appends.
+ *  - ARCHITECTURE: New processCompleteSerialMessage() dispatches commands and data
+ *    packets.  All commands route through executeRemoteCommand() for unified behavior
+ *    across Serial1, Web Portal, and BlueCherry sources.
+ *  - PERFORMANCE: Reduced loop delay from 100ms to 1ms (~100x faster loop execution)
+ *  - PERFORMANCE: Moved readSerialData() to top of loop() — runs every iteration,
+ *    not gated behind the 100ms timer.  Serial commands now process within 1-5ms.
+ *  - PERFORMANCE: Fast-path mode application using strstr+atoi in
+ *    processCompleteSerialMessage() — relay GPIO set BEFORE full JSON parsing.
+ *    Zero heap allocation for the critical mode path.
+ *  - PERFORMANCE: Skipped SaveToSD() on immediate serial path (parsedSerialData(false)).
+ *    SD writes still happen on the normal 15-second timer.
+ *  - RELIABILITY: Serial checked during all blocking operations (LTE reconnect,
+ *    SD remount retries, modem queries) via readSerialData() calls in
+ *    checkAndSendStatusToSerial() and SD retry loops.
+ *  - RELIABILITY: Startup-only sync discards partial UART garbage at boot until
+ *    first '{' is seen.  5-second timeout for incomplete messages during normal
+ *    operation.  Drains ALL queued messages per call (no break after first).
+ *  - NEW: toggle_relay and emergency_stop added to executeRemoteCommand() —
+ *    now reachable from Serial1, Web Portal, and BlueCherry (previously web-only).
+ *  - FIX: Fast-path mode now logs ALL outcomes (applied, blocked by guard, or
+ *    same-mode skip) so mode command processing is never silent.
+ *  - FIX: processCompleteSerialMessage() unknown-command else branch now routes
+ *    to executeRemoteCommand() instead of silently dropping commands.
+ *  - FIX: "No data received" idle counter replaced with actual millis() timestamps.
+ *    Old poll-count formula showed wildly wrong times after loop speed increased.
+ *  - CALIBRATION: ADC zero-point calibration range expanded from ±10% of factory
+ *    default (~868-1060) to full 12-bit ADS1015 range (1-4095).
+ *    * Sensors with different zero offsets (e.g., 670 raw ADC at atmospheric) now
+ *      calibrate successfully instead of being rejected.
+ *    * All four validation paths unified: auto-cal, manual cal, web API, EEPROM load.
+ *    * Values far from factory default (>20% deviation) print a WARNING but are NOT
+ *      rejected — allows sensors with significantly different characteristics.
+ *    * Only truly impossible values (0 or >4095) are rejected.
+ *  - PYTHON FIX: Removed duplicate serial send in main.py fifteen_second_updates() —
+ *    both main.py and modem.py were sending the same payload, causing ESP32 to receive
+ *    every data packet twice.
+ *  - PYTHON FIX: Implemented send_mode_immediate() in modem.py — this method was
+ *    called by io_manager.py but never existed, so mode changes had up to 15-second
+ *    delay (fell through to periodic _send_cycle timer).  Now instant.
  *
  *  Rev 10.29 (2/16/2026) - Profile-Specific Fault Code Mappings Implementation
  *  - IMPLEMENTED: Complete profile-specific fault code mappings as specified
@@ -886,14 +930,22 @@ float adcZeroPressure = 964.0;        // Overwritten by EEPROM value in setup()
 float pressureSlope12bit = 22.84;     // 365.44/16 — ADC counts (12-bit) per IWC
 const float ADC_ZERO_FACTORY_DEFAULT = 964.0;  // Factory default if EEPROM has no calibration
 
-// REV 10.9: Calibration range validation — middle 20% of scale centered on factory default.
-// Prevents bad calibrations (e.g., sensor under vacuum) from saving a wildly wrong zero point.
-// ±10% of 964.0 = ±96.4 ADC counts → allowed range: 867.6 to 1060.4
-// A calibration at -6 IWC vacuum would compute newZero ≈ 827 → REJECTED (below 867.6).
-// At sea level ambient: newZero ≈ 964 → accepted. High altitude (-0.5 IWC): newZero ≈ 953 → accepted.
-const float CAL_TOLERANCE_PERCENT = 10.0;  // ±10% = 20% total band (middle 20% of scale)
-const float CAL_RANGE_MIN = ADC_ZERO_FACTORY_DEFAULT * (1.0f - CAL_TOLERANCE_PERCENT / 100.0f);  // ~867.6
-const float CAL_RANGE_MAX = ADC_ZERO_FACTORY_DEFAULT * (1.0f + CAL_TOLERANCE_PERCENT / 100.0f);  // ~1060.4
+// REV 10.32: Calibration range expanded to full 12-bit ADS1015 positive range.
+// Previously (REV 10.9) restricted to ±10% of factory default (~868-1060), which
+// rejected sensors with significantly different zero offsets (e.g., a sensor reading
+// 670 raw ADC at atmospheric pressure).  Now any value 1-4095 is accepted for both
+// auto-cal and manual cal.  A warning is printed when the value is >20% away from
+// factory default, but the calibration is NOT rejected.
+//
+// The absolute limits (1 and 4095) prevent only truly impossible values:
+//   0 = ADC reads dead zero at atmospheric (hardware fault)
+//   >4095 = exceeds 12-bit range (corrupted data)
+const float CAL_RANGE_MIN = 1.0;     // Minimum valid 12-bit ADC value for zero point
+const float CAL_RANGE_MAX = 4095.0;  // Maximum valid 12-bit ADC value (2^12 - 1)
+
+// Threshold for printing a "far from factory default" warning (not a rejection).
+// If the calibration zero is more than ±20% from 964.0, a warning is logged.
+const float CAL_WARNING_TOLERANCE_PERCENT = 20.0;
 
 // Current: Python uses mapit(abs(ch2-ch3), 1248, 4640, 2.1, 8.0) on ADS1115 (16-bit)
 // Those 16-bit single-ended differences correspond to physical voltages:
@@ -1945,17 +1997,18 @@ void executeRemoteCommand(String cmd, String value) {
     // --- Set Manual ADC Zero ---
     // Allows user to manually set the ADC zero point for pressure sensor calibration.
     // Unlike calibrate_pressure (which reads the live ADC), this accepts a user-supplied value.
-    // The value is validated against MANUAL_ADC_MIN/MAX (broader range than CAL_RANGE), then saved to EEPROM.
+    // The value is validated against global CAL_RANGE_MIN/MAX (1-4095), then saved to EEPROM.
     // HTTP response is sent by the /api/command handler (not here, since request is not in scope).
     // NOTIFIES Python program about calibration change via Serial1 (same as calibrate_pressure).
     //
     // Usage example:
     //   executeRemoteCommand("set_manual_adc_zero", "1200.00");
+    // REV 10.32: Manual ADC zero now uses the same global CAL_RANGE_MIN/MAX (1-4095)
+    // as auto-cal and EEPROM load.  Previously used a local 500-2000 range that was
+    // inconsistent with the other validation paths.
     else if (cmd == "set_manual_adc_zero") {
         float newAdcZero = value.toFloat();
-        const float MANUAL_ADC_MIN = 500.0;   // Allow broader range for manual entry
-        const float MANUAL_ADC_MAX = 2000.0;  // ADS1015 12-bit: 0-4095, pressure ~500-2000
-        if (newAdcZero >= MANUAL_ADC_MIN && newAdcZero <= MANUAL_ADC_MAX) {
+        if (newAdcZero >= CAL_RANGE_MIN && newAdcZero <= CAL_RANGE_MAX) {
             adcZeroPressure = newAdcZero;
             savePressureCalibrationToEeprom();
 
@@ -1968,6 +2021,13 @@ void executeRemoteCommand(String cmd, String value) {
 
             Serial.printf("[CMD] Manual ADC zero set to: %.2f\r\n", adcZeroPressure);
 
+            // Warn if far from factory default (informational only, not a rejection)
+            float deviationPercent = fabsf((newAdcZero - ADC_ZERO_FACTORY_DEFAULT) / ADC_ZERO_FACTORY_DEFAULT) * 100.0f;
+            if (deviationPercent > CAL_WARNING_TOLERANCE_PERCENT) {
+                Serial.printf("[CMD] NOTE: Manual zero %.2f is %.1f%% from factory default %.2f\r\n",
+                              newAdcZero, deviationPercent, ADC_ZERO_FACTORY_DEFAULT);
+            }
+
             // Notify Python program about the calibration change (same format as calibrate_pressure)
             char calMsg[128];
             snprintf(calMsg, sizeof(calMsg),
@@ -1976,8 +2036,8 @@ void executeRemoteCommand(String cmd, String value) {
             Serial1.println(calMsg);
             Serial.printf("[CMD] Sent manual ADC zero result to Linux: %s\r\n", calMsg);
         } else {
-            Serial.printf("[CMD] ERROR: Manual ADC zero %.2f outside valid range (%.0f-%.0f)\r\n",
-                         newAdcZero, MANUAL_ADC_MIN, MANUAL_ADC_MAX);
+            Serial.printf("[CMD] ERROR: Manual ADC zero %.2f outside 12-bit ADC range (%.0f-%.0f)\r\n",
+                         newAdcZero, CAL_RANGE_MIN, CAL_RANGE_MAX);
         }
     }
     // --- Toggle Relay (CR1, CR2, CR5) ---
@@ -2655,21 +2715,30 @@ void loadPressureCalibrationFromEeprom() {
     float savedZero = prefs.getFloat("adcZero", -1.0);  // -1 = not set
     prefs.end();
     
-    // REV 10.9: Validate EEPROM value against the same middle-20% range used for calibration.
-    // If a bad calibration was saved previously (e.g., sensor under vacuum), the stored value
-    // will be out of range and we fall back to the factory default. This fixes devices that
-    // already have a corrupt EEPROM value — they self-heal on the next reboot.
+    // REV 10.32: Validate EEPROM value against the full 12-bit ADC range (1-4095).
+    // Previously (REV 10.9) used the ±10% range (~868-1060), which rejected valid
+    // calibrations from sensors with significantly different zero offsets (e.g., 670).
+    // Now any value within the 12-bit range is accepted.  A warning is printed if the
+    // value is far from the factory default, but it is NOT rejected.
     if (savedZero >= CAL_RANGE_MIN && savedZero <= CAL_RANGE_MAX) {
-        // Stored value is within the valid calibration range — use it
+        // Stored value is within the valid 12-bit ADC range — use it
         adcZeroPressure = savedZero;
         Serial.printf("[CAL] Loaded pressure zero from EEPROM: %.2f (valid range: %.0f-%.0f)\r\n",
                       adcZeroPressure, CAL_RANGE_MIN, CAL_RANGE_MAX);
+
+        // Warn if far from factory default (sensor may need inspection, but don't override)
+        float deviationPercent = fabsf((savedZero - ADC_ZERO_FACTORY_DEFAULT) / ADC_ZERO_FACTORY_DEFAULT) * 100.0f;
+        if (deviationPercent > CAL_WARNING_TOLERANCE_PERCENT) {
+            Serial.printf("[CAL] NOTE: EEPROM value %.2f is %.1f%% from factory default %.2f — "
+                          "sensor may have a different zero offset (this is OK)\r\n",
+                          savedZero, deviationPercent, ADC_ZERO_FACTORY_DEFAULT);
+        }
     } else if (savedZero > 0) {
-        // Value exists but is out of range — bad calibration from a prior firmware version
+        // Value exists but is completely out of 12-bit range — corrupted EEPROM data
         adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
-        Serial.printf("[CAL] WARNING: EEPROM value %.2f OUT OF RANGE (%.0f-%.0f) — using factory default %.2f\r\n",
+        Serial.printf("[CAL] WARNING: EEPROM value %.2f OUT OF 12-BIT RANGE (%.0f-%.0f) — using factory default %.2f\r\n",
                       savedZero, CAL_RANGE_MIN, CAL_RANGE_MAX, ADC_ZERO_FACTORY_DEFAULT);
-        Serial.printf("[CAL] Previous calibration was likely done under pressure — re-calibrate at ambient air\r\n");
+        Serial.printf("[CAL] EEPROM data may be corrupted — re-calibrate at ambient air\r\n");
     } else {
         // No calibration saved — first boot or EEPROM cleared
         adcZeroPressure = ADC_ZERO_FACTORY_DEFAULT;
@@ -2740,16 +2809,26 @@ void calibratePressureSensorZeroPoint() {
     // Since rawADC = oldZero + (oldPressure × slope):
     float newZero = oldZero + (oldPressure * pressureSlope12bit);
     
-    // REV 10.9: Strict range validation — middle 20% of scale (factory default ±10%).
-    // Prevents calibrating under pressure: e.g., at -6 IWC → newZero ≈ 827 → REJECTED.
-    // Old range (200-1800) was too wide and accepted nearly any value including bad calibrations.
-    // New range (~868-1060) ensures the sensor must be near atmospheric (0.0 IWC) to calibrate.
+    // REV 10.32: Accept any value within the 12-bit ADC range (1-4095).
+    // Only reject truly impossible values (0 or >4095).  Print a WARNING
+    // (not rejection) if the value is far from the factory default.
     if (newZero < CAL_RANGE_MIN || newZero > CAL_RANGE_MAX) {
-        Serial.printf("[CAL] REJECTED: new zero %.2f outside allowed range (%.0f-%.0f)\r\n",
+        Serial.printf("[CAL] REJECTED: new zero %.2f outside 12-bit ADC range (%.0f-%.0f)\r\n",
                       newZero, CAL_RANGE_MIN, CAL_RANGE_MAX);
-        Serial.printf("[CAL] Sensor may be under pressure — calibrate ONLY at ambient air\r\n");
-        Serial.printf("[CAL] Current reading: %.2f IWC (should be near 0.0 for calibration)\r\n", oldPressure);
+        Serial.printf("[CAL] This indicates a hardware fault or disconnected sensor\r\n");
+        Serial.printf("[CAL] Current reading: %.2f IWC, old zero: %.2f\r\n", oldPressure, oldZero);
         return;
+    }
+
+    // Warn (but do NOT reject) if the new zero is far from the factory default.
+    // This helps catch accidental calibrations under pressure while still allowing
+    // sensors with different zero offsets (e.g., 670 raw ADC at atmospheric).
+    float deviationPercent = fabsf((newZero - ADC_ZERO_FACTORY_DEFAULT) / ADC_ZERO_FACTORY_DEFAULT) * 100.0f;
+    if (deviationPercent > CAL_WARNING_TOLERANCE_PERCENT) {
+        Serial.printf("[CAL] WARNING: new zero %.2f is %.1f%% from factory default %.2f\r\n",
+                      newZero, deviationPercent, ADC_ZERO_FACTORY_DEFAULT);
+        Serial.printf("[CAL] If the sensor is under vacuum/pressure, re-calibrate at ambient air\r\n");
+        Serial.printf("[CAL] Proceeding with calibration (value is within 12-bit ADC range)\r\n");
     }
     
     adcZeroPressure = newZero;
@@ -3681,7 +3760,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.30</title>
+    <title>Walter IO Board - Rev 10.32</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -3780,7 +3859,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.31</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.32</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -4278,9 +4357,9 @@ const char* control_html = R"rawliteral(
             if(!inputEl || !resultEl) return;
 
             var adcValue=parseFloat(inputEl.value);
-            if(isNaN(adcValue) || adcValue < 0){
+            if(isNaN(adcValue) || adcValue < 1 || adcValue > 4095){
                 resultEl.style.color='#ff6b6b';
-                resultEl.textContent='Invalid ADC value - must be a positive number';
+                resultEl.textContent='Invalid ADC value - must be between 1 and 4095 (12-bit range)';
                 return;
             }
 
@@ -5710,14 +5789,13 @@ void startConfigAP() {
         }
         // =========================================================
         // SET MANUAL ADC ZERO — User-supplied ADC zero point value
-        // Validates against MANUAL_ADC_MIN/MAX (broader than CAL_RANGE for flexibility).
+        // Validates against global CAL_RANGE_MIN/MAX (1-4095, full 12-bit ADC range).
         // Returns the new adcZero value on success, or error on invalid range.
         // =========================================================
+        // REV 10.32: Uses global CAL_RANGE_MIN/MAX (1-4095) instead of local 500-2000.
         else if (cmd == "set_manual_adc_zero") {
             float newAdcZero = val.toFloat();
-            const float MANUAL_ADC_MIN = 500.0;   // Allow broader range for manual entry
-            const float MANUAL_ADC_MAX = 2000.0;  // ADS1015 12-bit: 0-4095, pressure ~500-2000
-            if (newAdcZero >= MANUAL_ADC_MIN && newAdcZero <= MANUAL_ADC_MAX) {
+            if (newAdcZero >= CAL_RANGE_MIN && newAdcZero <= CAL_RANGE_MAX) {
                 executeRemoteCommand(cmd, val);
                 char resp[128];
                 snprintf(resp, sizeof(resp),
@@ -5725,12 +5803,12 @@ void startConfigAP() {
                          adcZeroPressure);
                 request->send(200, "application/json", resp);
             } else {
-                Serial.printf("[WEB CMD] Manual ADC zero %.2f outside valid range (%.0f-%.0f)\r\n",
-                             newAdcZero, MANUAL_ADC_MIN, MANUAL_ADC_MAX);
+                Serial.printf("[WEB CMD] Manual ADC zero %.2f outside 12-bit ADC range (%.0f-%.0f)\r\n",
+                             newAdcZero, CAL_RANGE_MIN, CAL_RANGE_MAX);
                 char resp[192];
                 snprintf(resp, sizeof(resp),
-                         "{\"command\":\"set_manual_adc_zero\",\"success\":false,\"error\":\"ADC value outside valid range (%.0f-%.0f)\"}",
-                         MANUAL_ADC_MIN, MANUAL_ADC_MAX);
+                         "{\"command\":\"set_manual_adc_zero\",\"success\":false,\"error\":\"ADC value outside valid 12-bit range (%.0f-%.0f)\"}",
+                         CAL_RANGE_MIN, CAL_RANGE_MAX);
                 request->send(400, "application/json", resp);
             }
         }
@@ -6634,13 +6712,38 @@ bool processCompleteSerialMessage(const char* msg, uint16_t msgLen) {
         // Only fast-path NUMERIC modes (0-9).
         // String modes like "shutdown"/"normal" start with '"' and need
         // special handling in parsedSerialData() — skip them here.
+        // REV 10.32: Every outcome now logged so mode processing is NEVER silent.
         if (*valStart >= '0' && *valStart <= '9') {
             int fastMode = atoi(valStart);
-            if (fastMode >= 0 && fastMode <= 9 &&
-                !failsafeMode && !manualRelayOverride && !testRunning &&
-                (uint8_t)fastMode != currentRelayMode) {
+            if (fastMode < 0 || fastMode > 9) {
+                // Out-of-range numeric mode — let parsedSerialData() handle it
+                Serial.printf("[SERIAL FAST-PATH] Mode %d out of range (0-9), deferring to parsedSerialData()\r\n",
+                              fastMode);
+            } else if (failsafeMode) {
+                // Failsafe mode is active — ESP32 autonomously controls relays, Linux mode ignored
+                Serial.printf("[SERIAL FAST-PATH] Mode %d BLOCKED — failsafe mode active (ESP32 owns relays)\r\n",
+                              fastMode);
+            } else if (manualRelayOverride) {
+                // Web portal manual toggle in effect — Linux mode commands blocked until exit_manual
+                Serial.printf("[SERIAL FAST-PATH] Mode %d BLOCKED — manual relay override active "
+                              "(send exit_manual to clear)\r\n", fastMode);
+            } else if (testRunning) {
+                // Web portal test in progress — Linux mode commands blocked until test ends
+                Serial.printf("[SERIAL FAST-PATH] Mode %d BLOCKED — web test '%s' in progress "
+                              "(elapsed %lus, ESP32 owns relays)\r\n",
+                              fastMode, activeTestType.c_str(),
+                              (millis() - testStartTime) / 1000);
+            } else if ((uint8_t)fastMode == currentRelayMode) {
+                // Same mode already active — no relay write needed (most common case for
+                // periodic data payloads that repeat the same mode every 15 seconds)
+                Serial.printf("[SERIAL FAST-PATH] Mode %d already active — no relay change needed\r\n",
+                              fastMode);
+            } else {
+                // All guards passed, mode is different — apply immediately
+                Serial.printf("[SERIAL FAST-PATH] Mode change: %d → %d — applying to relays NOW\r\n",
+                              currentRelayMode, fastMode);
                 setRelaysForMode((uint8_t)fastMode);
-                Serial.printf("[SERIAL] FAST MODE %d applied in processCompleteSerialMessage()\r\n",
+                Serial.printf("[SERIAL FAST-PATH] Mode %d applied successfully (relays updated)\r\n",
                               fastMode);
             }
         }
@@ -6720,6 +6823,7 @@ void readSerialData() {
     static bool     rxMessageStarted     = false;
     static bool     startupSyncComplete  = false;
     static unsigned long rxMessageStartTime = 0;
+    static unsigned long lastSerialRxTime   = 0;  // REV 10.32: Actual millis() of last data received
 
     // Debug state
     static bool debugPrinted = false;
@@ -6793,6 +6897,7 @@ void readSerialData() {
                 braceDepth       = 0;
                 rxMessageStarted = true;
                 rxMessageStartTime = millis();
+                lastSerialRxTime   = millis();  // REV 10.32: Track actual receive time for idle counter
                 noSerialCount    = 0;
                 resetSerialWatchdog();
             }
@@ -6861,14 +6966,22 @@ void readSerialData() {
     }
 
     // ─── IDLE TRACKING ─────────────────────────────────────────────────────
-    // If no message is in progress and nothing is available, count idle polls.
-    // This drives the "no serial data" warning on the debug console.
+    // REV 10.32: Replaced poll-count formula with actual millis() elapsed time.
+    // The old counter assumed readSerialData() was called every 100ms, but since
+    // REV 10.31 it runs every ~1ms.  The old formula showed wildly wrong times.
+    // Now we track the real timestamp of the last received byte and print the
+    // actual elapsed milliseconds.  Prints every 2 seconds when idle.
     // ───────────────────────────────────────────────────────────────────────
     if (!rxMessageStarted && Serial1.available() == 0) {
-        noSerialCount++;
-        // Warn every ~10 seconds (100 polls at readInterval=100ms)
-        if (noSerialCount % 100 == 0 && noSerialCount > 0) {
-            Serial.printf("[SERIAL] No data received for %u seconds\r\n", noSerialCount / 10);
+        static unsigned long lastIdlePrintTime = 0;
+        unsigned long now = millis();
+        unsigned long idleMs = now - lastSerialRxTime;
+
+        // Print idle warning every 2 seconds (but only after at least 200ms idle
+        // to avoid spamming right after a message is processed)
+        if (idleMs >= 200 && (now - lastIdlePrintTime >= 2000)) {
+            Serial.printf("[SERIAL] No data received for %lu ms\r\n", idleMs);
+            lastIdlePrintTime = now;
         }
     }
 }
@@ -8559,7 +8672,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.25                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.32                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -8724,7 +8837,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.25 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.32 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
