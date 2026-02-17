@@ -861,6 +861,8 @@ void   loadPressureCalibrationFromEeprom();
 void   savePressureCalibrationToEeprom();
 void   calibratePressureSensorZeroPoint();
 void   notifyPythonOfCommand(const char* command, const char* value);
+void   refreshCellSignalInfo();
+bool   sendStatusUpdateViaSocket();
 void   executeRemoteCommand(String cmd, String value);
 
 // =====================================================================
