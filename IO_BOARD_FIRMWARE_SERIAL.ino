@@ -66,6 +66,12 @@
  *  - PYTHON FIX: Implemented send_mode_immediate() in modem.py — this method was
  *    called by io_manager.py but never existed, so mode changes had up to 15-second
  *    delay (fell through to periodic _send_cycle timer).  Now instant.
+ *  - STATUS UPDATE: Enhanced daily CBOR status reporting to port 5686 with comprehensive
+ *    diagnostics and troubleshooting information. Now sends immediately after cellular
+ *    init completes (plus every 24 hours). Includes device ID, firmware version, cellular
+ *    info (RSRP/RSRQ/band/operator/MCC/MNC/CID/TAC), MAC address, IMEI, IMSI, ICCID,
+ *    SD card status, and PLC type. Added manual trigger command "send_status" for testing.
+ *    Improved error logging and field validation for reliable server communication.
  *
  *  Rev 10.29 (2/16/2026) - Profile-Specific Fault Code Mappings Implementation
  *  - IMPLEMENTED: Complete profile-specific fault code mappings as specified
@@ -1356,6 +1362,7 @@ static unsigned int sendInterval;
 static unsigned int parseSDInterval=15000;
 #define STATUS_INTERVAL 86400000       // 24 hours in milliseconds - daily unified status report
 unsigned long lastDailyStatusTime = 0; // Tracks when last daily status was sent to port 5686
+bool forceInitialStatusSend = true;    // REV 10.33: Send status immediately after cellular init (for testing)
 int lastParseTime = 0 ;
 String DeviceName = "";  // Device name (e.g., "RND-0007", "CSX-1234")
 bool firstLostComm = 0;
@@ -2004,6 +2011,20 @@ void executeRemoteCommand(String cmd, String value) {
         // calibratePressureSensorZeroPoint() sends its own response to Serial1
         Serial.println("[CMD] Pressure calibration executed.");
     }
+    // --- Send Status Update ---
+    // Manually triggers a CBOR status update to the server (port 5686).
+    // Useful for testing and verification of the daily status functionality.
+    // REV 10.33: Added for debugging daily status issues.
+    else if (cmd == "send_status") {
+        Serial.println("[CMD] Manual status update triggered");
+        refreshCellSignalInfo();
+        if (sendStatusUpdateViaSocket()) {
+            Serial.println("[CMD] Status update sent successfully");
+        } else {
+            Serial.println("[CMD] Status update send failed");
+        }
+    }
+
     // --- Set Manual ADC Zero ---
     // Allows user to manually set the ADC zero point for pressure sensor calibration.
     // Unlike calibrate_pressure (which reads the live ADC), this accepts a user-supplied value.
@@ -5797,6 +5818,13 @@ void startConfigAP() {
                      "{\"ok\":true,\"adcZero\":%.2f}", adcZeroPressure);
             request->send(200, "application/json", resp);
         }
+        // SEND STATUS UPDATE — Manually trigger CBOR status update to server
+        // Useful for testing the daily status functionality without waiting 24 hours.
+        else if (cmd == "send_status") {
+            executeRemoteCommand(cmd, val);
+            Serial.println("[WEB CMD] Manual status update triggered");
+            request->send(200, "application/json", "{\"status\":\"Status update sent\"}");
+        }
         // =========================================================
         // SET MANUAL ADC ZERO — User-supplied ADC zero point value
         // Validates against global CAL_RANGE_MIN/MAX (1-4095, full 12-bit ADC range).
@@ -9035,21 +9063,55 @@ void loop() {
     
     // =====================================================================
     // DAILY STATUS MESSAGE (Unified 15-element format - sends to port 5686)
-    // Sends once on first boot and then every 24 hours.
+    // Sends immediately after cellular init completes, then every 24 hours.
     // REV 10.13: Gated on cellularInitComplete — needs LTE connection for socket send.
+    // REV 10.33: Enhanced logging and diagnostics for troubleshooting.
     // =====================================================================
-    if (cellularInitComplete && (lastDailyStatusTime == 0 || currentTime - lastDailyStatusTime >= STATUS_INTERVAL)) {
-        Serial.println("##################################################");
-        Serial.println("##### DAILY STATUS - IO_Board (Unified Format) ####");
-        Serial.println("##################################################");
-        refreshCellSignalInfo();
-        if (sendStatusUpdateViaSocket()) {
-            Serial.println("##### Status sent successfully #####");
+    if (cellularInitComplete && (forceInitialStatusSend || lastDailyStatusTime == 0 || currentTime - lastDailyStatusTime >= STATUS_INTERVAL)) {
+        Serial.println("\n==================================================");
+        Serial.println("📊 DAILY STATUS UPDATE - IO_Board (Unified Format)");
+        Serial.println("==================================================");
+
+        // Log timing info
+        if (lastDailyStatusTime == 0) {
+            Serial.println("📅 First status update after boot");
         } else {
-            Serial.println("##### Status send failed #####");
+            unsigned long hoursElapsed = (currentTime - lastDailyStatusTime) / 3600000UL;
+            Serial.printf("📅 %lu hours since last status update\r\n", hoursElapsed);
         }
-        Serial.println("##################################################");
+
+        // Refresh cellular info before sending
+        Serial.println("📡 Refreshing cellular signal info...");
+        refreshCellSignalInfo();
+
+        // Build and send CBOR status
+        Serial.println("📤 Building CBOR status payload...");
+        size_t cborSize = buildStatusCbor(cborBuffer, sizeof(cborBuffer));
+
+        if (cborSize > 0) {
+            Serial.printf("📦 CBOR payload built: %u bytes\r\n", cborSize);
+
+            // Log some key fields for verification
+            Serial.printf("   Device ID: %d\r\n", String(deviceName).startsWith("CSX-") ?
+                         String(deviceName).substring(4).toInt() :
+                         String(deviceName).substring(String(deviceName).lastIndexOf("-") + 1).toInt());
+            Serial.printf("   Firmware: %s\r\n", ver.c_str());
+            Serial.printf("   MAC: %s\r\n", macStr.c_str());
+            Serial.printf("   IMEI: %s\r\n", imei.c_str());
+
+            Serial.println("🌐 Sending via UDP to server:167.172.15.241:5686...");
+            if (sendCborDataViaSocket(cborBuffer, cborSize)) {
+                Serial.println("✅ Status update sent successfully!");
+            } else {
+                Serial.println("❌ Status update send failed - check cellular connection");
+            }
+        } else {
+            Serial.println("❌ Failed to build CBOR status payload");
+        }
+
+        Serial.println("==================================================\n");
         lastDailyStatusTime = currentTime;
+        forceInitialStatusSend = false;  // Clear flag after first send
     }
     
     // Refresh cell signal info every 60 seconds for web dashboard and serial JSON
