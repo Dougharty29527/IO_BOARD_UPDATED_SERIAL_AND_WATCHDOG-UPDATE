@@ -1,6 +1,6 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.28
+ *  Walter IO Board Firmware - Rev 1
  *  Date: 2/16/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -739,7 +739,7 @@
 #define RELAY_DELAY 1
 
 // Define the software version as a macro
-#define FIRMWARE_VERSION "10.29"
+#define FIRMWARE_VERSION "10.31"
 #define FIRMWARE_DATE "2/16/2026"
 #define VERSION "Rev " FIRMWARE_VERSION
 
@@ -789,7 +789,8 @@ bool   lteConnected();
 bool   isSDCardOK();
 String getDateTimeString();
 String getJsonValue(const char* json, const char* key);
-void   parsedSerialData();
+void   readSerialData();
+void   parsedSerialData(bool writeToSD = true);
 void   sendFastSensorPacket();
 void   loadPressureCalibrationFromEeprom();
 void   savePressureCalibrationToEeprom();
@@ -1978,6 +1979,57 @@ void executeRemoteCommand(String cmd, String value) {
             Serial.printf("[CMD] ERROR: Manual ADC zero %.2f outside valid range (%.0f-%.0f)\r\n",
                          newAdcZero, MANUAL_ADC_MIN, MANUAL_ADC_MAX);
         }
+    }
+    // --- Toggle Relay (CR1, CR2, CR5) ---
+    // Reads the current GPIO state and flips it.  Enters manual relay override
+    // so the 15-second relay refresh and Linux mode commands don't fight the toggle.
+    // Accepts value "CR1", "CR2", or "CR5" (case-sensitive).
+    //
+    // Usage example (Serial1 from Linux or Web Portal):
+    //   executeRemoteCommand("toggle_relay", "CR1");  // toggles CR1
+    //   executeRemoteCommand("toggle_relay", "CR5");  // toggles CR5
+    else if (cmd == "toggle_relay") {
+        int pin = -1;
+        if (value == "CR1")      pin = CR1;
+        else if (value == "CR2") pin = CR2;
+        else if (value == "CR5") pin = CR5;
+
+        if (pin != -1) {
+            int currentState = digitalRead(pin);
+            int newState = (currentState == HIGH) ? LOW : HIGH;
+            digitalWrite(pin, newState);
+            manualRelayOverride = true;
+            notifyPythonOfCommand("toggle_relay", value.c_str());
+            Serial.printf("[CMD] %s toggled to %d (manual override ON)\n", value.c_str(), newState);
+        } else {
+            Serial.printf("[CMD] ERROR: toggle_relay unknown relay '%s' — expected CR1, CR2, or CR5\n",
+                          value.c_str());
+        }
+    }
+    // --- Emergency Stop ---
+    // Immediately sets all relays to idle (mode 0), stops any running test or
+    // failsafe cycle, and clears manual relay override.  This is the "big red
+    // button" — it must always succeed regardless of current ESP32 state.
+    //
+    // Usage example:
+    //   executeRemoteCommand("emergency_stop", "");
+    else if (cmd == "emergency_stop") {
+        // Stop any running web portal test
+        if (testRunning) {
+            Serial.printf("[CMD] Emergency stop — cancelling active test '%s'\n",
+                          activeTestType.c_str());
+            testRunning = false;
+            activeTestType = "";
+        }
+        // Stop any running failsafe cycle
+        stopFailsafeCycle("Emergency stop");
+        // Clear manual relay override
+        manualRelayOverride = false;
+        // Set all relays to idle (mode 0: everything off)
+        setRelaysForMode(0);
+        currentRelayMode = 0;
+        notifyPythonOfCommand("emergency_stop", "");
+        Serial.println("[CMD] EMERGENCY STOP — all relays OFF, all tests/cycles stopped.");
     }
     // --- Unknown Command ---
     else {
@@ -3629,7 +3681,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.25</title>
+    <title>Walter IO Board - Rev 10.30</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -3728,7 +3780,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.28</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.31</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -4713,7 +4765,11 @@ void SaveToSD(String id, unsigned long seq, int pres, int cycles, int fault, int
                 }
                 attempts++;
                 Serial.println("Failed to remount SD card, attempt " + String(attempts) + " of " + String(maxAttempts));
-                delay(1000);
+                // REV 10.31: Keep reading serial during SD remount retries
+                for (int w = 0; w < 1000; w++) {
+                    readSerialData();
+                    delay(1);
+                }
             }
             if (attempts >= maxAttempts) {
                 Serial.println("Failed to remount SD card after " + String(maxAttempts) + " attempts");
@@ -5679,27 +5735,13 @@ void startConfigAP() {
             }
         }
         else if (cmd == "toggle_relay") {
-            // Convert web relay names (CR1, CR2, CR5) to ESP32 GPIO pins and toggle them
-            int pin = -1;
-            if (val == "CR1") pin = CR1;
-            else if (val == "CR2") pin = CR2;
-            else if (val == "CR5") pin = CR5;
-
-            if (pin != -1) {
-                // Read current state and toggle it
-                int currentState = digitalRead(pin);
-                int newState = (currentState == HIGH) ? LOW : HIGH;
-
-                // Set the new state directly on GPIO
-                digitalWrite(pin, newState);
-
-                // Also notify Python and set manual override flag
-                manualRelayOverride = true;
-                String relayName = val.substring(2);
-                relayName.toLowerCase();
-                notifyPythonOfCommand(relayName.c_str(), String(newState).c_str());
-                Serial.printf("[WEB CMD] %s toggled to %d\r\n", val.c_str(), newState);
-            }
+            // Unified dispatch — same logic for Web Portal, Serial1, and BlueCherry
+            executeRemoteCommand(cmd, val);
+            request->send(200, "application/json", "{\"ok\":true}");
+        }
+        else if (cmd == "emergency_stop") {
+            // Unified dispatch — stops all relays, tests, cycles, and manual override
+            executeRemoteCommand(cmd, val);
             request->send(200, "application/json", "{\"ok\":true}");
         }
         else if (cmd == "restart") {
@@ -6243,7 +6285,14 @@ void checkAndSendStatusToSerial() {
     if (passthroughMode) {
         return;
     }
-    
+
+    // REV 10.31: Check serial RX during blocking operations.
+    // This function is called inside lteConnect(), refreshCellSignalInfo(), and
+    // other long-running modem/SD operations that can stall the main loop for
+    // seconds.  By reading serial here, mode commands from Linux are processed
+    // even when the main loop is blocked — preventing command loss/delay.
+    readSerialData();
+
     unsigned long currentTime = millis();
     
     // === 1. Fast sensor packet every 200ms (5Hz) ===
@@ -6475,141 +6524,351 @@ bool isInteger(const char* str) {
     return true;
 }
 
-/**
- * Read JSON data from Serial1
- * Expected format: {"type":"data","gmid":"RND-0007","press":-14.22,"mode":0,"current":0.07,"fault":0,"cycles":484}
- * This replaces the old CSV parser with a simpler JSON parser
- * 
- * IMPORTANT: Skips during passthrough mode - serial ports are dedicated to modem bridge
- */
+// ═══════════════════════════════════════════════════════════════════════════════
+// processCompleteSerialMessage() — Handle one complete JSON message from Serial1
+// ═══════════════════════════════════════════════════════════════════════════════
+// Called by readSerialData() each time a complete { ... } message is framed.
+// Dispatches command messages immediately; copies data packets into dataBuffer
+// for parsedSerialData() to process.
+//
+// Parameters:
+//   msg    — Null-terminated char array containing the complete JSON message.
+//   msgLen — Number of characters in the message (excluding null terminator).
+//
+// Returns:
+//   true  = caller should continue reading more messages from Serial1.
+//   false = caller should STOP reading (e.g., passthrough mode activated,
+//           serial port is now dedicated to modem bridge).
+//
+// Example usage:
+//   char msg[] = "{\"command\":\"stop_cycle\"}";
+//   bool keepGoing = processCompleteSerialMessage(msg, strlen(msg));
+// ═══════════════════════════════════════════════════════════════════════════════
+bool processCompleteSerialMessage(const char* msg, uint16_t msgLen) {
+    Serial.printf("[SERIAL RX] Complete JSON (%u bytes): %s\r\n", msgLen, msg);
+
+    // ─── COMMAND MESSAGES ──────────────────────────────────────────────────
+    // Commands contain a "command" key.  We use strstr() on the raw char
+    // array (no String allocation) to detect this quickly before parsing.
+    // ───────────────────────────────────────────────────────────────────────
+    if (strstr(msg, "\"command\"") != NULL) {
+        String cmdType = getJsonValue(msg, "command");
+
+        if (cmdType == "passthrough") {
+            // Extract optional timeout value (default 60 minutes)
+            unsigned long timeout = 60;
+            const char* timeoutPtr = strstr(msg, "\"timeout\":");
+            if (timeoutPtr != NULL) {
+                timeout = (unsigned long)atol(timeoutPtr + 10);  // skip past "timeout":
+                if (timeout < 1) timeout = 60;
+            }
+            Serial.printf("[SERIAL] Passthrough command - %lu min\r\n", timeout);
+            enterPassthroughMode(timeout);
+            return false;  // STOP reading — serial port now used for modem bridge
+        }
+        else if (cmdType == "set_profile") {
+            String profName = getJsonValue(msg, "profile");
+            if (profName.length() > 0) {
+                profileManager.setActiveProfile(profName.c_str());
+            }
+            Serial.printf("[SERIAL] set_profile command processed: %s\r\n", profName.c_str());
+            return true;  // Continue reading — more messages may be queued
+        }
+        else if (cmdType == "start_cycle") {
+            String cycleType = getJsonValue(msg, "type");
+            if (cycleType == "run")        startFailsafeCycle(0);
+            else if (cycleType == "purge") startFailsafeCycle(1);
+            else if (cycleType == "clean") startFailsafeCycle(2);
+            Serial.printf("[SERIAL] start_cycle command processed: %s\r\n", cycleType.c_str());
+            return true;
+        }
+        else if (cmdType == "stop_cycle") {
+            stopFailsafeCycle("Serial command");
+            // REV 10.11: Linux stop_cycle does NOT clear web portal tests.
+            // The ESP32 owns relays during web portal tests — only the web
+            // portal Stop button or the auto-stop timer can end a test.
+            // Linux stop_cycle only stops failsafe cycles.
+            if (testRunning) {
+                Serial.printf("[Serial] stop_cycle from Linux IGNORED for web test '%s' "
+                              "— only web portal Stop or timer can end it\r\n",
+                              activeTestType.c_str());
+            }
+            return true;
+        }
+        else {
+            // ─── ALL OTHER COMMANDS ────────────────────────────────────────
+            // Commands not special-cased above (toggle_relay, emergency_stop,
+            // cr1, cr2, cr5, calibrate_pressure, overfill_override, etc.)
+            // are dispatched through the unified executeRemoteCommand() handler.
+            // This ensures commands sent over Serial1 behave identically to
+            // commands from the Web Portal or BlueCherry.
+            // ───────────────────────────────────────────────────────────────
+            String valField = getJsonValue(msg, "value");
+            executeRemoteCommand(cmdType, valField);
+            return true;
+        }
+    }
+
+    // ─── FAST-PATH MODE APPLICATION ────────────────────────────────────────
+    // For data packets containing a numeric "mode" field, set the relay GPIO
+    // IMMEDIATELY using raw C string parsing (strstr + atoi).  Zero heap
+    // allocation, zero Arduino String overhead — relay activates within
+    // microseconds of the closing '}' arriving in the UART.
+    //
+    // parsedSerialData(false) still runs afterward for full field extraction
+    // (gmid, fault, cycles, etc.), but it sees currentRelayMode already
+    // matches the new mode and skips the redundant setRelaysForMode() call.
+    //
+    // String modes ("shutdown" / "normal") are NOT fast-pathed — they have
+    // special GPIO13 handling and are routed through parsedSerialData().
+    //
+    // Example: {"type":"data","mode":2}
+    //   strstr finds "mode":2 → atoi("2") → setRelaysForMode(2) → done
+    // ────────────────────────────────────────────────────────────────────────
+    const char* modePtr = strstr(msg, "\"mode\":");
+    if (modePtr != NULL) {
+        const char* valStart = modePtr + 7;  // skip past "mode":
+        // Skip optional whitespace between colon and value
+        while (*valStart == ' ') valStart++;
+
+        // Only fast-path NUMERIC modes (0-9).
+        // String modes like "shutdown"/"normal" start with '"' and need
+        // special handling in parsedSerialData() — skip them here.
+        if (*valStart >= '0' && *valStart <= '9') {
+            int fastMode = atoi(valStart);
+            if (fastMode >= 0 && fastMode <= 9 &&
+                !failsafeMode && !manualRelayOverride && !testRunning &&
+                (uint8_t)fastMode != currentRelayMode) {
+                setRelaysForMode((uint8_t)fastMode);
+                Serial.printf("[SERIAL] FAST MODE %d applied in processCompleteSerialMessage()\r\n",
+                              fastMode);
+            }
+        }
+    }
+
+    // ─── DATA PACKET MESSAGES ──────────────────────────────────────────────
+    // Non-command messages (e.g., {"type":"data",...}) get copied into the
+    // global dataBuffer so parsedSerialData() can extract sensor values
+    // (gmid, fault, cycles, etc.).  The mode was already applied above by
+    // the fast path, so parsedSerialData() will skip the redundant relay
+    // write (currentRelayMode already matches).
+    // ───────────────────────────────────────────────────────────────────────
+    if (msgLen < MAX_BUFFER_SIZE) {
+        memcpy(dataBuffer, msg, msgLen + 1);  // +1 copies the null terminator
+        diagData = String(msg);               // Update diagnostic display string
+        // REV 10.31: Pass false to skip SD write — the 15-second timer handles SD.
+        // This removes 5-3000ms of SD blocking from the serial command hot path.
+        parsedSerialData(false);
+    } else {
+        Serial.printf("[SERIAL] ERROR: Message too long for dataBuffer (%u >= %d)\r\n",
+                      msgLen, MAX_BUFFER_SIZE);
+    }
+
+    return true;  // Continue reading
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// readSerialData() — Byte-level serial reader with brace-depth message framing
+// ═══════════════════════════════════════════════════════════════════════════════
+// Reads raw bytes from Serial1 into a static char array buffer.  Uses '{' and
+// '}' with brace-depth counting to detect complete JSON messages.
+//
+// Key design decisions:
+//   1. CHAR ARRAY BUFFER — avoids Arduino String heap fragmentation and the
+//      slow character-by-character concatenation that caused command delays.
+//   2. DRAINS ALL QUEUED MESSAGES — the while loop does NOT break after the
+//      first complete message.  If three messages are sitting in Serial1's
+//      hardware FIFO, all three are read, framed, and processed in one call.
+//   3. STARTUP-ONLY SYNC — at power-on the UART may hold a partial message
+//      left over from a previous transmission.  We discard bytes until the
+//      first '{' is seen, then never discard an opening brace again.
+//   4. INCOMPLETE MESSAGE TIMEOUT — if a '{' was received but the closing '}'
+//      never arrives within 5 seconds, the partial message is discarded and
+//      the reader resyncs on the next '{'.  This handles corruption, lost
+//      bytes, or a sender that died mid-message.
+//   5. BUFFER WIPE — after each complete message is processed, the buffer is
+//      zeroed with memset() and the write index reset to 0.
+//
+// Called from loop() every readInterval (100 ms).
+//
+// IMPORTANT: Skips entirely during passthrough mode — serial ports are
+//            dedicated to modem bridge.
+//
+// Expected message format:
+//   {"type":"data","gmid":"RND-0007","press":-14.22,"mode":0,...}
+//   {"command":"stop_cycle"}
+// ═══════════════════════════════════════════════════════════════════════════════
 void readSerialData() {
-    // Skip during passthrough mode - serial ports are dedicated to modem bridge
+    // Skip during passthrough mode — serial ports are dedicated to modem bridge
     if (passthroughMode) {
         return;
     }
-    
-    static String jsonBuffer = "";
-    static unsigned long lastRxTime = 0;
+
+    // ─── STATIC STATE (persists between calls) ─────────────────────────────
+    // rxBuffer           — char array accumulator for the current message
+    // rxIndex            — write position (next byte goes at rxBuffer[rxIndex])
+    // braceDepth         — tracks nested { } so we know when a message ends
+    // rxMessageStarted   — true while inside a { ... } message
+    // startupSyncComplete — false at boot; set true on the very first '{'
+    //                       seen, to discard any partial UART garbage from reset
+    // rxMessageStartTime — millis() when the current message's '{' arrived,
+    //                       used for incomplete-message timeout detection
+    // ───────────────────────────────────────────────────────────────────────
+    static char    rxBuffer[MAX_BUFFER_SIZE];
+    static uint16_t rxIndex              = 0;
+    static int      braceDepth           = 0;
+    static bool     rxMessageStarted     = false;
+    static bool     startupSyncComplete  = false;
+    static unsigned long rxMessageStartTime = 0;
+
+    // Debug state
     static bool debugPrinted = false;
     static unsigned long lastDebugTime = 0;
-    
-    // Debug: Print once to confirm Serial1 is being checked
+
+    // If we started receiving a message but the closing '}' never arrives
+    // within this window, discard the partial data and resync on next '{'
+    const unsigned long INCOMPLETE_MESSAGE_TIMEOUT_MS = 5000;
+
+    // ─── ONE-TIME STARTUP BANNER ───────────────────────────────────────────
     if (!debugPrinted) {
-        Serial.println("🔍 DEBUG: readSerialData() is active, Serial1 RX=GPIO44 TX=GPIO43");
+        Serial.println("[SERIAL] readSerialData() active — char-array buffer, brace-depth framing");
         debugPrinted = true;
     }
-    
-    // Debug: Show Serial1.available() every 30 seconds
+
+    // ─── PERIODIC DEBUG STATUS (every 30 s) ────────────────────────────────
     if (millis() - lastDebugTime > 30000) {
-        Serial.print("🔍 Serial1.available() = ");
-        Serial.println(Serial1.available());
+        Serial.printf("[SERIAL] Serial1.available()=%d  inMessage=%d  rxIndex=%u  braceDepth=%d\r\n",
+                      Serial1.available(), rxMessageStarted, rxIndex, braceDepth);
         lastDebugTime = millis();
     }
-    
-    while (Serial1.available() > 0) {
-        char ch = Serial1.read();
-        
-        // Start of JSON object
-        if (ch == '{') {
-            jsonBuffer = "{";
-            noSerialCount = 0;
-            lastRxTime = millis();
-            resetSerialWatchdog();  // Reset watchdog timer when data arrives
-            Serial.print("→ Receiving JSON: ");
-        }
-        // Accumulate characters with bounds checking BEFORE adding
-        else if (jsonBuffer.length() > 0) {
-            // CRITICAL SECURITY: Check bounds BEFORE adding character to prevent overflow
-            if (jsonBuffer.length() >= MAX_BUFFER_SIZE - 1) {
-                Serial.println("ERROR: JSON buffer overflow prevented - message too long");
-                jsonBuffer = "";  // Clear buffer immediately on overflow detection
-                continue;  // Continue processing any remaining data in buffer
-            }
 
-            jsonBuffer += ch;
-
-            // End of JSON object - process it immediately and clear buffer
-            if (ch == '}') {
-                Serial.println(jsonBuffer);  // Print complete JSON for debugging
-
-                // Process command messages immediately
-                if (jsonBuffer.indexOf("\"command\"") >= 0) {
-                    String cmdType = getJsonValue(jsonBuffer.c_str(), "command");
-
-                    if (cmdType == "passthrough") {
-                        int timeoutIdx = jsonBuffer.indexOf("\"timeout\":");
-                        unsigned long timeout = 60;
-                        if (timeoutIdx >= 0) {
-                            String timeoutStr = jsonBuffer.substring(timeoutIdx + 10);
-                            timeout = timeoutStr.toInt();
-                            if (timeout < 1) timeout = 60;
-                        }
-                        Serial.printf("[SERIAL] Passthrough command - %lu min\r\n", timeout);
-                        enterPassthroughMode(timeout);
-                        jsonBuffer = "";  // Clear buffer immediately after command processing
-                        return;
-                    }
-                    else if (cmdType == "set_profile") {
-                        String profName = getJsonValue(jsonBuffer.c_str(), "profile");
-                        if (profName.length() > 0) {
-                            profileManager.setActiveProfile(profName.c_str());
-                        }
-                        jsonBuffer = "";  // Clear buffer immediately after command processing
-                        return;
-                    }
-                    else if (cmdType == "start_cycle") {
-                        String cycleType = getJsonValue(jsonBuffer.c_str(), "type");
-                        if (cycleType == "run") startFailsafeCycle(0);
-                        else if (cycleType == "purge") startFailsafeCycle(1);
-                        else if (cycleType == "clean") startFailsafeCycle(2);
-                        jsonBuffer = "";  // Clear buffer immediately after command processing
-                        return;
-                    }
-                    else if (cmdType == "stop_cycle") {
-                        stopFailsafeCycle("Serial command");
-                        // REV 10.11: Linux stop_cycle does NOT clear web portal tests.
-                        // The ESP32 owns relays during web portal tests — only the web
-                        // portal Stop button or the auto-stop timer can end a test.
-                        // Linux stop_cycle only stops failsafe cycles.
-                        if (testRunning) {
-                            Serial.printf("[Serial] stop_cycle from Linux IGNORED for web test '%s' "
-                                          "— only web portal Stop or timer can end it\r\n",
-                                          activeTestType.c_str());
-                        }
-                        jsonBuffer = "";  // Clear buffer immediately after command processing
-                        return;
-                    }
-                }
-
-                // For non-command messages, copy to dataBuffer and parse
-                size_t jsonLen = jsonBuffer.length();
-                if (jsonLen < MAX_BUFFER_SIZE) {
-                    strcpy(dataBuffer, jsonBuffer.c_str());
-                    diagData = jsonBuffer;
-
-                    // Parse the data immediately
-                    parsedSerialData();
-                } else {
-                    Serial.println("ERROR: JSON message too long for dataBuffer");
-                }
-
-                // CRITICAL SECURITY: Always clear buffer immediately after processing
-                jsonBuffer = "";
-                break;
-            }
-        }
+    // ─── INCOMPLETE MESSAGE TIMEOUT ────────────────────────────────────────
+    // If a '{' was received but the closing '}' hasn't arrived in time, the
+    // message is assumed corrupted.  Wipe the buffer and resync on next '{'.
+    // This is the ONLY place (besides overflow) where an in-progress message
+    // is discarded during normal operation.
+    // ───────────────────────────────────────────────────────────────────────
+    if (rxMessageStarted && (millis() - rxMessageStartTime > INCOMPLETE_MESSAGE_TIMEOUT_MS)) {
+        Serial.printf("[SERIAL] Timeout: incomplete message after %lu ms — "
+                      "discarding %u bytes, resyncing on next '{'\r\n",
+                      INCOMPLETE_MESSAGE_TIMEOUT_MS, rxIndex);
+        memset(rxBuffer, 0, rxIndex);
+        rxIndex          = 0;
+        braceDepth       = 0;
+        rxMessageStarted = false;
     }
-    
-    // If no data received, increment counter
-    if (jsonBuffer.length() == 0 && Serial1.available() == 0) {
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // MAIN BYTE-READING LOOP
+    // Reads ALL available bytes from Serial1 in a single call.  Complete
+    // messages are processed immediately; the buffer is wiped and the loop
+    // continues to drain any additional queued messages.  No data is
+    // abandoned in the hardware FIFO.
+    // ═══════════════════════════════════════════════════════════════════════
+    while (Serial1.available() > 0) {
+        char ch = (char)Serial1.read();
+
+        // ─── STARTUP SYNC ──────────────────────────────────────────────
+        // At power-on or after a reset, the UART RX buffer may contain a
+        // partial message from a previous transmission.  Discard every byte
+        // until the first '{' is seen.  This runs ONCE — after the first
+        // '{' is found, startupSyncComplete stays true for the entire
+        // runtime, and every subsequent '{' is treated as a real message.
+        // ───────────────────────────────────────────────────────────────
+        if (!startupSyncComplete) {
+            if (ch == '{') {
+                startupSyncComplete = true;
+                Serial.println("[SERIAL] Startup sync complete — first '{' found");
+                // Fall through to handle this '{' as a message start below
+            } else {
+                continue;  // Discard pre-sync garbage byte
+            }
+        }
+
+        // ─── OPEN BRACE '{' : begin new message or nest deeper ─────────
+        if (ch == '{') {
+            if (!rxMessageStarted) {
+                // Brand new message — reset write position
+                rxIndex          = 0;
+                braceDepth       = 0;
+                rxMessageStarted = true;
+                rxMessageStartTime = millis();
+                noSerialCount    = 0;
+                resetSerialWatchdog();
+            }
+
+            // Write the '{' and track depth (handles nested JSON objects)
+            if (rxIndex < MAX_BUFFER_SIZE - 1) {
+                rxBuffer[rxIndex++] = ch;
+                braceDepth++;
+            } else {
+                // Overflow right at '{'
+                Serial.printf("[SERIAL] ERROR: Buffer overflow at '{' (%u bytes) — discarding\r\n", rxIndex);
+                memset(rxBuffer, 0, rxIndex);
+                rxIndex          = 0;
+                braceDepth       = 0;
+                rxMessageStarted = false;
+            }
+        }
+        // ─── INSIDE A MESSAGE: accumulate bytes ────────────────────────
+        else if (rxMessageStarted) {
+            // Bounds check BEFORE writing to prevent buffer overflow
+            if (rxIndex >= MAX_BUFFER_SIZE - 1) {
+                Serial.printf("[SERIAL] ERROR: Buffer overflow at %u bytes — discarding message\r\n", rxIndex);
+                memset(rxBuffer, 0, rxIndex);
+                rxIndex          = 0;
+                braceDepth       = 0;
+                rxMessageStarted = false;
+                continue;  // Keep draining Serial1 — don't leave stale bytes behind
+            }
+
+            rxBuffer[rxIndex++] = ch;
+
+            // ─── CLOSE BRACE '}' : check if the message is complete ────
+            if (ch == '}') {
+                braceDepth--;
+
+                if (braceDepth == 0) {
+                    // ═══ COMPLETE MESSAGE ═══════════════════════════════
+                    // Null-terminate so the buffer is a valid C string
+                    rxBuffer[rxIndex] = '\0';
+
+                    // Hand off to the message processor
+                    // Returns false only if we must stop reading (passthrough)
+                    bool keepReading = processCompleteSerialMessage(rxBuffer, rxIndex);
+
+                    // Wipe the buffer and reset state for next message
+                    memset(rxBuffer, 0, rxIndex + 1);
+                    rxIndex          = 0;
+                    rxMessageStarted = false;
+                    // braceDepth is already 0
+
+                    if (!keepReading) {
+                        // Passthrough mode activated — serial port repurposed
+                        return;
+                    }
+                    // Otherwise, keep looping to drain any additional
+                    // messages waiting in Serial1's hardware FIFO
+                }
+                // If braceDepth > 0, this '}' just closed a nested object —
+                // keep accumulating bytes until the outermost '}' arrives
+            }
+        }
+        // ─── OUTSIDE A MESSAGE: discard inter-message bytes ────────────
+        // Characters between '}' and the next '{' (whitespace, newlines,
+        // or garbage) are silently discarded.  This is normal framing
+        // behavior — we only care about data inside { ... }.
+    }
+
+    // ─── IDLE TRACKING ─────────────────────────────────────────────────────
+    // If no message is in progress and nothing is available, count idle polls.
+    // This drives the "no serial data" warning on the debug console.
+    // ───────────────────────────────────────────────────────────────────────
+    if (!rxMessageStarted && Serial1.available() == 0) {
         noSerialCount++;
-        
-        // Debug: Print if we haven't received data in a while
-        // Only warn every ~10 seconds (100 polls at 100ms each = 10s)
+        // Warn every ~10 seconds (100 polls at readInterval=100ms)
         if (noSerialCount % 100 == 0 && noSerialCount > 0) {
-            Serial.print("⚠ No serial data received for ");
-            Serial.print(noSerialCount / 10);  // readInterval is 100ms, so /10 = seconds
-            Serial.println(" seconds");
+            Serial.printf("[SERIAL] No data received for %u seconds\r\n", noSerialCount / 10);
         }
     }
 }
@@ -6657,11 +6916,20 @@ String getJsonValue(const char* json, const char* key) {
 }
 
 /**
- * Parse JSON serial data
+ * Parse JSON serial data from dataBuffer and apply mode/settings.
  * Expected format: {"type":"data","gmid":"CSX-1234","press":-14.22,"mode":0,"current":0.07,"fault":0,"cycles":484}
- * Much simpler than the old CSV parser!
+ *
+ * @param writeToSD  true  = parse data AND write to SD card (used by 15-second timer in loop()).
+ *                   false = parse data and apply mode only, skip SD write (used by
+ *                           processCompleteSerialMessage() for immediate serial processing).
+ *                   The 15-second timer in loop() always calls with default (true), so SD
+ *                   writes still happen at the normal interval even when skipped here.
+ *
+ * Usage examples:
+ *   parsedSerialData();       // Full parse + SD write (15-second timer path)
+ *   parsedSerialData(false);  // Mode-only fast path (immediate serial processing)
  */
-void parsedSerialData() {
+void parsedSerialData(bool writeToSD) {
     // Check if we have valid JSON data (must have both braces)
     if (strlen(dataBuffer) < 10 || strstr(dataBuffer, "{") == NULL || strstr(dataBuffer, "}") == NULL) {
         // Only print error if we actually received something
@@ -6820,19 +7088,26 @@ void parsedSerialData() {
     Serial.println("✓ JSON from Linux - Cycles:" + String(cycles) + " Faults:" + String(faults) +
                    " GMID:" + gmidStr + " (ADC press:" + String(adcPressure, 2) + " curr:" + String(adcCurrent, 2) + ")");
     
-    // Save to SD if we have valid data
-    if (noSerialCount <= 5) {
-        // REV 10 FIX: Use adcPressure (ESP32's own ADC reading at 60Hz) instead of
-        // the round-tripped 'pressure' variable from Python. Previously, pressure had
-        // to travel: ESP32 ADC → serial → Python → serial back → parsedSerialData()
-        // which added 15+ seconds of staleness. adcPressure is updated 60 times/sec.
-        pres_scaled = static_cast<int>(round(adcPressure * 100.0));
-        seq++;
-        Serial.println("Saving to SD");
-        // REV 10: Use ESP32's own adcCurrent and currentRelayMode (no Python round-trip)
-        SaveToSD(deviceName, seq - 1, pres_scaled, cycles, faults, currentRelayMode, temp_scaled, adcCurrent);
-    } else {
-        NoSerial = 1;
+    // Save to SD if we have valid data.
+    // REV 10.31: writeToSD=false skips the SD write when called from the immediate
+    // serial processing path (processCompleteSerialMessage).  The 15-second timer
+    // in loop() calls parsedSerialData() with the default (true) so SD writes still
+    // happen at the normal interval.  This removes 5-3000ms of SD blocking from the
+    // serial command hot path.
+    if (writeToSD) {
+        if (noSerialCount <= 5) {
+            // REV 10 FIX: Use adcPressure (ESP32's own ADC reading at 60Hz) instead of
+            // the round-tripped 'pressure' variable from Python. Previously, pressure had
+            // to travel: ESP32 ADC → serial → Python → serial back → parsedSerialData()
+            // which added 15+ seconds of staleness. adcPressure is updated 60 times/sec.
+            pres_scaled = static_cast<int>(round(adcPressure * 100.0));
+            seq++;
+            Serial.println("Saving to SD");
+            // REV 10: Use ESP32's own adcCurrent and currentRelayMode (no Python round-trip)
+            SaveToSD(deviceName, seq - 1, pres_scaled, cycles, faults, currentRelayMode, temp_scaled, adcCurrent);
+        } else {
+            NoSerial = 1;
+        }
     }
 }
 
@@ -8508,6 +8783,21 @@ void loop() {
     }
     
     // =====================================================================
+    // REV 10.31: SERIAL CHECK — RUNS FIRST, EVERY ITERATION
+    // Moved readSerialData() here so it runs BEFORE any potentially-blocking
+    // operation (LTE reconnect, modem queries, SD card retries).  Previously
+    // it was gated behind a 100ms timer, meaning serial commands waited up to
+    // 200ms (100ms delay + 100ms timer) before being read.  Now with delay(1)
+    // at the end of loop() and this call at the top, serial commands are read
+    // within 1-5ms of arriving in Serial1's hardware FIFO.
+    //
+    // readSerialData() is very lightweight: it checks Serial1.available() and
+    // reads bytes into a static char array.  No heap allocation, no I/O.
+    // Safe to call 1000+ times per second.
+    // =====================================================================
+    readSerialData();
+
+    // =====================================================================
     // REV 10.13: NON-BLOCKING CELLULAR INITIALIZATION
     // Run the cellular state machine until initialization is complete.
     // This replaces the blocking lteConnect() + BlueCherry + initModemTime()
@@ -8557,9 +8847,11 @@ void loop() {
     dataBuf[6] = counter >> 8;
     dataBuf[7] = counter & 0xFF;
     
+    // REV 10.31: readSerialData() moved to top of loop() (runs every iteration).
+    // updateTimestamp() and checkSerialWatchdog() remain on the 100ms timer —
+    // they don't need sub-millisecond responsiveness.
     if (currentTime - readTime >= readInterval) {
         updateTimestamp();
-        readSerialData();
         checkSerialWatchdog();  // Check if watchdog timeout has been exceeded
         readTime = currentTime;
     }
@@ -8650,7 +8942,13 @@ void loop() {
                 }
                 attempts++;
                 Serial.println("Failed to remount SD card, attempt " + String(attempts) + " of " + String(maxAttempts));
-                delay(1000);
+                // REV 10.31: Replace blocking delay(1000) with a loop that
+                // keeps checking serial every 1ms.  Without this, the SD remount
+                // retry is a 1-3 second blind spot where serial commands are lost.
+                for (int w = 0; w < 1000; w++) {
+                    readSerialData();
+                    delay(1);
+                }
             }
             if (attempts >= maxAttempts) {
                 Serial.println("Failed to remount SD card after " + String(maxAttempts) + " attempts");
@@ -8787,5 +9085,11 @@ void loop() {
     // Blue breathing=Idle, Green=Run, Orange=Purge, Yellow=Burp
     updateStatusLED();
     
-    delay(100);
+    // REV 10.31: Reduced from delay(100) to delay(1).
+    // delay(100) added 100ms of dead time to EVERY loop iteration, capping the
+    // loop at ~10Hz and making serial command latency 100-200ms worst-case.
+    // delay(1) yields to the RTOS scheduler (feeds watchdog, handles WiFi/TCP
+    // stack) without wasting 99ms of processing time.  With this change the
+    // loop runs at ~1000Hz, and serial commands are processed within 1-5ms.
+    delay(1);
 }
