@@ -1,6 +1,6 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.33
+ *  Walter IO Board Firmware - Rev 10.34
  *  Date: 2/17/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -13,7 +13,7 @@
  *  REVISION HISTORY (newest first)
  *  =====================================================================
  *
- *  Rev 10.33 (2/17/2026) - Web Portal Command Isolation
+ *  Rev 10.34 (2/17/2026) - Web Portal Command Isolation + ICCID Status
  *  - SERIAL ISOLATION: Python serial commands are IGNORED when web portal is active
  *    * When testRunning=true (web tests in progress) or manualRelayOverride=true
  *      (manual relay control active), all RS-232 serial messages from Python are
@@ -22,6 +22,11 @@
  *    * Emergency stop and mode commands from Python cannot override web portal.
  *    * Debug warning logged every 30 seconds when commands are being ignored.
  *    * Web portal maintains exclusive control until test/manual mode is cleared.
+ *  - STATUS UPDATE: Added ICCID field to daily CBOR status message
+ *    * Expanded from 15-element to 16-element unified format
+ *    * ICCID field [15] contains SIM card ID (e.g., '89014103211118510720')
+ *    * Updated logging to show ICCID value for verification
+ *    * Maintains compatibility with server-side table structure
  *
  *  Rev 10.32 (2/17/2026) - Serial Command Reliability + Fast-Path Mode Diagnostics
  *  - ARCHITECTURE: Rewrote readSerialData() with char-array buffer and brace-depth
@@ -1362,7 +1367,7 @@ static unsigned int sendInterval;
 static unsigned int parseSDInterval=15000;
 #define STATUS_INTERVAL 86400000       // 24 hours in milliseconds - daily unified status report
 unsigned long lastDailyStatusTime = 0; // Tracks when last daily status was sent to port 5686
-bool forceInitialStatusSend = true;    // REV 10.33: Send status immediately after cellular init (for testing)
+bool forceInitialStatusSend = true;    // REV 10.34: Send status immediately after cellular init (for testing)
 int lastParseTime = 0 ;
 String DeviceName = "";  // Device name (e.g., "RND-0007", "CSX-1234")
 bool firstLostComm = 0;
@@ -2014,7 +2019,7 @@ void executeRemoteCommand(String cmd, String value) {
     // --- Send Status Update ---
     // Manually triggers a CBOR status update to the server (port 5686).
     // Useful for testing and verification of the daily status functionality.
-    // REV 10.33: Added for debugging daily status issues.
+    // REV 10.34: Added for debugging daily status issues.
     else if (cmd == "send_status") {
         Serial.println("[CMD] Manual status update triggered");
         refreshCellSignalInfo();
@@ -3791,7 +3796,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.33</title>
+    <title>Walter IO Board - Rev 10.34</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -3890,7 +3895,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.33</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.34</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -6845,7 +6850,7 @@ void readSerialData() {
         return;
     }
 
-    // REV 10.33: Skip serial processing when web portal has control
+    // REV 10.34: Skip serial processing when web portal has control
     // When web portal tests are running (testRunning) or manual relay override
     // is active (manualRelayOverride), Python serial commands are ignored to
     // prevent interference with web portal operations.
@@ -8218,10 +8223,10 @@ size_t buildStatusCbor(uint8_t* cborBuf, size_t bufSize) {
     int id = idStr.toInt();
     String sdStatus = isSDCardOK() ? "OK" : "FAULT";
     
-    // Create 15-element unified status array (matches RMS Board v0.1.33 format)
-    // Both IO Board and RMS Board populate a common server-side table using this layout.
-    // Server receives on port 5686 and distinguishes format by array length (15 = unified).
-    cbor_encoder_create_array(&encoder, &arrayEncoder, 15);
+    // Create 16-element unified status array (IO Board format with ICCID)
+    // IO Board and RMS Board populate a common server-side table using this layout.
+    // Server receives on port 5686 and distinguishes format by array length (16 = IO Board).
+    cbor_encoder_create_array(&encoder, &arrayEncoder, 16);
     
     // [0] Device ID (integer) - numeric part of device name (e.g., 9199 from "CSX-9199")
     cbor_encode_int(&arrayEncoder, id);
@@ -8267,7 +8272,10 @@ size_t buildStatusCbor(uint8_t* cborBuf, size_t bufSize) {
     
     // [14] TAC - Tracking Area Code (integer) - e.g., 10519
     cbor_encode_int(&arrayEncoder, modemTAC);
-    
+
+    // [15] ICCID - SIM Card ID (string) - e.g., "89014103211118510720"
+    cbor_encode_text_stringz(&arrayEncoder, modemICCID.length() > 0 ? modemICCID.c_str() : "--");
+
     cbor_encoder_close_container(&encoder, &arrayEncoder);
     return cbor_encoder_get_buffer_size(&encoder, cborBuf);
 }
@@ -8728,7 +8736,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.33                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.34                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -8893,7 +8901,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.33 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.34 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
@@ -9065,7 +9073,7 @@ void loop() {
     // DAILY STATUS MESSAGE (Unified 15-element format - sends to port 5686)
     // Sends immediately after cellular init completes, then every 24 hours.
     // REV 10.13: Gated on cellularInitComplete — needs LTE connection for socket send.
-    // REV 10.33: Enhanced logging and diagnostics for troubleshooting.
+    // REV 10.34: Enhanced logging and diagnostics for troubleshooting.
     // =====================================================================
     if (cellularInitComplete && (forceInitialStatusSend || lastDailyStatusTime == 0 || currentTime - lastDailyStatusTime >= STATUS_INTERVAL)) {
         Serial.println("\n==================================================");
@@ -9098,6 +9106,7 @@ void loop() {
             Serial.printf("   Firmware: %s\r\n", ver.c_str());
             Serial.printf("   MAC: %s\r\n", macStr.c_str());
             Serial.printf("   IMEI: %s\r\n", imei.c_str());
+            Serial.printf("   ICCID: %s\r\n", modemICCID.length() > 0 ? modemICCID.c_str() : "--");
 
             Serial.println("🌐 Sending via UDP to server:167.172.15.241:5686...");
             if (sendCborDataViaSocket(cborBuffer, cborSize)) {
