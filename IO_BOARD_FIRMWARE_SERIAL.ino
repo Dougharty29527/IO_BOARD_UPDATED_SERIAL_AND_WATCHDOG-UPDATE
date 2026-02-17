@@ -1,6 +1,6 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.32
+ *  Walter IO Board Firmware - Rev 10.33
  *  Date: 2/17/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,16 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.33 (2/17/2026) - Web Portal Command Isolation
+ *  - SERIAL ISOLATION: Python serial commands are IGNORED when web portal is active
+ *    * When testRunning=true (web tests in progress) or manualRelayOverride=true
+ *      (manual relay control active), all RS-232 serial messages from Python are
+ *      silently discarded to prevent interference with web portal operations.
+ *    * Serial buffer is drained to prevent command queuing during web portal use.
+ *    * Emergency stop and mode commands from Python cannot override web portal.
+ *    * Debug warning logged every 30 seconds when commands are being ignored.
+ *    * Web portal maintains exclusive control until test/manual mode is cleared.
  *
  *  Rev 10.32 (2/17/2026) - Serial Command Reliability + Fast-Path Mode Diagnostics
  *  - ARCHITECTURE: Rewrote readSerialData() with char-array buffer and brace-depth
@@ -3760,7 +3770,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.32</title>
+    <title>Walter IO Board - Rev 10.33</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -3859,7 +3869,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.32</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.33</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -6807,6 +6817,24 @@ void readSerialData() {
         return;
     }
 
+    // REV 10.33: Skip serial processing when web portal has control
+    // When web portal tests are running (testRunning) or manual relay override
+    // is active (manualRelayOverride), Python serial commands are ignored to
+    // prevent interference with web portal operations.
+    if (testRunning || manualRelayOverride) {
+        // Drain serial buffer to prevent command queuing, but don't process
+        while (Serial1.available() > 0) {
+            Serial1.read();  // Discard byte without processing
+        }
+        static unsigned long lastWebPortalWarn = 0;
+        if (millis() - lastWebPortalWarn > 30000) {  // Warn every 30 seconds
+            Serial.printf("[SERIAL] Python commands IGNORED — web portal %s active\r\n",
+                          testRunning ? "test" : "manual relay control");
+            lastWebPortalWarn = millis();
+        }
+        return;
+    }
+
     // ─── STATIC STATE (persists between calls) ─────────────────────────────
     // rxBuffer           — char array accumulator for the current message
     // rxIndex            — write position (next byte goes at rxBuffer[rxIndex])
@@ -8672,7 +8700,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.32                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.33                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -8837,7 +8865,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.32 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.33 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
