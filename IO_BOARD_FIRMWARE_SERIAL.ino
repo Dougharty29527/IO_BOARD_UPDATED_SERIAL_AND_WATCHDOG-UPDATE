@@ -1,7 +1,7 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.34
- *  Date: 2/17/2026
+ *  Walter IO Board Firmware - Rev 10.35
+ *  Date: 2/20/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -12,6 +12,30 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.35 (2/20/2026) - Non-Blocking Firmware Overhaul + Fault Code Corrections
+ *  - BLOCKING ELIMINATION: All blocking operations in loop() now call readSerialData()
+ *    to maintain serial responsiveness during modem, SD card, and network operations.
+ *  - LTE RECONNECT: Replaced blocking lteConnect() (308s worst-case) with non-blocking
+ *    state machine reuse. LTE reconnection now takes ~0ms per loop iteration.
+ *  - RESTART POLICY: ESP only restarts after 24 continuous hours of no LTE, and only
+ *    at the 5:00 AM EST maintenance window. No more aggressive 5-failure reboots.
+ *  - HTTP FIX: Removed ESP.restart() from getHTTPinfo() — HTTP failures are non-fatal.
+ *  - MODEM TIME FIX: initModemTime() now has 10-second timeout (was infinite hang).
+ *    Also fixed logic bug where getClock success skipped result processing.
+ *  - BLUECHERRY FIX: checkFirmwareUpdate() sync loop has 60-second timeout and
+ *    readSerialData() calls. ZTP provisioning calls have serial checks between steps.
+ *  - SOCKET FIX: sendCborArrayViaSocket() and sendCborDataViaSocket() call
+ *    readSerialData() between every modem AT command (socketConfig, socketDial, etc.)
+ *  - SD CARD FIX: initSdLogging(), dataBackfill(), cleanupOldLogFiles() all keep
+ *    serial responsive during blocking SD operations. Fixed hot-removal detection.
+ *  - WATCHDOG FIX: pulseWatchdogPin() keeps serial alive during power cycle pulses.
+ *  - FAULT CODE CORRECTIONS: Confirmed all ESP32 fault codes in CBOR payload:
+ *    * 1024 = IO Board SD Card Failure/Missing
+ *    * 2048 = Watchdog Alarm (No serial data from Python program)
+ *    * 4096 = Failsafe Mode - ESP32 is running system without input from Python Program
+ *    * 8192 = Bluecherry sync is failing to connect
+ *    * 16384 = Passthrough Mode Enabled
  *
  *  Rev 10.34 (2/17/2026) - Web Portal Command Isolation + ICCID Status
  *  - SERIAL ISOLATION: Python serial commands are IGNORED when web portal is active
@@ -804,7 +828,7 @@
 #define RELAY_DELAY 1
 
 // Define the software version as a macro
-#define FIRMWARE_VERSION "10.31"
+#define FIRMWARE_VERSION "10.35"
 #define FIRMWARE_DATE "2/16/2026"
 #define VERSION "Rev " FIRMWARE_VERSION
 
@@ -1039,7 +1063,7 @@ bool manualRelayOverride = false;
 // FAILSAFE MODE GLOBALS (Rev 10 - autonomous relay control when Comfile is down)
 // =====================================================================
 bool failsafeMode = false;                  // True when ESP32 controls relays autonomously
-const int FAILSAFE_FAULT_CODE = 4096;       // REV 10.17: Added to fault code when in failsafe (was 8192)
+//const int FAILSAFE_FAULT_CODE = 4096;       // REV 10.17: Added to fault code when in failsafe (was 8192)
 const int MAX_WATCHDOG_ATTEMPTS_BEFORE_FAILSAFE = 2;  // Enter failsafe after 2 restart attempts
 
 // Failsafe run cycle state
@@ -1163,8 +1187,9 @@ const unsigned long WATCHDOG_FIRST_PULSE = 1000; // First reboot attempt: 1 seco
 const unsigned long WATCHDOG_LONG_PULSE = 30000; // Subsequent attempts: 30 second pulse
 const int SD_CARD_FAULT_CODE = 1024;             // REV 10.17: Fault code for SD card failure
 const int WATCHDOG_FAULT_CODE = 2048;            // REV 10.17: Fault code for serial watchdog (was 1024)
+const int FAILSAFE_FAULT_CODE = 4096;            // REV 10.17: Added to fault code when in failsafe mode
 const int BLUECHERRY_FAULT_CODE = 8192;          // REV 10.17: Fault code for BlueCherry disconnected (was 4096)
-const int FAILSAFE_ACTIVE_FAULT_CODE = 16384;   // NEW: Added when failsafe mode is actively controlling relays
+const int PASSTHROUGH_FAULT_CODE = 16384;        // REV 10.35: Added when passthrough mode is active
 
 // Profile-specific fault code mappings (from Python control software)
 // CS8/CS12 profiles have extensive alarm coverage
@@ -1201,6 +1226,14 @@ const int FAILSAFE_MODE_FAULT = 8192;           // Failsafe mode active
 unsigned long lastLteCheckTime = 0;
 const unsigned long LTE_CHECK_INTERVAL = 60000;  // 60 seconds between LTE status checks
 int lteReconnectFailures = 0;                     // Track consecutive reconnect failures
+
+// REV 10.35: Graceful LTE restart policy — only restart after 24 hours of continuous
+// LTE downtime, and only during the 5:00 AM EST (10:00 UTC) maintenance window.
+// The device remains fully operational (serial, relays, web portal, SD logging) while
+// LTE is down. No more aggressive reboots after 5 failures.
+unsigned long lteDownSinceMillis = 0;             // millis() when LTE first dropped (0 = LTE is up)
+const unsigned long LTE_DOWN_RESTART_THRESHOLD_MS = 86400000UL;  // 24 hours in milliseconds
+const int LTE_RESTART_HOUR_UTC = 10;              // 5:00 AM EST = 10:00 UTC
 
 // BlueCherry connection tracking variables
 // Allows system to run without BlueCherry, but schedules weekly restart for OTA retry
@@ -1677,16 +1710,24 @@ void pulseWatchdogPin(unsigned long pulseDuration) {
     
     digitalWrite(ESP_WATCHDOG_PIN, HIGH);
     
-    // For long pulses, print status every 10 seconds
+    // REV 10.35: Keep serial responsive during watchdog power cycle pulse.
+    // Previously used delay(10000) which blocked serial for 10 seconds at a time.
     if (pulseDuration > 5000) {
         unsigned long startTime = millis();
+        unsigned long lastStatusPrint = 0;
         while (millis() - startTime < pulseDuration) {
-            unsigned long remaining = (pulseDuration - (millis() - startTime)) / 1000;
-            Serial.printf("[WATCHDOG] Power cycle... %lu sec remaining\r\n", remaining);
-            delay(10000);
+            readSerialData();
+            unsigned long elapsed = millis() - startTime;
+            if (elapsed - lastStatusPrint >= 10000) {
+                unsigned long remaining = (pulseDuration - elapsed) / 1000;
+                Serial.printf("[WATCHDOG] Power cycle... %lu sec remaining\r\n", remaining);
+                lastStatusPrint = elapsed;
+            }
+            delay(100);
         }
     } else {
-        delay(pulseDuration);
+        // Short pulses: keep serial alive with 1ms granularity
+        for (unsigned long w = 0; w < pulseDuration; w++) { readSerialData(); delay(1); }
     }
     
     digitalWrite(ESP_WATCHDOG_PIN, LOW);
@@ -3488,13 +3529,14 @@ void runFailsafeCycleLogic() {
 /**
  * Get combined fault code from all fault sources.
  * Each fault code is a unique power-of-2 bit flag, so they can be OR'd together.
- * 
- * REV 10.17 fault code assignments:
- *   1024  = SD card failure
+ *
+ * REV 10.35 fault code assignments:
+ *   1024  = SD card failure/missing
  *   2048  = Serial watchdog activated (no serial data for 30+ min)
- *   4096  = Failsafe mode (ESP32 autonomous relay control)
- *   8192  = BlueCherry connection failed (OTA unavailable)
- * 
+ *   4096  = Failsafe mode enabled (ESP32 autonomous relay control)
+ *   8192  = BlueCherry sync failing to connect
+ *   16384 = Passthrough mode enabled
+ *
  * Usage example:
  *   int faultCode = getCombinedFaultCode();  // e.g., 1024 + 2048 + 8192 = 11264
  */
@@ -3503,8 +3545,8 @@ int getCombinedFaultCode() {
     if (!isSDCardOK())       code += SD_CARD_FAULT_CODE;
     if (isInWatchdogState()) code += WATCHDOG_FAULT_CODE;
     if (failsafeEnabled)     code += FAILSAFE_FAULT_CODE;      // Failsafe is enabled (4096)
-    if (failsafeMode)        code += FAILSAFE_ACTIVE_FAULT_CODE; // Failsafe is actively running (16384)
     if (!blueCherryConnected) code += BLUECHERRY_FAULT_CODE;
+    if (passthroughMode)     code += PASSTHROUGH_FAULT_CODE;   // Passthrough mode active (16384)
     return code;
 }
 
@@ -3688,7 +3730,11 @@ void dataBackfill() {
     bool firstEntry = true;
     int backfillCount = 0;
 
+    int backfillLineCount = 0;
     while (logFile.available()) {
+        // REV 10.35: Keep serial responsive during large file reads
+        if (++backfillLineCount % 10 == 0) readSerialData();
+        
         String line = logFile.readStringUntil('\n');
         line.trim();
 
@@ -3798,7 +3844,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.34</title>
+    <title>Walter IO Board - Rev 10.35</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -3897,7 +3943,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.34</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.35</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -4810,7 +4856,8 @@ void initSdLogging() {
         attempts++;
         Serial.println("**** ERROR - SD Card not Mounted, attempt " + String(attempts) + " of " + String(maxAttempts));
         if (attempts < maxAttempts) {
-            delay(2000);
+            // REV 10.35: Keep serial responsive during SD mount retry (was blocking delay(2000))
+            for (int w = 0; w < 2000; w++) { readSerialData(); delay(1); }
         }
     }
     if (attempts >= maxAttempts) {
@@ -4850,6 +4897,7 @@ void cleanupOldLogFiles(int currentYear) {
 
     File file = root.openNextFile();
     while (file) {
+        readSerialData();  // REV 10.35: Keep serial responsive during SD file enumeration
         String fileName = String(file.name());
         if (fileName.startsWith("logfile") && fileName.endsWith(".log")) {
             String yearStr = fileName.substring(7, 11);
@@ -4869,6 +4917,18 @@ void cleanupOldLogFiles(int currentYear) {
 }
 
 void SaveToSD(String id, unsigned long seq, int pres, int cycles, int fault, int mode, int temp, float current) {
+    // REV 10.35: Check for physical card presence BEFORE writing.
+    // The file handle can remain "valid" in RAM even after the card is ejected.
+    // isSDCardOK() performs a real SPI probe to detect hot-removal.
+    if (!isSDCardOK()) {
+        Serial.println("[SD] Card not present — skipping write");
+        if (logFile) {
+            logFile.close();
+            Serial.println("[SD] Closed stale file handle after card removal");
+        }
+        return;
+    }
+    
     if (!logFile) {
         Serial.println("Log file not open, attempting to reopen");
         if (!SD.cardType()) {
@@ -5959,7 +6019,11 @@ void startConfigAP() {
     delay(100);
 }
 
+// REV 10.35: Added readSerialData() between modem calls and in polling loop.
+// Removed ESP.restart() on HTTP failure — the device must never restart for a
+// non-critical HTTP lookup. System continues operating normally without the data.
 void getHTTPinfo() {
+    readSerialData();
     if (modem.httpConfigProfile(HTTP_PROFILE, "167.172.15.241", 5687, TLS_PROFILE)) {
         Serial.println("Successfully configured the http profile");
     } else {
@@ -5969,18 +6033,18 @@ void getHTTPinfo() {
     static char url[128];
     static char ctbuf[128];
     snprintf(url, sizeof(url), "lookup?mac=%s", macStr.c_str());
+    readSerialData();
     if (modem.httpQuery(HTTP_PROFILE, url, WALTER_MODEM_HTTP_QUERY_CMD_GET, ctbuf, sizeof(ctbuf), NULL, &rsp)) {
         Serial.println("Request successful");
     } else {
-        Serial.println("http query failed");
-        delay(1000);
-        ESP.restart();
+        Serial.println("[HTTP] Query failed — continuing without server data (no restart)");
         return;
     }
     bool responseReceived = false;
     unsigned long startTime = millis();
     const unsigned long timeout = 10000;
     while (!responseReceived && (millis() - startTime < timeout)) {
+        readSerialData();
         while (modem.httpDidRing(HTTP_PROFILE, incomingBuf, sizeof(incomingBuf), &rsp)) {
             Serial.println("Webserver response received");
             Serial.printf("[%s]\r\n", incomingBuf);
@@ -6001,8 +6065,6 @@ void getHTTPinfo() {
                     String timingString = String(timing);
                     timing *= 1000;
                     String newId = String(idBuf);
-                    // Display server device ID (informational only — does NOT overwrite ESP32's stored name)
-                    // The ESP32 device name is set exclusively via the web portal.
                     if (DeviceName != newId) {
                         Serial.println("[HTTP] Server device ID: '" + newId + 
                                        "' (ESP32 name: '" + DeviceName + "' — NOT overwriting)");
@@ -6017,27 +6079,41 @@ void getHTTPinfo() {
             }
             responseReceived = true;
         }
-        if (!responseReceived) delay(100);
+        if (!responseReceived) delay(10);
     }
     if (!responseReceived) Serial.println("Timeout waiting for HTTP response");
 }
 
 // Removed extractDataBeyondComma3() - no longer needed with JSON parsing
 
+// REV 10.35: Added 10-second timeout and readSerialData() to prevent infinite hang.
+// Also fixed logic bug: original while(!getClock) body only ran when getClock returned
+// false, and both branches returned immediately (never actually looped). If getClock
+// returned true, the function fell off the end with no return (undefined behavior).
 bool initModemTime() {
-    while (!modem.getClock(&rsp)) {
-        if (rsp.result == WALTER_MODEM_STATE_OK) {
-            currentTimestamp = rsp.data.clock.epochTime;
-            lastMillis = millis();
-            modemTimeFresh = true;  // REV 10.5: Mark time as fresh from modem
-            Serial.print("Raw modem timestamp (UTC): ");
-            Serial.println(rsp.data.clock.epochTime);
-            return true;
+    const unsigned long MODEM_TIME_TIMEOUT_MS = 10000;
+    unsigned long startTime = millis();
+    
+    while (millis() - startTime < MODEM_TIME_TIMEOUT_MS) {
+        readSerialData();
+        if (modem.getClock(&rsp)) {
+            if (rsp.result == WALTER_MODEM_STATE_OK) {
+                currentTimestamp = rsp.data.clock.epochTime;
+                lastMillis = millis();
+                modemTimeFresh = true;
+                Serial.print("Raw modem timestamp (UTC): ");
+                Serial.println(rsp.data.clock.epochTime);
+                return true;
+            } else {
+                Serial.println("[TIME] getClock succeeded but result not OK — retrying");
+            }
         } else {
-            Serial.println("Invalid timestamp from modem!");
-            return false;
+            Serial.println("[TIME] getClock failed — retrying");
         }
+        delay(500);
     }
+    Serial.println("[TIME] Timeout getting modem clock (10s) — using cached time");
+    return false;
 }
 
 void updateTimestamp() {
@@ -6155,9 +6231,32 @@ String formatTimestamp(int64_t seconds) {
  * Usage example:
  *   if (isSDCardOK()) { ... }
  */
+// REV 10.35: SD.cardType() returns a CACHED value — it does NOT re-probe hardware.
+// After a card is mounted, cardType() will report the old type forever, even if the
+// card is physically ejected. To detect hot-removal, we attempt a small file open
+// that forces actual SPI communication with the card. If the SPI transaction fails,
+// the card is gone. This is throttled to once per second to avoid overhead.
 bool isSDCardOK() {
-    // Check if SD card type is valid (not CARD_NONE)
-    return (SD.cardType() != CARD_NONE);
+    static unsigned long lastProbeTime = 0;
+    static bool lastKnownState = false;
+    
+    if (millis() - lastProbeTime < 1000) return lastKnownState;
+    lastProbeTime = millis();
+    
+    if (SD.cardType() == CARD_NONE) {
+        lastKnownState = false;
+        return false;
+    }
+    
+    // Force a real SPI probe by trying to open the root directory
+    File testRoot = SD.open("/");
+    if (!testRoot) {
+        lastKnownState = false;
+        return false;
+    }
+    testRoot.close();
+    lastKnownState = true;
+    return true;
 }
 
 /**
@@ -6512,7 +6611,10 @@ bool sendPassthroughRequestToLinux(unsigned long timeoutMinutes) {
                 }
             }
         }
-        delay(10);  // Small delay to prevent tight loop
+        // REV 10.35: Reduced from 10ms to 1ms for faster response.
+        // Note: readSerialData() is NOT called here because it also reads
+        // from Serial1, which would steal the "ready" bytes this function needs.
+        delay(1);
     }
     
     Serial.println("[PASSTHROUGH] WARNING: No 'ready' from Linux (timeout)");
@@ -7727,16 +7829,23 @@ void runCellularInitStateMachine() {
             if (rsp.data.blueCherry.state == WALTER_MODEM_BLUECHERRY_STATUS_NOT_PROVISIONED
                 && cellularInitBcAttempts == 1) {
                 Serial.println("[CELL-INIT] Device not provisioned, attempting ZTP...");
+                readSerialData();  // REV 10.35: ZTP calls block 5-30s each
                 if (BlueCherryZTP::begin(BC_DEVICE_TYPE, BC_TLS_PROFILE, bc_ca_cert, &modem)) {
                     uint8_t mac[8] = {0};
                     esp_read_mac(mac, ESP_MAC_WIFI_STA);
                     BlueCherryZTP::addDeviceIdParameter(BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC, mac);
+                    readSerialData();
                     if (modem.getIdentity(&rsp)) {
                         BlueCherryZTP::addDeviceIdParameter(BLUECHERRY_ZTP_DEVICE_ID_TYPE_IMEI, rsp.data.identity.imei);
                     }
-                    if (BlueCherryZTP::requestDeviceId() && BlueCherryZTP::generateKeyAndCsr()
-                        && BlueCherryZTP::requestSignedCertificate()
-                        && modem.blueCherryProvision(BlueCherryZTP::getCert(), BlueCherryZTP::getPrivKey(), bc_ca_cert)) {
+                    readSerialData();
+                    bool ztpSuccess = BlueCherryZTP::requestDeviceId();
+                    readSerialData();
+                    if (ztpSuccess) ztpSuccess = BlueCherryZTP::generateKeyAndCsr();
+                    readSerialData();
+                    if (ztpSuccess) ztpSuccess = BlueCherryZTP::requestSignedCertificate();
+                    readSerialData();
+                    if (ztpSuccess && modem.blueCherryProvision(BlueCherryZTP::getCert(), BlueCherryZTP::getPrivKey(), bc_ca_cert)) {
                         Serial.println("[CELL-INIT] ZTP provisioning succeeded — retrying BlueCherry init");
                     }
                 }
@@ -7878,13 +7987,16 @@ bool retryBlueCherryConnection() {
     Serial.println("\n🔄 Retrying BlueCherry connection...");
     blueCherryLastAttempt = millis();
     
+    readSerialData();  // REV 10.35: Keep serial responsive before blocking modem call
     if (modem.blueCherryInit(BC_TLS_PROFILE, otaBuffer, &rsp)) {
         blueCherryConnected = true;
         Serial.println("✓ BlueCherry reconnected successfully!");
+        readSerialData();
         return true;
     } else {
         Serial.print("BlueCherry still unavailable, state: ");
         Serial.println(rsp.data.blueCherry.state);
+        readSerialData();
         return false;
     }
 }
@@ -7940,7 +8052,14 @@ void checkFirmwareUpdate() {
     
     // BlueCherry is connected - check for firmware updates AND incoming messages
     Serial.println("[BC Sync] Starting sync cycle...");
+    unsigned long syncStartTime = millis();
+    const unsigned long BC_SYNC_TIMEOUT_MS = 60000;  // REV 10.35: 60s max for entire sync cycle
     do {
+        readSerialData();  // REV 10.35: Keep serial responsive during BlueCherry sync
+        if (millis() - syncStartTime > BC_SYNC_TIMEOUT_MS) {
+            Serial.println("[BC Sync] TIMEOUT — sync cycle exceeded 60 seconds, aborting");
+            return;
+        }
         if (!modem.blueCherrySync(&rsp)) {
             Serial.printf("[BC Sync] ERROR: sync failed, state=%d\r\n", rsp.data.blueCherry.state);
             // Mark as disconnected if sync fails - DO NOT reset modem (keeps LTE alive)
@@ -7964,6 +8083,7 @@ void checkFirmwareUpdate() {
         // Process incoming messages from BlueCherry platform
         // Topic 0 = firmware update request, Topic != 0 = other MQTT messages
         for (uint8_t msgIdx = 0; msgIdx < rsp.data.blueCherry.messageCount; msgIdx++) {
+            readSerialData();  // REV 10.35: Keep serial responsive during message processing
             if (rsp.data.blueCherry.messages[msgIdx].topic == 0) {
                 // Topic 0 = Firmware update available
                 Serial.println("\n📥 Firmware update available - downloading...");
@@ -8320,6 +8440,7 @@ bool sendCborArrayViaSocket(uint8_t* buffer, size_t size) {
         Serial.print(4 - retries);
         Serial.println("/3");
         
+        readSerialData();  // REV 10.35: Keep serial responsive between modem calls
         if (!modem.socketConfig(&rsp, NULL, NULL, 1, 1024, 60, 30, 5000)) {
             Serial.println("Failed to configure UDP socket");
             retries--;
@@ -8329,12 +8450,14 @@ bool sendCborArrayViaSocket(uint8_t* buffer, size_t size) {
         Serial.print("Configured socket ID: ");
         Serial.println(socketId);
 
+        readSerialData();
         if(!modem.socketConfigSecure(false, 1, socketId)) {
             Serial.println("Failed to disable TLS on the UDP socket");
             retries--;
             continue;
         }
         
+        readSerialData();
         if (!modem.socketConfigExtended(&rsp, NULL, NULL, socketId)) {
             Serial.println("Failed to configure UDP socket extended parameters");
             retries--;
@@ -8342,6 +8465,7 @@ bool sendCborArrayViaSocket(uint8_t* buffer, size_t size) {
         }
         Serial.println("Socket extended parameters configured successfully");
         
+        readSerialData();
         if (!modem.socketDial("167.172.15.241", 5689, 0, &rsp, NULL, NULL, 
                                 WALTER_MODEM_SOCKET_PROTO_UDP, 
                                 WALTER_MODEM_ACCEPT_ANY_REMOTE_DISABLED, socketId)) {
@@ -8352,6 +8476,7 @@ bool sendCborArrayViaSocket(uint8_t* buffer, size_t size) {
         }
         Serial.println("Socket connected to server");
         
+        readSerialData();
         if (!modem.socketSend(buffer, size, &rsp, NULL, NULL, 
                              WALTER_MODEM_RAI_ONLY_SINGLE_RXTX_EXPECTED, socketId)) {
             Serial.println("Failed to send data via UDP socket");
@@ -8370,7 +8495,8 @@ bool sendCborArrayViaSocket(uint8_t* buffer, size_t size) {
             Serial.print("Retrying in 1 second... (");
             Serial.print(retries);
             Serial.println(" attempts remaining)");
-            delay(1000);
+            // REV 10.35: Keep serial responsive during retry delay
+            for (int w = 0; w < 1000; w++) { readSerialData(); delay(1); }
         }
     }
     Serial.println("All UDP socket send attempts failed");
@@ -8384,22 +8510,26 @@ bool sendCborDataViaSocket(uint8_t* buffer, size_t size) {
     Serial.print(size);
     Serial.println(" bytes");
     
+    readSerialData();  // REV 10.35: Keep serial responsive between modem calls
     if (!modem.socketConfig(&rsp, NULL, NULL, 1, 1024, 60, 30, 5000)) {
         Serial.println("Failed to configure UDP socket for status/error");
         return false;
     }
     socketId = rsp.data.socketId;
 
+    readSerialData();
     if(!modem.socketConfigSecure(false, 1, socketId)) {
         Serial.println("Failed to disable TLS on the UDP socket for status/error");
         return false;
     }
     
+    readSerialData();
     if (!modem.socketConfigExtended(&rsp, NULL, NULL, socketId)) {
         Serial.println("Failed to configure UDP socket extended parameters for status/error");
         return false;
     }
     
+    readSerialData();
     if (!modem.socketDial("167.172.15.241", 5686, 0, &rsp, NULL, NULL, 
                             WALTER_MODEM_SOCKET_PROTO_UDP, 
                             WALTER_MODEM_ACCEPT_ANY_REMOTE_DISABLED, socketId)) {
@@ -8408,6 +8538,7 @@ bool sendCborDataViaSocket(uint8_t* buffer, size_t size) {
         return false;
     }
     
+    readSerialData();
     if (!modem.socketSend(buffer, size, &rsp, NULL, NULL, 
                          WALTER_MODEM_RAI_ONLY_SINGLE_RXTX_EXPECTED, socketId)) {
         Serial.println("Failed to send status/error data via UDP socket");
@@ -8738,7 +8869,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.34                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.35                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -8903,7 +9034,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.34 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.35 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
@@ -8988,33 +9119,63 @@ void loop() {
     }
     
     // =====================================================================
-    // LTE CONNECTION CHECK — SCHEDULED (every 60 seconds)
-    // Only runs AFTER cellular initialization is complete.
-    // If LTE drops, serial data keeps flowing. Reconnection is attempted on
-    // the next scheduled check. After 5 consecutive failures, ESP restarts.
+    // REV 10.35: NON-BLOCKING LTE RECONNECTION
+    // Checks LTE every 60 seconds. If LTE is down, triggers the non-blocking
+    // state machine to reconnect (same one used at boot). No more blocking
+    // lteConnect() call that stalls the loop for 5+ minutes.
+    //
+    // RESTART POLICY: Only restart after 24 continuous hours of no LTE,
+    // and only at the 5:00 AM EST (10:00 UTC) maintenance window. The device
+    // stays fully operational (serial, relays, web portal, SD) while LTE is down.
     // =====================================================================
     if (cellularInitComplete && currentTime - lastLteCheckTime >= LTE_CHECK_INTERVAL) {
         lastLteCheckTime = currentTime;
         if (!lteConnected()) {
-            Serial.println("####################################################################");
-            Serial.printf("## LTE CONNECTION LOST — attempting reconnect (failure #%d)\r\n",
-                          lteReconnectFailures + 1);
-            Serial.println("## Serial data to Linux continues during reconnection attempt");
-            Serial.println("####################################################################");
-            if (!lteConnect()) {
-                lteReconnectFailures++;
-                Serial.printf("[LTE] Reconnect FAILED — will retry in 60 seconds (failures: %d/5)\r\n",
-                              lteReconnectFailures);
-                if (lteReconnectFailures >= 5) {
-                    Serial.println("[LTE] 5 consecutive failures — restarting ESP32");
-                    delay(1000);
+            if (lteDownSinceMillis == 0) {
+                lteDownSinceMillis = millis();
+                Serial.println("####################################################################");
+                Serial.println("## LTE CONNECTION LOST — non-blocking reconnect initiated");
+                Serial.println("## Serial/relays/web portal remain fully operational");
+                Serial.println("####################################################################");
+            }
+            
+            unsigned long downDurationMs = millis() - lteDownSinceMillis;
+            unsigned long downMinutes = downDurationMs / 60000UL;
+            
+            if (downMinutes % 5 == 0) {
+                Serial.printf("[LTE] Down for %lu minutes — state machine reconnecting\r\n", downMinutes);
+            }
+            
+            // Reset the cellular init state machine to drive non-blocking reconnection
+            if (cellularInitComplete) {
+                Serial.println("[LTE] Resetting cellular state machine for reconnection");
+                cellularInitComplete = false;
+                cellularInitState = CELL_INIT_SET_MINIMUM;
+                cellularInitRetryCount = 0;
+            }
+            
+            // Check if 24 hours of continuous downtime have elapsed
+            if (downDurationMs >= LTE_DOWN_RESTART_THRESHOLD_MS) {
+                // Only restart at the 5:00 AM EST (10:00 UTC) maintenance window
+                time_t rawTime = (time_t)currentTimestamp;
+                struct tm *timeInfo = gmtime(&rawTime);
+                if (timeInfo->tm_hour == LTE_RESTART_HOUR_UTC && timeInfo->tm_min < 2) {
+                    Serial.println("####################################################################");
+                    Serial.printf("## LTE DOWN FOR %lu HOURS — scheduled restart at 5:00 AM EST\r\n",
+                                  downDurationMs / 3600000UL);
+                    Serial.println("## Restarting ESP32 to attempt fresh cellular connection");
+                    Serial.println("####################################################################");
+                    delay(100);
                     ESP.restart();
                 }
-            } else {
-                lteReconnectFailures = 0;
-                Serial.println("[LTE] Reconnection successful — resuming normal operation");
             }
         } else {
+            if (lteDownSinceMillis != 0) {
+                unsigned long downDurationMs = millis() - lteDownSinceMillis;
+                Serial.printf("[LTE] ✓ Connection restored after %lu minutes of downtime\r\n",
+                              downDurationMs / 60000UL);
+                lteDownSinceMillis = 0;
+            }
             lteReconnectFailures = 0;
         }
     }
@@ -9133,8 +9294,15 @@ void loop() {
         Serial.print("@@@@@@  Free heap: ");
         Serial.println(ESP.getFreeHeap());
         Serial.println("@@@@@@");
-        if (!SD.cardType()) {
-            Serial.println("SD card not mounted, attempting to remount");
+        // REV 10.35: Use isSDCardOK() which performs a real SPI probe instead
+        // of the cached SD.cardType(). Also close stale file handles on card removal.
+        if (!isSDCardOK()) {
+            Serial.println("[SD] Card not detected — closing stale handles and attempting remount");
+            if (logFile) {
+                logFile.close();
+                Serial.println("[SD] Closed stale log file handle");
+            }
+            SD.end();  // Force unmount to clear cached state
             int attempts = 0;
             const int maxAttempts = 3;
             while (attempts < maxAttempts) {
@@ -9156,16 +9324,13 @@ void loop() {
                 }
                 attempts++;
                 Serial.println("Failed to remount SD card, attempt " + String(attempts) + " of " + String(maxAttempts));
-                // REV 10.31: Replace blocking delay(1000) with a loop that
-                // keeps checking serial every 1ms.  Without this, the SD remount
-                // retry is a 1-3 second blind spot where serial commands are lost.
                 for (int w = 0; w < 1000; w++) {
                     readSerialData();
                     delay(1);
                 }
             }
             if (attempts >= maxAttempts) {
-                Serial.println("Failed to remount SD card after " + String(maxAttempts) + " attempts");
+                Serial.println("[SD] Failed to remount after " + String(maxAttempts) + " attempts — card likely removed");
             }
         }
         lastSDCheck = currentTime;
