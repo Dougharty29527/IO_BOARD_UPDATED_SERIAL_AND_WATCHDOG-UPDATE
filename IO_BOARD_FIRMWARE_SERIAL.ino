@@ -1,7 +1,7 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.35
- *  Date: 2/20/2026
+ *  Walter IO Board Firmware - Rev 10.36
+ *  Date: 2/19/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -12,6 +12,25 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.36 (2/19/2026) - ESPNow Wireless Display Panel Support
+ *  - ESPNOW: Added ESP-NOW wireless communication for Waveshare ESP32 Display panel
+ *    * Auto-discovery via broadcast beacons (2-second interval, FF:FF:FF:FF:FF:FF)
+ *    * Automatic pairing handshake (beacon → pair request → pair confirm)
+ *    * Reuses existing JSON protocol — same format as RS-232 serial
+ *    * Sensor data (200ms/5Hz) and cellular status (10s) sent via ESPNow when paired
+ *    * Display panel can send mode commands, calibration, and other commands back
+ *    * Automatic fragmentation for JSON payloads > 248 bytes (cellular status)
+ *  - SERIAL SUPPRESSION: Serial1 sends are suppressed when ESPNow peer is active
+ *    * Serial1 receiving remains active (Python commands still accepted)
+ *  - THERMAL MONITORING: Added ESP32 temperature to cellular status packet
+ *    * Resumes serial sends within 10 seconds of display disconnect
+ *  - WATCHDOG: ESPNow data reception resets the serial watchdog timer
+ *    * Prevents false watchdog triggers when Python is absent but display is connected
+ *    * Display keepalive packets (5-second interval) maintain the heartbeat
+ *  - COEXISTENCE: ESPNow shares WiFi radio with existing AP mode (channel 1)
+ *    * Web config portal continues to function normally
+ *    * No changes to existing WiFi AP or DNS server configuration
  *
  *  Rev 10.35 (2/20/2026) - Non-Blocking Firmware Overhaul + Fault Code Corrections
  *  - BLOCKING ELIMINATION: All blocking operations in loop() now call readSerialData()
@@ -828,8 +847,8 @@
 #define RELAY_DELAY 1
 
 // Define the software version as a macro
-#define FIRMWARE_VERSION "10.35"
-#define FIRMWARE_DATE "2/16/2026"
+#define FIRMWARE_VERSION "10.36"
+#define FIRMWARE_DATE "2/19/2026"
 #define VERSION "Rev " FIRMWARE_VERSION
 
 String ver = VERSION;
@@ -844,6 +863,7 @@ String ver = VERSION;
 #include "driver/gpio.h"             // ESP-IDF GPIO driver for gpio_hold_en/dis, gpio_pullup_en
                                       // Used to latch DISP_SHUTDN HIGH through reboots & OTA updates
 #include <WiFi.h>
+#include <esp_now.h>
 #include <ESPAsyncWebServer.h>
 #include <ESPAsyncDNSServer.h>
 #include <HardwareSerial.h>
@@ -888,6 +908,16 @@ void   notifyPythonOfCommand(const char* command, const char* value);
 void   refreshCellSignalInfo();
 bool   sendStatusUpdateViaSocket();
 void   executeRemoteCommand(String cmd, String value);
+bool   processCompleteSerialMessage(const char* msg, uint16_t msgLen);
+
+// ESPNow forward declarations
+void   initializeESPNow();
+void   onEspNowDataReceived(const esp_now_recv_info_t *recvInfo, const uint8_t *data, int dataLen);
+void   onEspNowDataSent(const wifi_tx_info_t *txInfo, esp_now_send_status_t status);
+void   processEspNowMessages();
+void   sendEspNowJsonPacket(const char* json, int len);
+void   sendEspNowBeacon();
+void   checkEspNowHeartbeat();
 
 // =====================================================================
 // ADS1015 ADC CONFIGURATION (Rev 10 - replaces MCP23017 emulation)
@@ -1234,6 +1264,55 @@ int lteReconnectFailures = 0;                     // Track consecutive reconnect
 unsigned long lteDownSinceMillis = 0;             // millis() when LTE first dropped (0 = LTE is up)
 const unsigned long LTE_DOWN_RESTART_THRESHOLD_MS = 86400000UL;  // 24 hours in milliseconds
 const int LTE_RESTART_HOUR_UTC = 10;              // 5:00 AM EST = 10:00 UTC
+
+// =====================================================================
+// REV 10.36: ESPNOW WIRELESS COMMUNICATION
+// =====================================================================
+// Enables a Waveshare ESP32 Display panel to monitor and control the IO Board
+// using the same JSON protocol as RS-232 serial. ESPNow coexists with WiFi AP
+// mode on the same channel. When an ESPNow peer is connected:
+//   - Sensor data (200ms) and cellular status (10s) are sent via ESPNow
+//   - Serial1 sends are suppressed (Python still receives via serial if needed)
+//   - The serial watchdog is reset by ESPNow data (no false triggers)
+//   - Auto-discovery uses broadcast beacons; no hardcoded MAC addresses
+//
+// ESPNow packet format (2-byte header + JSON payload, max 250 bytes total):
+//   Byte 0: Packet type (0x01=JSON, 0x10=Beacon, 0x11=PairReq, 0x12=PairConfirm)
+//   Byte 1: Fragment info (high nibble=index, low nibble=total count)
+//   Bytes 2-249: Raw JSON string (same format as Serial1)
+// =====================================================================
+
+// ESPNow packet type constants
+const uint8_t ESPNOW_PKT_JSON          = 0x01;  // JSON data (sensor, cellular, or command)
+const uint8_t ESPNOW_PKT_BEACON        = 0x10;  // Discovery beacon (IO Board → broadcast)
+const uint8_t ESPNOW_PKT_PAIR_REQUEST  = 0x11;  // Pair request (Display → IO Board)
+const uint8_t ESPNOW_PKT_PAIR_CONFIRM  = 0x12;  // Pair confirm (IO Board → Display)
+
+// ESPNow timing constants
+const unsigned long ESPNOW_BEACON_INTERVAL_MS   = 2000;   // Broadcast beacon every 2 seconds when unpaired
+const unsigned long ESPNOW_HEARTBEAT_TIMEOUT_MS  = 10000;  // 10 seconds of silence = peer disconnected
+const uint8_t ESPNOW_CHANNEL = 1;                          // Must match WiFi AP channel (default 1)
+const int ESPNOW_MAX_PAYLOAD = 248;                         // 250 - 2 byte header
+
+// ESPNow connection state
+bool espNowInitialized       = false;   // True after esp_now_init() succeeds
+bool espNowPeerConnected     = false;   // True when a display panel is paired and active
+uint8_t espNowPeerMac[6]     = {0};     // MAC address of the connected display panel
+unsigned long lastEspNowRxTime     = 0; // millis() of last ESPNow packet received from peer
+unsigned long lastEspNowBeaconTime = 0; // millis() of last beacon broadcast
+
+// ESPNow receive buffer — written by the WiFi-task callback, read by loop()
+// Uses a volatile flag for thread-safe handoff (single producer, single consumer)
+const int ESPNOW_RX_BUF_SIZE = 512;
+char espNowRxBuffer[ESPNOW_RX_BUF_SIZE];
+volatile int espNowRxLen = 0;
+volatile bool espNowRxReady = false;
+
+// ESPNow fragment reassembly buffer for incoming multi-packet messages
+char espNowFragBuffer[ESPNOW_RX_BUF_SIZE];
+int espNowFragLen = 0;
+uint8_t espNowFragExpected = 0;  // Total fragments expected (0 = no reassembly in progress)
+uint8_t espNowFragReceived = 0;  // Fragments received so far
 
 // BlueCherry connection tracking variables
 // Allows system to run without BlueCherry, but schedules weekly restart for OTA retry
@@ -3844,7 +3923,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Walter IO Board - Rev 10.35</title>
+    <title>Walter IO Board - Rev 10.36</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html { -webkit-text-size-adjust: 100%%; }
@@ -3943,7 +4022,7 @@ const char* control_html = R"rawliteral(
 <body>
     <!-- Top bar with status -->
     <div class="topbar">
-        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.35</span></div>
+        <div><span class="title">Walter IO Board</span><br><span class="info" id="topVer">Rev 10.36</span></div>
         <div style="text-align:right"><span class="info" id="topTime">--</span><br><span class="badge ok" id="connBadge" style="position:static;font-size:10px">Connected</span></div>
     </div>
     <div class="content-wrap">
@@ -6294,19 +6373,24 @@ bool isSDCardOK() {
 void sendCellularStatusToSerial() {
     // Check LTE connection status
     int lteStatus = lteConnected() ? 1 : 0;
-    
+
+    // Read ESP32 temperature sensor
+    float celsius = temperatureRead();
+    float fahrenheit = (celsius * 9.0 / 5.0) + 32;
+
     // Use cached signal values -- may be stale if modem queries are failing,
     // but sending stale values is better than sending nothing.
     String rsrpStr = modemRSRP.length() > 0 ? modemRSRP : "--";
     String rsrqStr = modemRSRQ.length() > 0 ? modemRSRQ : "--";
     String operatorStr = modemNetName.length() > 0 ? modemNetName : "--";
     String bandStr = modemBand.length() > 0 ? modemBand : "--";
-    
+
     // REV 10.9: Cellular-only JSON -- no datetime, no failsafe.
     // datetime: sent separately via sendDateTimeToSerial() only when fresh.
     // failsafe: already in the 5Hz fast sensor packet (Rev 10.8).
     // REV 10.9: Added imei, imsi, iccid, technology for Linux device identification.
     // These are static values queried once at boot -- they don't change at runtime.
+    // REV 10.36: Added ESP32 temperature for thermal monitoring.
     char jsonBuffer[512];
     snprintf(jsonBuffer, sizeof(jsonBuffer),
              "{\"passthrough\":%d,"
@@ -6315,7 +6399,8 @@ void sendCellularStatusToSerial() {
              "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u,\"tac\":%u,"
              "\"profile\":\"%s\","
              "\"imei\":\"%s\",\"imsi\":\"%s\","
-             "\"iccid\":\"%s\",\"technology\":\"%s\"}",
+             "\"iccid\":\"%s\",\"technology\":\"%s\","
+             "\"espnow\":%d,\"temperature\":%.1f}",
              passthroughValue,
              lteStatus,
              rsrpStr.c_str(),
@@ -6327,15 +6412,22 @@ void sendCellularStatusToSerial() {
              imei.c_str(),
              modemIMSI.length() > 0 ? modemIMSI.c_str() : "--",
              modemICCID.length() > 0 ? modemICCID.c_str() : "--",
-             modemTechnology.length() > 0 ? modemTechnology.c_str() : "--");
+             modemTechnology.length() > 0 ? modemTechnology.c_str() : "--",
+             espNowPeerConnected ? 1 : 0,
+             fahrenheit);
     
-    // Send to Python device via Serial1 (RS-232)
-    Serial1.println(jsonBuffer);
+    // REV 10.36: Send via ESPNow if peer connected, otherwise via Serial1
+    if (espNowPeerConnected) {
+        sendEspNowJsonPacket(jsonBuffer, strlen(jsonBuffer));
+    } else {
+        Serial1.println(jsonBuffer);
+    }
     
     // Debug output to Serial Monitor (verbose — only when debug mode ON)
     if (serialDebugMode) {
-        Serial.print("[RS232-TX CELL @10s] ");
-    Serial.println(jsonBuffer);
+        Serial.printf("[%s CELL @10s] %s\r\n",
+                      espNowPeerConnected ? "ESPNOW-TX" : "RS232-TX",
+                      jsonBuffer);
     }
 }
 
@@ -6367,12 +6459,18 @@ void sendDateTimeToSerial() {
              "{\"datetime\":\"%s\"}",
              dateTimeStr.c_str());
     
-    Serial1.println(jsonBuffer);
+    // REV 10.36: Send via ESPNow if peer connected, otherwise via Serial1
+    if (espNowPeerConnected) {
+        sendEspNowJsonPacket(jsonBuffer, strlen(jsonBuffer));
+    } else {
+        Serial1.println(jsonBuffer);
+    }
     
     // Debug output to Serial Monitor (verbose — only when debug mode ON)
     if (serialDebugMode) {
-        Serial.print("[RS232-TX TIME FRESH] ");
-        Serial.println(jsonBuffer);
+        Serial.printf("[%s TIME FRESH] %s\r\n",
+                      espNowPeerConnected ? "ESPNOW-TX" : "RS232-TX",
+                      jsonBuffer);
     }
 }
 
@@ -6461,18 +6559,24 @@ void sendFastSensorPacket() {
         Serial.printf("[SERIAL1-TX @%lums] %s\r\n", millis(), buf);
     }
 
-    Serial1.println(buf);
+    // REV 10.36: Send via ESPNow if peer connected, otherwise via Serial1
+    if (espNowPeerConnected) {
+        sendEspNowJsonPacket(buf, strlen(buf));
+    } else {
+        Serial1.println(buf);
+    }
 
     // Debug log to USB Serial Monitor — shows timestamp (ms) so you can verify 5Hz rate
     // Expect ~200ms between each line. Look for consistent spacing in the millis() values.
     // REV 10.9: Only prints when debug mode ON — this fires 5x/second and floods the monitor
     if (serialDebugMode) {
-        Serial.printf("[FAST-TX @%lums] P=%.2f rawP=%d zero=%.2f C=%.2f rawC=%d OV=%d M=%d%s\r\n",
+        Serial.printf("[FAST-TX @%lums] P=%.2f rawP=%d zero=%.2f C=%.2f rawC=%d OV=%d M=%d%s via %s\r\n",
                       millis(), sendPressure, (int)adcRawPressure,
                       adcZeroPressure,
                       sendCurrent, (int)adcRawCurrent,
                       overfillAlarmActive ? 1 : 0, currentRelayMode,
-                      adcDataStale ? " **STALE**" : "");
+                      adcDataStale ? " **STALE**" : "",
+                      espNowPeerConnected ? "ESPNow" : "Serial1");
     }
 }
 
@@ -6554,6 +6658,329 @@ void checkAndSendStatusToSerial() {
 
 // QC mode and ADS1015 ADC removed in Rev 9.4 (web simplification)
 // Relay control is exclusively handled by I2C from the Linux master
+
+// =====================================================================
+// REV 10.36: ESPNOW WIRELESS COMMUNICATION FUNCTIONS
+// =====================================================================
+// Auto-discovery protocol:
+//   1. IO Board broadcasts beacon every 2s to FF:FF:FF:FF:FF:FF
+//   2. Display panel receives beacon, sends pair request with its MAC
+//   3. IO Board registers display as peer, sends pair confirm
+//   4. Connection maintained by implicit heartbeat (200ms sensor packets)
+//   5. If no ESPNow data for 10s → peer disconnected, resume serial sends
+//
+// All ESPNow JSON payloads use the same format as Serial1, enabling the
+// display panel to parse data identically to the Python controller.
+// =====================================================================
+
+/**
+ * Initialize ESP-NOW after WiFi AP is already running.
+ * 
+ * Must be called AFTER startConfigAP() — ESPNow shares the WiFi radio
+ * and inherits the AP's channel. Registers send/receive callbacks and
+ * adds the broadcast address as a peer for beacon discovery.
+ * 
+ * Example:
+ *   startConfigAP();         // WiFi AP on channel 1
+ *   initializeESPNow();      // ESPNow on same channel 1
+ */
+void initializeESPNow() {
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ESPNOW] ERROR — esp_now_init() failed");
+        espNowInitialized = false;
+        return;
+    }
+
+    esp_now_register_recv_cb(onEspNowDataReceived);
+    esp_now_register_send_cb(onEspNowDataSent);
+
+    // Register broadcast peer for beacon transmission
+    esp_now_peer_info_t broadcastPeer;
+    memset(&broadcastPeer, 0, sizeof(broadcastPeer));
+    memset(broadcastPeer.peer_addr, 0xFF, 6);  // FF:FF:FF:FF:FF:FF
+    broadcastPeer.channel = 0;  // 0 = use current WiFi channel
+    broadcastPeer.encrypt = false;
+    if (esp_now_add_peer(&broadcastPeer) != ESP_OK) {
+        Serial.println("[ESPNOW] WARNING — failed to add broadcast peer");
+    }
+
+    espNowInitialized = true;
+    espNowPeerConnected = false;
+    lastEspNowBeaconTime = 0;
+
+    Serial.println("[ESPNOW] Initialized — broadcasting beacons for display panel discovery");
+}
+
+/**
+ * ESPNow receive callback — runs on the WiFi task (not the main loop).
+ * 
+ * Must be lightweight: copies data to a buffer and sets a flag.
+ * The main loop calls processEspNowMessages() to handle the data.
+ * 
+ * Handles pairing in-callback because the pair request must be ACKed
+ * immediately (before the next loop iteration) to avoid timeout.
+ * 
+ * @param recvInfo  Sender MAC and destination info
+ * @param data      Raw ESPNow packet (header + payload)
+ * @param dataLen   Total bytes received (including 2-byte header)
+ */
+void onEspNowDataReceived(const esp_now_recv_info_t *recvInfo, const uint8_t *data, int dataLen) {
+    if (dataLen < 2) return;  // Need at least header
+
+    uint8_t pktType = data[0];
+    uint8_t fragInfo = data[1];
+    const uint8_t* payload = data + 2;
+    int payloadLen = dataLen - 2;
+
+    const uint8_t* senderMac = recvInfo->src_addr;
+
+    // ─── PAIR REQUEST from display panel ─────────────────────────────
+    if (pktType == ESPNOW_PKT_PAIR_REQUEST) {
+        if (espNowPeerConnected) {
+            // Already paired — check if it's the same device reconnecting
+            if (memcmp(senderMac, espNowPeerMac, 6) != 0) return;
+        }
+
+        // Register sender as a peer (if not already registered)
+        if (!esp_now_is_peer_exist(senderMac)) {
+            esp_now_peer_info_t peerInfo;
+            memset(&peerInfo, 0, sizeof(peerInfo));
+            memcpy(peerInfo.peer_addr, senderMac, 6);
+            peerInfo.channel = 0;
+            peerInfo.encrypt = false;
+            esp_now_add_peer(&peerInfo);
+        }
+
+        memcpy(espNowPeerMac, senderMac, 6);
+        espNowPeerConnected = true;
+        lastEspNowRxTime = millis();
+
+        // Send pair confirm back to the display panel
+        char confirmJson[128];
+        snprintf(confirmJson, sizeof(confirmJson),
+                 "{\"type\":\"pair_confirm\",\"gmid\":\"%s\"}", deviceName);
+        uint8_t confirmPkt[2 + 128];
+        confirmPkt[0] = ESPNOW_PKT_PAIR_CONFIRM;
+        confirmPkt[1] = 0x01;  // 1 fragment, index 0
+        int cLen = strlen(confirmJson);
+        memcpy(confirmPkt + 2, confirmJson, cLen);
+        esp_now_send(senderMac, confirmPkt, 2 + cLen);
+        return;
+    }
+
+    // ─── JSON DATA or COMMAND from paired display ────────────────────
+    if (pktType == ESPNOW_PKT_JSON) {
+        // Only accept data from our paired peer
+        if (!espNowPeerConnected || memcmp(senderMac, espNowPeerMac, 6) != 0) return;
+
+        lastEspNowRxTime = millis();
+
+        uint8_t fragIndex = (fragInfo >> 4) & 0x0F;
+        uint8_t fragTotal = fragInfo & 0x0F;
+
+        if (fragTotal <= 1) {
+            // Single-packet message — copy directly to receive buffer
+            if (!espNowRxReady && payloadLen < ESPNOW_RX_BUF_SIZE) {
+                memcpy(espNowRxBuffer, payload, payloadLen);
+                espNowRxBuffer[payloadLen] = '\0';
+                espNowRxLen = payloadLen;
+                espNowRxReady = true;
+            }
+        } else {
+            // Multi-packet fragment — accumulate in fragment buffer
+            if (fragIndex == 0) {
+                espNowFragLen = 0;
+                espNowFragExpected = fragTotal;
+                espNowFragReceived = 0;
+            }
+            if (espNowFragLen + payloadLen < ESPNOW_RX_BUF_SIZE) {
+                memcpy(espNowFragBuffer + espNowFragLen, payload, payloadLen);
+                espNowFragLen += payloadLen;
+                espNowFragReceived++;
+            }
+            if (espNowFragReceived >= espNowFragExpected && !espNowRxReady) {
+                memcpy(espNowRxBuffer, espNowFragBuffer, espNowFragLen);
+                espNowRxBuffer[espNowFragLen] = '\0';
+                espNowRxLen = espNowFragLen;
+                espNowRxReady = true;
+                espNowFragExpected = 0;
+                espNowFragReceived = 0;
+                espNowFragLen = 0;
+            }
+        }
+        return;
+    }
+
+    // Heartbeat or unknown — just update timestamp if from our peer
+    if (espNowPeerConnected && memcmp(senderMac, espNowPeerMac, 6) == 0) {
+        lastEspNowRxTime = millis();
+    }
+}
+
+/**
+ * ESPNow send callback — delivery confirmation.
+ * Lightweight: only logs failures for diagnostics.
+ * 
+ * ESP32 Arduino Core 3.x (ESP-IDF 5.x) uses wifi_tx_info_t* instead
+ * of a raw MAC address pointer in the send callback signature.
+ */
+void onEspNowDataSent(const wifi_tx_info_t *txInfo, esp_now_send_status_t status) {
+    if (status != ESP_NOW_SEND_SUCCESS && serialDebugMode) {
+        Serial.printf("[ESPNOW] Send failed (status=%d)\r\n", status);
+    }
+}
+
+/**
+ * Process received ESPNow messages in the main loop context.
+ * 
+ * Called from loop() right after readSerialData(). Checks the volatile
+ * espNowRxReady flag set by the WiFi-task callback, copies the buffer,
+ * clears the flag, then feeds the JSON through processCompleteSerialMessage()
+ * — the same pipeline used for Serial1 data.
+ * 
+ * Also resets the serial watchdog on valid data, preventing false triggers
+ * when the Python controller is disconnected but the display panel is active.
+ * 
+ * Example flow:
+ *   onEspNowDataReceived() → sets espNowRxReady=true
+ *   loop() → processEspNowMessages() → processCompleteSerialMessage()
+ */
+void processEspNowMessages() {
+    if (!espNowRxReady) return;
+
+    // Copy buffer and clear flag atomically (single consumer)
+    char localBuf[ESPNOW_RX_BUF_SIZE];
+    int localLen = espNowRxLen;
+    memcpy(localBuf, (const char*)espNowRxBuffer, localLen);
+    localBuf[localLen] = '\0';
+    espNowRxLen = 0;
+    espNowRxReady = false;
+
+    Serial.printf("[ESPNOW RX] JSON (%d bytes): %s\r\n", localLen, localBuf);
+
+    // Reset the serial watchdog — ESPNow data counts as active communication
+    resetSerialWatchdog();
+
+    // Feed through the same command/data pipeline as Serial1
+    processCompleteSerialMessage(localBuf, (uint16_t)localLen);
+}
+
+/**
+ * Send a JSON string via ESPNow to the paired display panel.
+ * 
+ * Automatically fragments messages larger than 248 bytes (250 - 2 byte header)
+ * into multiple ESPNow packets. Each packet has a 2-byte header:
+ *   Byte 0 = ESPNOW_PKT_JSON (0x01)
+ *   Byte 1 = (fragment_index << 4) | total_fragments
+ * 
+ * For single-packet messages (most sensor data), fragInfo = 0x01.
+ * For multi-packet messages (cellular status), fragments are sent sequentially.
+ * 
+ * @param json  Null-terminated JSON string to send
+ * @param len   Length of the JSON string (excluding null terminator)
+ * 
+ * Example:
+ *   char buf[200];
+ *   snprintf(buf, sizeof(buf), "{\"pressure\":1.23}");
+ *   sendEspNowJsonPacket(buf, strlen(buf));  // Sends as 1 packet
+ */
+void sendEspNowJsonPacket(const char* json, int len) {
+    if (!espNowInitialized || !espNowPeerConnected) return;
+
+    uint8_t totalFrags = (len + ESPNOW_MAX_PAYLOAD - 1) / ESPNOW_MAX_PAYLOAD;
+    if (totalFrags > 15) totalFrags = 15;  // Nibble limit
+
+    int offset = 0;
+    for (uint8_t frag = 0; frag < totalFrags; frag++) {
+        int chunkLen = len - offset;
+        if (chunkLen > ESPNOW_MAX_PAYLOAD) chunkLen = ESPNOW_MAX_PAYLOAD;
+
+        uint8_t pkt[250];
+        pkt[0] = ESPNOW_PKT_JSON;
+        pkt[1] = (frag << 4) | totalFrags;
+        memcpy(pkt + 2, json + offset, chunkLen);
+
+        esp_now_send(espNowPeerMac, pkt, 2 + chunkLen);
+        offset += chunkLen;
+    }
+
+    if (serialDebugMode) {
+        Serial.printf("[ESPNOW TX] %d bytes in %d fragment(s)\r\n", len, totalFrags);
+    }
+}
+
+/**
+ * Broadcast a discovery beacon so display panels can find this IO Board.
+ * 
+ * Called from loop() every ESPNOW_BEACON_INTERVAL_MS (2 seconds) when
+ * no ESPNow peer is connected. The beacon contains the device's GMID,
+ * firmware version, and WiFi channel so the display panel knows what
+ * it's connecting to.
+ * 
+ * Beacon JSON format:
+ *   {"type":"beacon","gmid":"RND-0003","fw":"10.36","ch":1}
+ * 
+ * The display panel receives this on the broadcast address, registers
+ * the IO Board's MAC as a peer, and replies with a pair request.
+ */
+void sendEspNowBeacon() {
+    if (!espNowInitialized || espNowPeerConnected) return;
+
+    unsigned long now = millis();
+    if (now - lastEspNowBeaconTime < ESPNOW_BEACON_INTERVAL_MS) return;
+    lastEspNowBeaconTime = now;
+
+    char beaconJson[128];
+    snprintf(beaconJson, sizeof(beaconJson),
+             "{\"type\":\"beacon\",\"gmid\":\"%s\",\"fw\":\"%s\",\"ch\":%d}",
+             deviceName, FIRMWARE_VERSION, ESPNOW_CHANNEL);
+
+    uint8_t pkt[250];
+    pkt[0] = ESPNOW_PKT_BEACON;
+    pkt[1] = 0x01;  // Single fragment
+    int pLen = strlen(beaconJson);
+    memcpy(pkt + 2, beaconJson, pLen);
+
+    uint8_t broadcastAddr[6];
+    memset(broadcastAddr, 0xFF, 6);
+    esp_now_send(broadcastAddr, pkt, 2 + pLen);
+
+    if (serialDebugMode) {
+        Serial.printf("[ESPNOW] Beacon sent: %s\r\n", beaconJson);
+    }
+}
+
+/**
+ * Check ESPNow peer heartbeat and handle disconnect.
+ * 
+ * Called from loop() on the 100ms timer. If the paired display panel
+ * hasn't sent any data for ESPNOW_HEARTBEAT_TIMEOUT_MS (10 seconds),
+ * mark it as disconnected. This resumes:
+ *   - Serial1 sensor/cellular sends to the Python controller
+ *   - Beacon broadcasting for re-discovery
+ * 
+ * The display panel's regular data requests or explicit keepalive packets
+ * serve as implicit heartbeats — no separate heartbeat message is needed
+ * from the IO Board side (the 200ms sensor packets handle that).
+ */
+void checkEspNowHeartbeat() {
+    if (!espNowInitialized || !espNowPeerConnected) return;
+
+    if (millis() - lastEspNowRxTime > ESPNOW_HEARTBEAT_TIMEOUT_MS) {
+        Serial.printf("[ESPNOW] Peer disconnected — no data for %lu ms. Resuming serial sends.\r\n",
+                      ESPNOW_HEARTBEAT_TIMEOUT_MS);
+        Serial.printf("[ESPNOW]   Former peer: %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+                      espNowPeerMac[0], espNowPeerMac[1], espNowPeerMac[2],
+                      espNowPeerMac[3], espNowPeerMac[4], espNowPeerMac[5]);
+
+        // Remove the peer registration so it can re-pair via discovery
+        esp_now_del_peer(espNowPeerMac);
+
+        espNowPeerConnected = false;
+        memset(espNowPeerMac, 0, 6);
+        lastEspNowBeaconTime = 0;  // Force immediate beacon on next loop
+    }
+}
 
 // =====================================================================
 // PASSTHROUGH MODE FUNCTIONS
@@ -8869,7 +9296,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 10.35                ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 10.36                ║");
     Serial.println("║  ADS1015 ADC + Failsafe Relay Control                ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -8959,6 +9386,10 @@ void setup() {
     Serial.print(apSSID);
     Serial.println("' ready");
     Serial.println("Connect and navigate to 192.168.4.1");
+
+    // REV 10.36: Initialize ESPNow for wireless display panel communication
+    // Must be called AFTER startConfigAP() — shares WiFi radio on same channel
+    initializeESPNow();
     
     Serial.println("#########################################");
     Serial.println("##   Walter IO Board Firmware " + ver + "   ##");
@@ -9034,13 +9465,14 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 10.35 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 10.36 initialization complete!");
     Serial.println("✅ ADS1015 ADC reader running on Core 0 (60Hz, address 0x48)");
     Serial.println("✅ SPA web interface active with " + String(PROFILE_COUNT) + " profiles");
     Serial.println("✅ Active profile: " + profileManager.getActiveProfileName());
     Serial.println("✅ Serial watchdog ready");
     Serial.println("✅ Failsafe relay control standby (activates after 2 restart attempts)");
     Serial.printf("✅ CBOR buffer: %d samples (%d min capacity)\r\n", CBOR_BUFFER_MAX_SAMPLES, CBOR_BUFFER_MAX_SAMPLES * 15 / 60);
+    Serial.printf("✅ ESPNow: %s — beacon discovery active\r\n", espNowInitialized ? "initialized" : "FAILED");
     Serial.println("⏳ Cellular connecting in background (LTE + BlueCherry + time)");
     Serial.println("✅ System ready — IO operational!\n");
 }
@@ -9106,6 +9538,11 @@ void loop() {
     // Safe to call 1000+ times per second.
     // =====================================================================
     readSerialData();
+    
+    // REV 10.36: Process any ESPNow messages received from display panel.
+    // Runs every iteration like readSerialData() — feeds JSON through the
+    // same processCompleteSerialMessage() pipeline and resets the watchdog.
+    processEspNowMessages();
 
     // =====================================================================
     // REV 10.13: NON-BLOCKING CELLULAR INITIALIZATION
@@ -9193,6 +9630,11 @@ void loop() {
     if (currentTime - readTime >= readInterval) {
         updateTimestamp();
         checkSerialWatchdog();  // Check if watchdog timeout has been exceeded
+        
+        // REV 10.36: ESPNow heartbeat check and beacon broadcast
+        checkEspNowHeartbeat();  // Detect display panel disconnect (10s timeout)
+        sendEspNowBeacon();      // Broadcast discovery beacon when unpaired (every 2s)
+        
         readTime = currentTime;
     }
     

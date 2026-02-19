@@ -1,20 +1,44 @@
-# ESP32 IO Board Serial Protocol Guide
+# ESP32 IO Board Communication Protocol Guide
 
-**Firmware:** IO_BOARD_FIRMWARE9 Rev 10.13  
-**Date:** February 10, 2026  
-**Audience:** Anyone writing software that talks to this ESP32 over serial
+**Firmware:** IO_BOARD_FIRMWARE Rev 10.36
+**Date:** February 19, 2026
+**Audience:** Management stakeholders interested in system capabilities, and technical staff implementing communication with the ESP32 IO Board
+
+---
+
+## Executive Summary
+
+The ESP32 IO Board serves as the central control system for vacuum pump operations, providing reliable communication through multiple channels. While the core functionality remains serial-based RS-232 communication with Linux devices, the system now includes advanced ESPNow wireless capabilities for remote display panels.
+
+**Key Communication Methods:**
+- **RS-232 Serial** (Primary): Wired communication with Linux control systems
+- **ESPNow Wireless** (Secondary): Wireless communication with display panels
+- **WiFi Web Portal** (Configuration): Browser-based system management and diagnostics
+
+This guide explains how data flows between the ESP32 IO Board and connected devices, ensuring reliable operation and system monitoring.
 
 ---
 
 ## Purpose of This Document
 
-The ESP32 IO Board communicates with a Linux device (Raspberry Pi / Comfile) over a serial RS-232 connection. The ESP32 handles all physical hardware: relay switching, ADC sensor reading, overfill detection, SD card logging, cellular modem, and a WiFi web portal. The Linux device handles business logic: deciding when to run cycles, detecting alarm conditions, and sending status to the cloud.
+The ESP32 IO Board serves as the central hardware controller for vacuum pump operations, communicating through multiple channels depending on the connected device type.
 
-This document describes every byte on the wire between the two devices. If you are rewriting the Linux-side software, this is the complete specification.
+**For Management Stakeholders:**
+This document provides an overview of how the ESP32 IO Board communicates with different system components, ensuring you understand the reliability and monitoring capabilities of the vacuum control system.
+
+**For Technical Implementers:**
+This document provides the complete specification for all communication protocols. Whether you're implementing Linux control software, developing a wireless display panel, or integrating with the web portal, you'll find the exact message formats, timing requirements, and data flows needed for reliable system operation.
+
+**Communication Channels:**
+- **Linux Control Systems**: Use RS-232 serial communication for primary control and monitoring
+- **Display Panels**: Use ESPNow wireless communication for remote monitoring and control
+- **Human Operators**: Use WiFi web portal for configuration and diagnostics
 
 ---
 
 ## Physical Layer
+
+### RS-232 Serial Communication (Primary Channel)
 
 | Parameter | Value |
 |-----------|-------|
@@ -28,49 +52,168 @@ This document describes every byte on the wire between the two devices. If you a
 | ESP32 TX pin | **GPIO43** |
 | Linux port | `/dev/serial0` (Raspberry Pi UART) |
 
-All messages are **JSON objects**, one per line, terminated by `\n` (newline). The ESP32 uses `Serial1.println()` which appends `\r\n`. The Linux device should be tolerant of both `\n` and `\r\n`.
+### ESPNow Wireless Communication (Display Panel Channel)
 
-The ESP32 has three serial ports:
-- **Serial** (USB): Debug output only. Not part of this protocol.
-- **Serial1** (GPIO44/43): This protocol. All communication with the Linux device.
-- **Serial2** (GPIO14/48): Walter cellular modem. Not accessible to Linux.
+| Parameter | Value |
+|-----------|-------|
+| Protocol | ESPNow (ESP32 proprietary wireless protocol) |
+| Frequency | 2.4 GHz (WiFi channel 1) |
+| Range | Typically 50-100 meters line-of-sight |
+| Security | No encryption (local network only) |
+| Packet size | Maximum 250 bytes (248 bytes payload + 2 bytes header) |
+| Discovery | Automatic beacon broadcasting |
+| Connection | Auto-pairing with display panels |
+
+### Message Format
+
+All communication channels use **JSON objects** as the message format, one per transmission, terminated by `\n` (newline).
+
+- **RS-232 Serial**: ESP32 uses `Serial1.println()` which appends `\r\n`. Connected devices should accept both `\n` and `\r\n` terminators.
+- **ESPNow Wireless**: JSON payloads are transmitted as raw strings within ESPNow packets, maintaining the same format as serial communication.
+
+### ESP32 Communication Ports
+
+The ESP32 manages multiple communication channels simultaneously:
+- **Serial** (USB): Debug output only. Not part of operational protocols.
+- **Serial1** (GPIO44/43): RS-232 communication with Linux control systems.
+- **Serial2** (GPIO14/48): Cellular modem communication (internal use only).
+- **ESPNow**: Wireless communication with display panels (shares WiFi radio).
+- **WiFi AP**: Web portal for human operators (192.168.4.1).
 
 ---
 
 ## Message Flow Overview
 
+### Primary Communication: Linux Control System (RS-232 Serial)
+
 ```
 Linux Device                    ESP32 IO Board
      │                               │
      │  ◄─── Fast Sensor Packet ───  │  Every 200ms (5Hz)
-     │       (pressure, current,     │  Sent regardless of Linux state
+     │       (pressure, current,     │  Real-time operational data
      │        overfill, sdcard)      │
      │                               │
-     │  ◄─── Cellular Status ─────  │  Every 10 seconds (cached values)
-     │       (lte, rsrp, rsrq,      │  Always sent on timer
+     │  ◄─── Cellular Status ─────  │  Every 10 seconds
+     │       (lte, rsrp, rsrq,      │  Network connectivity status
      │        operator, band, etc.)  │
      │                               │
-     │  ◄─── Datetime Packet ─────  │  Only when fresh from modem clock
-     │       (datetime only)         │  Never repeated with stale values
+     │  ◄─── Datetime Packet ─────  │  Only when fresh from modem
+     │       (datetime only)         │  Accurate time synchronization
      │                               │
      │  ── Data Payload ──────────►  │  Every 15 seconds
-     │     (gmid, mode, fault,       │  Used for CBOR/cellular/SD logging
+     │     (gmid, mode, fault,       │  Cloud data transmission
      │      cycles, press, current)  │
      │                               │
-     │  ── Immediate Mode ────────►  │  On mode change (within 100ms)
-     │     (mode number only)        │  This is the relay control path
+     │  ── Immediate Mode ────────►  │  On mode change (<100ms)
+     │     (mode number only)        │  Relay control commands
      │                               │
-     │  ◄─── Web Portal Command ──  │  When user presses button on web portal
-     │       (start_cycle, stop,     │
-     │        start_test, etc.)      │
+     │  ── Web Portal Commands ──►  │  User-initiated actions
+     │       (relay control,         │  Manual control interface
+     │        calibration, tests)    │
      │                               │
-     │  ── Command ───────────────►  │  Passthrough, set_profile, etc.
+     │  ── System Commands ───────►  │  Configuration and maintenance
+     │     (passthrough, calibration,│  System management
+     │      profile changes, etc.)   │
+```
+
+### Secondary Communication: Display Panel (ESPNow Wireless)
+
+```
+Display Panel                  ESP32 IO Board
      │                               │
+     │  ◄─── Fast Sensor Packet ───  │  Every 200ms (5Hz)
+     │       (pressure, current,     │  Same real-time data as serial
+     │        overfill, sdcard)      │
+     │                               │
+     │  ◄─── Cellular Status ─────  │  Every 10 seconds
+     │       (lte, rsrp, rsrq,      │  Network status for monitoring
+     │        operator, band, etc.)  │
+     │                               │
+     │  ◄─── Datetime Packet ─────  │  Only when fresh from modem
+     │       (datetime only)         │  Time display
+     │                               │
+     │  ── Mode Commands ─────────►  │  Touchscreen control
+     │     (mode 0-9, emergency)     │  Remote relay control
+     │                               │
+     │  ── System Commands ───────►  │  Configuration access
+     │     (calibration, diagnostics)│  Panel-initiated actions
+     │                               │
+     │  ── Heartbeat ─────────────►  │  Every 5 seconds
+     │     (keepalive signals)       │  Connection monitoring
+```
+
+### Auto-Discovery and Connection Management
+
+```
+Display Panel                  ESP32 IO Board
+     │                               │
+     │  ◄─── Beacon Broadcast ────  │  Every 2 seconds (unpaired)
+     │     {"type":"beacon",         │  IO Board identification
+     │      "gmid":"CSX-1234",       │
+     │      "fw":"10.36"}            │
+     │                               │
+     │  ── Pair Request ──────────►  │  After beacon received
+     │     {"type":"pair_request",   │  Connection establishment
+     │      "name":"Display-1"}      │
+     │                               │
+     │  ◄─── Pair Confirm ────────  │  Immediate response
+     │     {"type":"pair_confirm",   │  Connection confirmed
+     │      "gmid":"CSX-1234"}       │
+     │                               │
+     │  ◄─── Data Stream ─────────  │  After pairing complete
+     │     (sensor + cellular data)  │  Continuous monitoring
 ```
 
 ---
 
-## ESP32 to Linux Messages
+## ESPNow Wireless Communication Protocol
+
+### Overview
+
+ESPNow provides wireless communication between the ESP32 IO Board and remote display panels. This allows operators to monitor and control vacuum systems from a distance without running cables.
+
+**Key Features:**
+- **Automatic Discovery**: Display panels automatically find and connect to IO Boards
+- **Seamless Integration**: Same JSON message format as RS-232 serial
+- **Priority System**: When a display panel is connected, it receives all sensor data instead of the Linux system
+- **Reliable Connection**: Built-in heartbeat monitoring and automatic reconnection
+- **Fragmentation Support**: Large messages (like cellular status) are automatically split across multiple packets
+
+### ESPNow Packet Structure
+
+Each ESPNow transmission consists of a 2-byte header followed by JSON payload:
+
+```
+Byte 0: Packet Type
+  0x01 = JSON data (sensor, cellular, commands)
+  0x10 = Discovery beacon (IO Board broadcasting)
+  0x11 = Pair request (Display → IO Board)
+  0x12 = Pair confirmation (IO Board → Display)
+
+Byte 1: Fragment Information
+  High nibble: Fragment index (0-based)
+  Low nibble: Total fragments
+  Example: 0x01 = single packet, 0x12 = fragment 1 of 2
+
+Bytes 2-249: JSON Payload (up to 248 bytes)
+```
+
+### Connection Process
+
+1. **Discovery Phase**: IO Board broadcasts beacons every 2 seconds containing its identity
+2. **Pairing Phase**: Display panel responds with pair request, IO Board confirms connection
+3. **Active Phase**: Continuous data exchange with heartbeat monitoring
+4. **Reconnection**: Automatic recovery if connection is lost
+
+### Communication Priority
+
+- **ESPNow Active**: When a display panel is connected, all outgoing sensor and cellular data goes to the display panel via ESPNow
+- **ESPNow Inactive**: When no display panel is connected, all data goes to the Linux system via RS-232 serial
+- **Bidirectional**: Commands can come from either the Linux system (RS-232) or display panel (ESPNow)
+
+---
+
+## ESP32 to Connected Device Messages
 
 ### 1. Fast Sensor Packet (5Hz / every 200ms)
 
@@ -105,7 +248,7 @@ Sent every 10 seconds using cached values from the last successful modem query. 
 - `failsafe` is already included in the 5Hz fast sensor packet (Rev 10.8)
 
 ```json
-{"passthrough":0,"lte":1,"rsrp":"-85.5","rsrq":"-10.2","operator":"T-Mobile","band":"B2","mcc":310,"mnc":260,"cellId":12345678,"tac":9876,"profile":"CS8","imei":"351234567890123","imsi":"310410123456789","iccid":"8901260882310000000","technology":"LTE-M"}
+{"passthrough":0,"lte":1,"rsrp":"-85.5","rsrq":"-10.2","operator":"T-Mobile","band":"B2","mcc":310,"mnc":260,"cellId":12345678,"tac":9876,"profile":"CS8","imei":"351234567890123","imsi":"310410123456789","iccid":"8901260882310000000","technology":"LTE-M","espnow":0,"temperature":85.2}
 ```
 
 | Field | Type | Description |
@@ -125,8 +268,12 @@ Sent every 10 seconds using cached values from the last successful modem query. 
 | `imsi` | string | **Rev 10.9.** SIM IMSI (International Mobile Subscriber Identity). `"--"` if unavailable. |
 | `iccid` | string | **Rev 10.9.** SIM ICCID (Integrated Circuit Card ID). `"--"` if unavailable. |
 | `technology` | string | **Rev 10.9.** Radio Access Technology: `"LTE-M"`, `"NB-IoT"`, `"Auto"`, or `"Unknown"`. |
+| `espnow` | int | **Rev 10.36.** ESPNow connection status: `1` = display panel connected, `0` = no display panel |
+| `temperature` | float | **Rev 10.36.** ESP32 board temperature in degrees Fahrenheit. Typical range: 70-120°F. Used for thermal monitoring and diagnostics. |
 
-**Why 10-second timer:** Guarantees the Linux device always has cellular info, even during modem communication failures. Uses cached values from the last successful query — stale but useful beats missing entirely.
+**Why 10-second timer:** Guarantees connected devices always have cellular info, even during modem communication failures. Uses cached values from the last successful query — stale but useful beats missing entirely.
+
+**ESPNow fragmentation:** When this packet exceeds 248 bytes, it's automatically split across multiple ESPNow packets and reassembled by the display panel.
 
 ---
 
@@ -146,51 +293,75 @@ Sent **only** when the modem clock returns a genuinely new timestamp (`modemTime
 
 ---
 
-### 3. Web Portal Command (ESP32 takes priority and controls GPIO directly)
+### 3. Web Portal Commands (HTTP POST to ESP32)
 
-When a user interacts with the ESP32's WiFi web portal (default IP: `192.168.4.1`), the ESP32 **takes priority** and sets GPIO outputs directly. Web portal commands have higher precedence than Python control panel commands. Control is returned to the Python control panel when the user exits the web config portal.
+Web portal commands are sent from the user's browser to the ESP32 via HTTP POST requests to `/api/command`. The ESP32 processes these commands and either handles them directly or forwards them to the Linux system for logging/coordination.
 
-**Commands handled directly by ESP32 (GPIO control):**
+**Commands handled directly by ESP32:**
 ```json
 {"command":"toggle_relay","value":"CR1"}
 {"command":"toggle_relay","value":"CR2"}
 {"command":"toggle_relay","value":"CR5"}
 {"command":"emergency_stop"}
+{"command":"calibrate_pressure"}
+{"command":"set_manual_adc_zero","value":"964.0"}
+{"command":"overfill_override","value":"on"}
+{"command":"clear_press_alarm"}
+{"command":"clear_motor_alarm"}
+{"command":"enable_failsafe"}
+{"command":"exit_failsafe"}
+{"command":"restart"}
+{"command":"send_status"}
 ```
 
-**Commands forwarded to Linux:**
+**Commands that ESP32 handles directly but also notifies Linux:**
 ```json
-{"command":"start_cycle","type":"run"}
 {"command":"start_cycle","type":"manual_purge"}
 {"command":"start_cycle","type":"clean"}
 {"command":"stop_cycle"}
 {"command":"start_test","type":"leak"}
 {"command":"start_test","type":"func"}
 {"command":"start_test","type":"eff"}
+{"command":"stop_test"}
 ```
 
-Note: `stop_test` is forwarded as `{"command":"stop_cycle"}` (same as stop_cycle — Python's `stop_cycle()` stops everything).
+**Commands forwarded to Linux for primary handling:**
+```json
+{"command":"start_cycle","type":"run"}
+{"command":"set_profile","value":"CS8","password":"1793"}
+```
 
 | Field | Description |
 |-------|-------------|
-| `command` | The action: `"start_cycle"`, `"stop_cycle"`, `"start_test"`, `"toggle_relay"`, or `"emergency_stop"` |
+| `command` | The action: `"toggle_relay"`, `"emergency_stop"`, `"calibrate_pressure"`, `"start_cycle"`, `"start_test"`, `"set_profile"`, etc. |
 | `type` | For start commands: `"run"`, `"manual_purge"`, `"clean"`, `"leak"`, `"func"`, `"eff"` |
-| `value` | For toggle_relay: `"CR1"`, `"CR2"`, or `"CR5"` |
+| `value` | For toggle_relay: `"CR1"`, `"CR2"`, `"CR5"`; for set_profile: profile name; for ADC zero: numeric value |
+| `password` | Required for set_profile command (password: `"1793"`) |
 
-**ESP32 direct control (immediate GPIO action):**
-- `toggle_relay/CR1` — Toggle CR1 relay ON/OFF
-- `toggle_relay/CR2` — Toggle CR2 relay ON/OFF
-- `toggle_relay/CR5` — Toggle CR5 relay ON/OFF
-- `emergency_stop` — Set ESP32 to idle mode (mode 0)
+**ESP32 direct control actions:**
+- `toggle_relay/CR1` — Toggle CR1 relay ON/OFF (individual valve control)
+- `toggle_relay/CR2` — Toggle CR2 relay ON/OFF (individual valve control)
+- `toggle_relay/CR5` — Toggle CR5 relay ON/OFF (individual valve control)
+- `emergency_stop` — Set ESP32 to idle mode (mode 0), stops all operations
+- `calibrate_pressure` — Calibrate pressure sensor zero point (requires ambient air)
+- `set_manual_adc_zero` — Set pressure sensor zero point to specific ADC value
+- `overfill_override` — Override overfill alarm detection
+- `clear_press_alarm` — Clear pressure alarm state
+- `clear_motor_alarm` — Clear motor current alarm state
+- `enable_failsafe` — Enable autonomous failsafe mode
+- `exit_failsafe` — Disable autonomous failsafe mode
+- `restart` — Reboot the ESP32 immediately
+- `send_status` — Manually trigger CBOR status update to cloud server
 
-**Linux device handles (forwarded commands):**
-- `start_cycle/run` — Start a normal run cycle (same as pressing Start on the touchscreen)
-- `start_cycle/manual_purge` — Start a manual purge cycle
-- `start_cycle/clean` — Start a canister clean (15 min motor run)
-- `stop_cycle` — Stop whatever is currently running
-- `start_test/leak` — Start a leak test (30 min, mode 9, all valves open, motor off)
-- `start_test/func` — Start a functionality test (10 x run/purge cycles)
-- `start_test/eff` — Start an efficiency test (120s fill/run)
+**ESP32 test operations (direct control with Linux notification):**
+- `start_cycle/manual_purge` — ESP32 controls purge mode relays, notifies Linux
+- `start_cycle/clean` — ESP32 controls run mode for canister cleaning, notifies Linux
+- `start_test/leak` — ESP32 runs leak test sequence, notifies Linux
+- `start_test/func` — ESP32 runs functionality test cycles, notifies Linux
+- `start_test/eff` — ESP32 runs efficiency test, notifies Linux
+
+**Linux-handled operations:**
+- `start_cycle/run` — Linux manages normal operation cycles with full monitoring
 
 **Web portal security:** The Maintenance screen requires password `"878"` to unlock. Profile changes require password `"1793"`. Device name/watchdog changes require password `"gm2026"`.
 
@@ -370,9 +541,52 @@ Enables fast BlueCherry message retrieval by checking every 15 seconds instead o
 
 ---
 
-## Serial Watchdog and Failsafe Mode
+### Commands from ESPNow Display Panels
 
-The ESP32 monitors the serial line for incoming data. Watchdog behavior depends on whether failsafe mode is enabled or disabled.
+Display panels can send the same web portal commands as the browser interface, allowing remote touchscreen control of vacuum operations:
+
+**Direct ESP32 Control Commands:**
+```json
+{"command":"toggle_relay","value":"CR1"}    // Toggle CR1 valve
+{"command":"toggle_relay","value":"CR2"}    // Toggle CR2 valve
+{"command":"toggle_relay","value":"CR5"}    // Toggle CR5 valve
+{"command":"emergency_stop"}                // Emergency stop all
+{"command":"calibrate_pressure"}            // Calibrate pressure sensor
+{"command":"restart"}                       // Reboot ESP32
+```
+
+**Test and Cycle Commands:**
+```json
+{"command":"start_cycle","type":"run"}      // Start normal run cycle
+{"command":"start_cycle","type":"manual_purge"}  // Manual purge operation
+{"command":"start_cycle","type":"clean"}    // Canister cleaning cycle
+{"command":"stop_cycle"}                    // Stop current operation
+{"command":"start_test","type":"leak"}      // Leak test
+{"command":"start_test","type":"func"}      // Functionality test
+{"command":"start_test","type":"eff"}       // Efficiency test
+{"command":"stop_test"}                     // Stop current test
+```
+
+**Legacy Serial Protocol Commands (also supported):**
+```json
+{"type":"data","mode":1}      // Set to Run mode
+{"type":"data","mode":0}      // Emergency stop (idle)
+{"type":"data","mode":"shutdown"}  // Activate 72-hour shutdown
+{"type":"cmd","cmd":"cal"}    // Calibrate pressure sensor
+```
+
+**Connection Maintenance:**
+```json
+{"type":"keepalive"}          // Connection heartbeat (every 5 seconds)
+```
+
+Display panels receive all the same responses as the web portal, including calibration results, relay state confirmations, and command acknowledgments.
+
+---
+
+## Communication Watchdog and Failsafe Mode
+
+The ESP32 monitors both RS-232 serial and ESPNow wireless communication channels for incoming data. When either channel is active (receiving data), the watchdog is reset. Watchdog behavior depends on whether failsafe mode is enabled or disabled.
 
 ### Failsafe Enable/Disable Setting
 
@@ -522,6 +736,8 @@ If an immediate mode command is lost, the next 15-second Linux payload corrects 
 
 ## Timing Summary
 
+### RS-232 Serial Communication (Linux Control System)
+
 | Event | Interval | Direction | Purpose |
 |-------|----------|-----------|---------|
 | Fast sensor packet | 200ms (5Hz) | ESP32 → Linux | Real-time pressure, current, overfill, SD status, failsafe, shutdown |
@@ -529,10 +745,41 @@ If an immediate mode command is lost, the next 15-second Linux payload corrects 
 | Datetime packet | Event-driven | ESP32 → Linux | Fresh modem clock only — never repeated with stale values |
 | Periodic data payload | 15s | Linux → ESP32 | CBOR/SD logging data (gmid, fault, cycles) + mode re-send |
 | Immediate mode command | On change | Linux → ESP32 | Relay control (<200ms response) |
-| **Relay state refresh** | **15s** | **ESP32 internal** | **Re-applies currentRelayMode to GPIO pins (Rev 10.8)** |
+| Relay state refresh | 15s | ESP32 internal | Re-applies currentRelayMode to GPIO pins |
 | Mode polling (internal) | 100ms | Linux internal | ModeManager mmap check for child process mode changes |
 | ESP32 serial check | 100ms | ESP32 internal | How often ESP32 checks Serial1 for incoming data |
 | Serial watchdog timeout | 30 min | ESP32 internal | Triggers power-cycle pulse on GPIO39 |
+
+### Web Portal Commands (Browser to ESP32)
+
+| Event | Interval | Direction | Purpose |
+|-------|----------|-----------|---------|
+| Web command processing | <50ms | Browser → ESP32 | HTTP POST to /api/command endpoint |
+| Calibration operation | <1s | ESP32 direct | Pressure sensor zero point calibration |
+| Relay toggle response | <10ms | ESP32 direct | Immediate GPIO state change |
+| Test start operation | <100ms | ESP32 direct | Initialize test sequence and take relay control |
+| Profile change | <50ms | ESP32 direct | Switch active equipment profile (password protected) |
+| ESP32 restart | <500ms delay | ESP32 direct | Reboot with 500ms response delay |
+
+### ESPNow Wireless Communication (Display Panel)
+
+| Event | Interval | Direction | Purpose |
+|-------|----------|-----------|---------|
+| Fast sensor packet | 200ms (5Hz) | ESP32 → Display | Same real-time data as serial channel |
+| Cellular status | 10s (timer) | ESP32 → Display | Network status for remote monitoring |
+| Datetime packet | Event-driven | ESP32 → Display | Fresh modem time for display |
+| Discovery beacon | 2s (when unpaired) | ESP32 broadcast | Allows display panels to find IO Board |
+| Heartbeat timeout | 10s (silence threshold) | ESP32 monitor | Detects display panel disconnection |
+| Display heartbeat | 5s | Display → ESP32 | Maintains wireless connection |
+| ESPNow message processing | 100ms | ESP32 internal | Checks for incoming wireless data |
+| Fragment reassembly | Variable | ESP32 internal | Combines multi-packet messages |
+
+### Communication Channel Priority
+
+- **ESPNow Connected**: All outgoing data (sensors, cellular) goes to display panel via ESPNow
+- **ESPNow Disconnected**: All outgoing data goes to Linux via RS-232 serial
+- **Incoming Commands**: Accepted from both channels simultaneously
+- **Watchdog Reset**: Occurs when data is received from either channel
 
 ---
 
@@ -553,6 +800,28 @@ Without this, the `testRunning` flag could become permanently stuck. If a web po
 ### Why does the Linux device send pressure/current in the 15s payload if the ESP32 doesn't use them?
 Historical compatibility and debugging. The CBOR format was originally designed for a system where Linux read the sensors. The ESP32 now reads its own sensors for CBOR but keeping the fields in the serial payload allows the web portal diagnostics page to display what Linux thinks the values are, which is useful for troubleshooting sensor disagreements.
 
+### Why ESPNow instead of WiFi TCP/UDP for display panels?
+ESPNow provides several advantages for industrial control applications:
+- **Lower latency**: Direct radio communication without TCP/IP overhead
+- **Better reliability**: No connection drops from IP address changes or network congestion
+- **Lower power consumption**: Optimized for short, frequent messages
+- **Simpler implementation**: No need for IP addressing, DHCP, or socket programming
+- **Deterministic timing**: Messages arrive in order without retransmission delays
+
+### Why automatic ESPNow discovery instead of manual MAC address configuration?
+Manual configuration creates maintenance overhead and potential errors:
+- MAC addresses must be entered correctly on both devices
+- Device replacement requires reconfiguration
+- Multiple IO Boards in the same area require careful MAC management
+- Automatic discovery eliminates these issues while maintaining security through proximity requirements
+
+### Why ESPNow takes priority over serial when both are connected?
+Display panels serve as the primary human-machine interface:
+- Operators expect immediate feedback from the panel they're using
+- Serial communication continues to work for all control functions
+- The system gracefully falls back to serial-only operation when wireless disconnects
+- Watchdog monitoring covers both communication channels
+
 ### Why does the periodic payload only send every 15 seconds?
 This payload feeds the CBOR builder which transmits to the cloud. The cloud ingestion rate is 15-second intervals. Sending more frequently would waste bandwidth and not improve cloud data granularity. The real-time control path (immediate mode commands) is separate and much faster.
 
@@ -561,7 +830,9 @@ The Linux application uses `multiprocessing` (fork) for cycle sequences. After f
 
 ---
 
-## Quick Start for a New Linux Implementation
+## Quick Start for New Implementations
+
+### Linux Control System Implementation
 
 1. **Open** `/dev/serial0` at 115200 baud, 8N1, no flow control
 2. **Start receiving** — read lines, parse JSON, store sensor values
@@ -570,6 +841,17 @@ The Linux application uses `multiprocessing` (fork) for cycle sequences. After f
 5. **Handle web portal commands** — parse `{"command":"..."}` messages and act on them
 6. **Drain the buffer** — always read ALL available data and use only the latest JSON line. If you read only one line at a time, you'll fall behind and get stale data.
 7. **Send mode 0** on shutdown/cleanup to idle all relays
+
+### Display Panel Implementation (ESPNow)
+
+1. **Initialize ESPNow** in STA mode on WiFi channel 1
+2. **Listen for beacons** from IO Board (broadcast every 2 seconds)
+3. **Send pair request** when beacon received: `{"type":"pair_request","name":"Display-1"}`
+4. **Wait for confirmation** and start receiving sensor data
+5. **Send keepalive** every 5 seconds: `{"type":"keepalive"}`
+6. **Send commands** using same JSON format as serial (modes, calibration, etc.)
+7. **Handle fragmentation** for messages larger than 248 bytes
+8. **Reconnect automatically** if connection lost (watch for new beacons)
 
 **Minimal "hello world" to verify serial works:**
 
