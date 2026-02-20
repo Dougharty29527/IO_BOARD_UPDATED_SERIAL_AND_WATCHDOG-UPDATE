@@ -1,7 +1,7 @@
 /* ********************************************
  *
- *  Walter IO Board Firmware - Rev 10.36
- *  Date: 2/19/2026
+ *  Walter IO Board Firmware - Rev 10.37
+ *  Date: 2/20/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -12,6 +12,15 @@
  *  =====================================================================
  *  REVISION HISTORY (newest first)
  *  =====================================================================
+ *
+ *  Rev 10.37 (2/20/2026) - ESPNow Unified Command Path
+ *  - REMOVED: set_mode handler from executeRemoteCommand(). ESP-NOW HMI must use
+ *    the same JSON protocol as the Python/Linux device — no separate command paths.
+ *    Mode changes from HMI use {"type":"data","mode":N} through the serial fast-path,
+ *    identical to how the Linux device sets modes.
+ *  - ARCHITECTURE: ESP-NOW HMI is a drop-in replacement for the Linux serial device.
+ *    All commands route through processCompleteSerialMessage() → executeRemoteCommand()
+ *    and mode data through the fast-path — one unified pipeline for both transports.
  *
  *  Rev 10.36 (2/19/2026) - ESPNow Wireless Display Panel Support
  *  - ESPNOW: Added ESP-NOW wireless communication for Waveshare ESP32 Display panel
