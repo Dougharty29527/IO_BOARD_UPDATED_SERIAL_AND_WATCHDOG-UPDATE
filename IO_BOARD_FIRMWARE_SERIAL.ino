@@ -2233,6 +2233,20 @@ void executeRemoteCommand(String cmd, String value) {
                           value.c_str());
         }
     }
+    // --- Test Watchdog Output ---
+    // Toggles ESP_WATCHDOG_PIN (GPIO39) between HIGH and LOW on each call.
+    // Used to verify the watchdog relay output is physically working.
+    // Does NOT affect normal watchdog timer or reboot logic.
+    //
+    // Usage example:
+    //   executeRemoteCommand("test_watchdog", "");  // toggles GPIO39
+    else if (cmd == "test_watchdog") {
+        int current = digitalRead(ESP_WATCHDOG_PIN);
+        int next = (current == HIGH) ? LOW : HIGH;
+        digitalWrite(ESP_WATCHDOG_PIN, next);
+        notifyPythonOfCommand("test_watchdog", next ? "1" : "0");
+        Serial.printf("[CMD] Watchdog output toggled — GPIO39 now %s\n", next ? "HIGH" : "LOW");
+    }
     // --- Emergency Stop ---
     // Immediately sets all relays to idle (mode 0), stops any running test or
     // failsafe cycle, and clears manual relay override.  This is the "big red
@@ -5327,8 +5341,8 @@ String generateCaptivePortalHTML() {
 }
 
 void startConfigAP() {
-    // Configure WiFi AP with explicit settings for reliability
-    WiFi.mode(WIFI_AP);
+    // AP+STA mode required for ESP-NOW to coexist with the config AP
+    WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(apSSID);
     delay(100);  // Let AP stabilize before starting DNS
     
